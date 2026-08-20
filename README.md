@@ -25,9 +25,20 @@ disputed, scope, clocks, and that `memory_forget` is not erasure.
 
 ## Other clients
 
-This marketplace is for **Claude Code**. Cursor, Codex, Grok and VS Code
-have their own repos when those exist. Claude Desktop and ChatGPT paste
-the same URL: see [memvara.dev/docs/agents](https://memvara.dev/docs/agents).
+This marketplace is for **Claude Code**. Cursor, Codex, Grok, VS Code and
+OpenCode have their own repos (see [memvara.dev/docs/agents](https://memvara.dev/docs/agents)).
+Claude Desktop and ChatGPT paste the same URL.
+
+OpenClaw 2026.7 can install this as a Claude **bundle**:
+
+```
+openclaw plugins install memvara --marketplace memvara/claude-memvara
+```
+
+That loads the skill. Hosted HTTP MCP is listed but not started on 2026.7.1
+("stdio only today"). Do not use an OpenClaw `slots.memory` capture plugin
+as a workaround. A native HTTP MCP plugin is a follow-up if OpenClaw still
+cannot run `type: http` from a bundle.
 
 A loop you wrote is not this path. Python: `pip install memvara`.
 
