@@ -44,6 +44,7 @@ ALLOWED_PLUGIN_FILES = {
     pathlib.Path("hooks") / "lib" / "__init__.py",
     pathlib.Path("hooks") / "lib" / "open.py",
     pathlib.Path("hooks") / "lib" / "extract.py",
+    pathlib.Path("hooks") / "lib" / "usage.py",
 }
 
 
@@ -230,8 +231,9 @@ class Hooks(unittest.TestCase):
         original = os.environ.get(SENTINEL)
         os.environ[SENTINEL] = "1"
         try:
-            self.assertEqual(_payload("anything at all"), "",
-                             "extraction ran despite the recursion sentinel")
+            result, usage = _payload("anything at all")
+            self.assertEqual(result, "", "extraction ran despite the recursion sentinel")
+            self.assertEqual(usage, {}, "a blocked run must report no tokens spent")
         finally:
             if original is None:
                 os.environ.pop(SENTINEL, None)
@@ -253,6 +255,76 @@ class Hooks(unittest.TestCase):
             raw = path.read_text(encoding="utf-8")
             self.assertNotIn("MEMVARA_DB=", raw, path)
             self.assertNotIn("/.memvara/workstation", raw, path)
+
+
+class Usage(unittest.TestCase):
+    """Token accounting for what capture spends."""
+
+    def _usage(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("lib.usage")
+        finally:
+            sys.path.pop(0)
+
+    def test_uses_the_librarys_billing_series(self) -> None:
+        """Names come from the catalogue, not from this repo.
+
+        `write.tokens_in` is documented there as the series to bill on. A hook that
+        invented `capture.tokens` would produce numbers nothing else could aggregate.
+        """
+        usage = self._usage()
+        self.assertEqual(usage.TOKENS_IN, "write.tokens_in")
+        self.assertEqual(usage.TOKENS_OUT, "write.tokens_out")
+
+    def test_satisfies_the_recorder_protocol(self) -> None:
+        usage = self._usage()
+        for method in ("counter", "gauge", "timing"):
+            self.assertTrue(callable(getattr(usage.JsonlRecorder, method, None)), method)
+
+    def test_a_tag_cannot_overwrite_an_envelope_field(self) -> None:
+        """Regression: tags used to be flattened into the record.
+
+        `record_extraction` tags cache rows `kind="cache_read"`, which collided with the
+        envelope's own `kind` (counter/gauge/timing) and silently replaced it. The row
+        stayed valid JSON, so nothing failed and the metric type was simply lost.
+        """
+        usage = self._usage()
+        import tempfile
+
+        path = pathlib.Path(tempfile.mkdtemp()) / "usage.jsonl"
+        usage.JsonlRecorder(path).counter("write.tokens_in", 5, kind="cache_read")
+        record = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(record["kind"], "counter")
+        self.assertEqual(record["tags"]["kind"], "cache_read")
+
+    def test_input_total_includes_cache_reads_and_writes(self) -> None:
+        """The cached preamble *is* the cost of a headless run.
+
+        A measured extraction was 9 fresh input tokens against 21,130 cached. Counting
+        only `input_tokens` would report the run as ~1/2000th of its true size and make
+        the batching threshold look like premature optimisation.
+        """
+        usage = self._usage()
+        import tempfile
+
+        path = pathlib.Path(tempfile.mkdtemp()) / "usage.jsonl"
+        usage.record_extraction(
+            {"input_tokens": 9, "cache_read_input_tokens": 12206,
+             "cache_creation_input_tokens": 8924, "output_tokens": 871},
+            model="m", recorder=usage.JsonlRecorder(path))
+        totals = usage.totals(path)
+        self.assertEqual(totals["write.tokens_in"], 9 + 12206 + 8924)
+        self.assertEqual(totals["write.tokens_out"], 871)
+
+    def test_usage_is_not_written_into_the_memory_store(self) -> None:
+        # Operational accounting belongs beside the store, not in it: "we spent 4,897
+        # tokens" must never surface as a fact about the user in a recall block.
+        source = (HOOKS / "lib" / "usage.py").read_text(encoding="utf-8")
+        self.assertNotIn("remember(", source)
+        self.assertNotIn("store.add", source)
 
 
 class ReadmeAndLicense(unittest.TestCase):

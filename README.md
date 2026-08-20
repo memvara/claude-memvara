@@ -58,6 +58,20 @@ The child is launched with an empty hook set, and refuses to start if it
 finds itself already inside an extraction. Without both, a `Stop` hook
 that spawns Claude would fire the child's `Stop` hook, forever.
 
+Every extraction reports what it cost to
+`~/.memvara/.hooks/usage.jsonl`, under the library's own
+`write.tokens_in` and `write.tokens_out` — the series its metric
+catalogue names as the one to bill on. `python3 hooks/lib/usage.py`
+prints the running totals. Cache reads and cache writes are counted as
+input and tagged so they stay separable, which is the whole picture:
+a measured run spent **9 fresh input tokens against 21,130 cached**.
+Counting only `input_tokens` would report that run at a two-thousandth
+of its real size.
+
+The ledger sits beside the store, never inside it. Operational
+accounting is not a fact about you, and must not surface in a recall
+block.
+
 ## Other clients
 
 This marketplace is for **Claude Code**. Cursor, Codex, Grok, VS Code and

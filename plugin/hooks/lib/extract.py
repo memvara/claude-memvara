@@ -28,6 +28,8 @@ import os
 import re
 import subprocess
 
+from .usage import record_extraction
+
 #: Set in the child's environment. If a hook ever sees this, it is running underneath an
 #: extraction and must not start another one.
 SENTINEL = "MEMVARA_CAPTURE_ACTIVE"
@@ -55,10 +57,15 @@ Conversation:
 """
 
 
-def _payload(text: str) -> str:
-    """The model's reply, or '' if the run failed in any way."""
+def _payload(text: str) -> "tuple[str, dict]":
+    """The model's reply and what it cost, or `('', {})` if the run failed.
+
+    Cost is returned rather than discarded because here is the only place it exists.
+    `--output-format json` puts usage on the envelope beside `result`; reading `result`
+    alone, as this first did, throws the token counts away with the process.
+    """
     if os.environ.get(SENTINEL):
-        return ""
+        return "", {}
 
     env = dict(os.environ)
     env[SENTINEL] = "1"
@@ -77,17 +84,22 @@ def _payload(text: str) -> str:
             capture_output=True, text=True, timeout=TIMEOUT_SEC, env=env,
         )
     except (OSError, subprocess.SubprocessError):
-        return ""
+        return "", {}
     if proc.returncode != 0:
-        return ""
+        return "", {}
 
     try:
         body = json.loads(proc.stdout)
     except ValueError:
-        return ""
+        return "", {}
+
+    usage = body.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
     if body.get("is_error"):
-        return ""
-    return str(body.get("result") or "")
+        # Reported even so. A failed run still burned the preamble, and accounting that
+        # counted only successes would make the expensive failures the invisible ones.
+        return "", usage
+    return str(body.get("result") or ""), usage
 
 
 def _facts(result: str) -> "list[dict]":
@@ -114,8 +126,14 @@ def triples(text: str) -> "list[tuple[str, str, str]]":
     unregistered predicate is many-valued forever in this store, so two spellings of one
     relation never reconcile and both keep answering.
     """
+    result, usage = _payload(text)
+    if usage:
+        # Recorded before the reply is even parsed: the tokens were spent whether or not
+        # the model returned anything usable.
+        record_extraction(usage, model=MODEL)
+
     out: "list[tuple[str, str, str]]" = []
-    for fact in _facts(_payload(text)):
+    for fact in _facts(result):
         if not isinstance(fact, dict):
             continue
         subject = str(fact.get("subject") or "user").strip() or "user"
