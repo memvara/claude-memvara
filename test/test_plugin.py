@@ -16,13 +16,32 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "plugin"
-SKILL = PLUGIN / "skills" / "memvara"
+HOOKS = PLUGIN / "hooks"
 HOSTED = "https://app.memvara.dev/mcp"
 REPO_NAME = "memvara/claude-memvara"
 
+#: The skill ships as `memory` so the client renders it `/memvara:memory` instead of
+#: `/memvara:memvara`. The library still calls it `memvara`, which is the right name
+#: everywhere else — including the bare `~/.claude/skills/memvara/` install, where there
+#: is no plugin segment to pair it with. The gap is one frontmatter line, and
+#: `test_matches_library_at_lock_sha` asserts it is the only one.
+SKILL_NAME = "memory"
+LIBRARY_SKILL_NAME = "memvara"
+LIBRARY_SKILL_PATH = "memvara/skills/memvara"
+SKILL = PLUGIN / "skills" / SKILL_NAME
+
+#: Hook scripts are executable content the client runs on every prompt, so the allowlist
+#: names them one by one. A file appearing under `hooks/` that nobody listed here is the
+#: failure this gate exists to catch.
 ALLOWED_PLUGIN_FILES = {
     pathlib.Path(".claude-plugin") / "plugin.json",
     pathlib.Path(".mcp.json"),
+    pathlib.Path("hooks") / "hooks.json",
+    pathlib.Path("hooks") / "recall.py",
+    pathlib.Path("hooks") / "session_start.py",
+    pathlib.Path("hooks") / "capture.py",
+    pathlib.Path("hooks") / "lib" / "__init__.py",
+    pathlib.Path("hooks") / "lib" / "open.py",
 }
 
 
@@ -101,16 +120,98 @@ class SkillTree(unittest.TestCase):
         refs = list((SKILL / "references").glob("*.md"))
         self.assertGreaterEqual(len(refs), 7)
 
+    def test_skill_is_named_for_the_plugin_segment(self) -> None:
+        """`/memvara:memory`, not `/memvara:memvara`.
+
+        The client builds the invocation from the plugin name and the skill's own
+        frontmatter, so a directory rename alone changes nothing. Both are asserted
+        because a mismatch between them is silent.
+        """
+        self.assertEqual(SKILL.name, SKILL_NAME)
+        text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(text, rf"(?m)^name:[ \t]+{re.escape(SKILL_NAME)}[ \t]*$")
+
     def test_matches_library_at_lock_sha(self) -> None:
+        """Vendored bytes equal the library's, except the one line we rename.
+
+        Comparing after a targeted substitution rather than skipping the file keeps the
+        drift gate at full strength: every other byte of the skill still has to match,
+        and the rename itself fails loudly if the library's frontmatter ever stops
+        saying what this expects.
+        """
         lock = _lock()
         self.assertEqual(lock["repo"], "memvara/memvara")
-        self.assertEqual(lock["path"], "memvara/skills/memvara")
+        self.assertEqual(lock["path"], LIBRARY_SKILL_PATH)
         sha = lock["sha"]
         self.assertEqual(len(sha), 40)
+
         for rel in ("SKILL.md", "references/hosted-mcp.md"):
-            expected = _library_bytes(sha, f"memvara/skills/memvara/{rel}")
+            expected = _library_bytes(sha, f"{LIBRARY_SKILL_PATH}/{rel}")
+            if rel == "SKILL.md":
+                old = f"name: {LIBRARY_SKILL_NAME}\n".encode()
+                self.assertIn(old, expected, f"library frontmatter at {sha} is not {old!r}")
+                expected = expected.replace(old, f"name: {SKILL_NAME}\n".encode(), 1)
             got = (SKILL / rel).read_bytes()
             self.assertEqual(got, expected, f"{rel} drifted from {sha}")
+
+
+class Hooks(unittest.TestCase):
+    """The hooks run unattended on every prompt, so the bar is behavioural.
+
+    This file used to assert `hooks/` did not exist. That was the right call while the
+    plugin was only an MCP endpoint and a skill: a hook is code the client executes
+    without being asked, and shipping one is a different promise than shipping prose.
+    The promise is kept here instead of avoided — every script is executed, against a
+    deliberately empty environment, and required to stay silent and succeed.
+    """
+
+    #: Every hook must survive this: no store, no credentials, no library.
+    BARREN = {"HOME": "/nonexistent", "PATH": os.environ.get("PATH", "")}
+
+    def _scripts(self) -> list[str]:
+        body = _json(HOOKS / "hooks.json")
+        assert isinstance(body, dict)
+        found = []
+        for entries in body["hooks"].values():
+            for entry in entries:
+                for hook in entry["hooks"]:
+                    self.assertEqual(hook["type"], "command")
+                    found.append(hook["command"])
+        return found
+
+    def test_every_referenced_script_exists(self) -> None:
+        for command in self._scripts():
+            match = re.search(r"\$\{CLAUDE_PLUGIN_ROOT\}/(\S+?)\"", command)
+            self.assertIsNotNone(match, command)
+            assert match is not None
+            self.assertTrue((PLUGIN / match.group(1)).is_file(), command)
+
+    def test_covers_the_events_that_make_memory_automatic(self) -> None:
+        body = _json(HOOKS / "hooks.json")
+        assert isinstance(body, dict)
+        # Recall on every prompt is the whole point; capture is what keeps it fed.
+        self.assertLessEqual({"UserPromptSubmit", "SessionStart", "Stop"},
+                             set(body["hooks"]))
+
+    def test_hooks_are_silent_and_succeed_with_nothing_configured(self) -> None:
+        payload = json.dumps({"prompt": "hello", "transcript_path": "/nonexistent"})
+        for script in ("recall.py", "session_start.py", "capture.py"):
+            with self.subTest(script=script):
+                proc = subprocess.run(
+                    ["python3", str(HOOKS / script)],
+                    input=payload, capture_output=True, text=True,
+                    env=self.BARREN, timeout=30,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, "", "a hook with no store must print nothing")
+
+    def test_hooks_do_not_hardcode_a_store_path(self) -> None:
+        # Configuration is discovered from the client's own server block. A literal path
+        # here would silently read a different store than the MCP server writes.
+        for path in HOOKS.rglob("*.py"):
+            raw = path.read_text(encoding="utf-8")
+            self.assertNotIn("MEMVARA_DB=", raw, path)
+            self.assertNotIn("/.memvara/workstation", raw, path)
 
 
 class ReadmeAndLicense(unittest.TestCase):
@@ -142,8 +243,7 @@ class Hygiene(unittest.TestCase):
             raw = path.read_text(encoding="utf-8")
             self.assertNotIn("npx", raw, path)
 
-    def test_no_hooks_or_app_json(self) -> None:
-        self.assertFalse((PLUGIN / "hooks").exists())
+    def test_no_app_json_or_commands(self) -> None:
         self.assertFalse((PLUGIN / ".app.json").exists())
         self.assertFalse((PLUGIN / "commands").exists())
 
@@ -152,7 +252,13 @@ class Hygiene(unittest.TestCase):
         for path in SKILL.rglob("*"):
             if path.is_file():
                 allowed.add(path.relative_to(PLUGIN))
-        found = {p.relative_to(PLUGIN) for p in PLUGIN.rglob("*") if p.is_file()}
+        found = {
+            p.relative_to(PLUGIN) for p in PLUGIN.rglob("*")
+            # Running a hook writes bytecode next to it, so __pycache__ appears inside
+            # any installed copy. It is generated, never committed (see .gitignore), and
+            # failing on it would fail every machine that has used the plugin once.
+            if p.is_file() and "__pycache__" not in p.parts
+        }
         extra = found - allowed
         self.assertFalse(extra, f"unexpected plugin files: {sorted(extra)}")
 

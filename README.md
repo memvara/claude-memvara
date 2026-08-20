@@ -19,9 +19,32 @@ Ten tools on `https://app.memvara.dev/mcp`: `memory_recall`,
 `memory_forget`, `memory_end`, `memory_history`, `memory_why`,
 `memory_stats`.
 
-The `memvara` skill is the judgment a single tool description cannot
+The `memory` skill is the judgment a single tool description cannot
 carry: which surface to use, the sequence when a stored fact is
 disputed, scope, clocks, and that `memory_forget` is not erasure.
+Claude Code shows it as `/memvara:memory`.
+
+Three hooks, so memory happens without being asked for:
+
+| Event | What it does |
+|---|---|
+| `SessionStart` | Opens the session with standing facts, and names the scope it is bound to |
+| `UserPromptSubmit` | Recalls against every prompt |
+| `Stop` | Ingests the turn that just ended |
+
+The hooks read the store directly instead of going through MCP, which is
+why they are cheap enough to run per prompt — 0.22 s cold, interpreter
+startup included. They discover their configuration from the `memvara`
+server block in your own client settings, so they open the store the MCP
+server writes to rather than one of their own choosing, and they fall
+silent when there is no store, no library or no credentials.
+
+Capture needs an extractor. Under the default `MEMVARA_LLM=none` the
+library's `NullLLM` stores nothing from prose, so the `Stop` hook exits
+without writing rather than reporting success over an empty store;
+recall is unaffected. Set `MEMVARA_LLM=anthropic` with an
+`ANTHROPIC_API_KEY` to turn capture on — that sends transcripts to a
+model, which the offline default does not.
 
 ## Other clients
 

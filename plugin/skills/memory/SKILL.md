@@ -1,5 +1,5 @@
 ---
-name: memvara
+name: memory
 description: >
   Wire Memvara into an agent or editor, pick the right surface (hosted MCP,
   Python library, REST), and use memory without forging history. Use when the
