@@ -8,10 +8,15 @@ making on someone's prompt path.
 
 Order of preference, and what each costs when it fails:
 
-1. **Daemon.** ~12ms. A missing or wedged one costs the connect attempt, which is
-   sub-millisecond against a socket that is not there.
-2. **In-process.** ~148ms, the pre-daemon behaviour, always correct.
-3. **Nothing.** No store configured at all: empty string, no output, no error.
+1. **Daemon.** ~38ms end to end, most of it this client's own interpreter startup. A
+   missing or wedged one costs the connect attempt, which is sub-millisecond against a
+   socket that is not there.
+2. **In-process library.** ~148ms, the pre-daemon behaviour, always correct. Skipped
+   entirely when the library is not installed, which is the normal hosted case.
+3. **Hosted over stdlib HTTP.** ~390ms cold. Needs no `pip install`, which is the point:
+   the hosted install story is "paste a URL", and a hook that waited for a Python package
+   would be silently dead on exactly the machines this is aimed at.
+4. **Nothing.** No store, no login: empty string, no output, no error.
 
 Spawning is deliberately *after* answering. The first prompt of a session should not wait
 on a process that cannot help it yet, so the daemon is started for the benefit of the next
@@ -82,6 +87,22 @@ def recall(query: str, *, k: int = 6, budget: int = 700, header: str | None = No
 
     store = open_store()
     if store is None:
+        # No local library or no local store. Hosted is the remaining route, and on a
+        # paste-the-URL install it is the only one there ever was.
+        from .hosted import open_hosted
+
+        client = open_hosted()
+        if client is not None:
+            try:
+                text = client.recall(query, k=k, budget=budget, header=header)
+            except Exception:
+                text = None
+            finally:
+                client.close()
+            if text:
+                if spawn and path is not None:
+                    _spawn(root)
+                return text
         return ""
 
     try:

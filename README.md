@@ -32,12 +32,35 @@ Three hooks, so memory happens without being asked for:
 | `UserPromptSubmit` | Recalls against every prompt |
 | `Stop` | Ingests the turn that just ended |
 
-The hooks read the store directly instead of going through MCP, which is
-why they are cheap enough to run per prompt — 0.22 s cold, interpreter
-startup included. They discover their configuration from the `memvara`
-server block in your own client settings, so they open the store the MCP
-server writes to rather than one of their own choosing, and they fall
-silent when there is no store, no library or no credentials.
+The hooks try three routes and return the same text from each; only the
+latency differs. A resident daemon answers in ~38 ms. Without one, a
+local install queries in-process in ~148 ms. A hosted install with no
+`memvara` package installed goes over plain stdlib HTTP — no
+`pip install`, since the hosted install story is pasting a URL.
+
+| Install | Cold | With the daemon |
+|---|---|---|
+| Local (SQLite) | 148 ms | **38 ms** |
+| Hosted (stdlib HTTP) | ~390 ms | **~177 ms** |
+
+The daemon earns more on hosted than on local, because only a resident
+process can hold the TLS connection open: the same request measured
+609 ms on a fresh connection and 177 ms on a warm one. It exits after 30
+minutes idle, and its socket address digests both the store and the hook
+sources, so a second store can never reach it and edited code strands it
+rather than being served stale.
+
+Two things the hosted path needs that look like nothing when missing.
+It must send a **User-Agent**: Cloudflare refuses the stdlib default with
+error 1010 before the request reaches the application at all. And it
+needs a **CA bundle**, because python.org's macOS build does not use the
+system trust store and fails with `CERTIFICATE_VERIFY_FAILED` on a
+certificate every other tool accepts.
+
+Configuration is discovered from the `memvara` server block in your own
+client settings, so the hooks open the store the MCP server writes to
+rather than one of their own choosing, and they fall silent when there is
+no store, no library and no login.
 
 Capture needs a model, and uses the one you already pay for. It shells
 out to `claude -p` against your existing Claude Code login, so there is

@@ -69,6 +69,10 @@ class Daemon:
             # documented as thread-safe; a per-prompt hook has no concurrency worth the
             # risk of finding out otherwise.
             with self._lock:
+                # Both backends answer the same call. The local one is a `Memvara`; the
+                # hosted one is a `HostedRecall` holding a kept-alive TLS connection,
+                # which is the whole reason a hosted install wants a daemon: the same
+                # request costs 609ms on a fresh connection and 177ms on a warm one.
                 return str(self.store.recall(query, **kwargs) or "")
         except Exception:
             # A failed query is an empty answer, never a dead daemon.
@@ -140,12 +144,22 @@ class Daemon:
 def main() -> int:
     store = open_store()
     if store is None:
-        # Nothing to serve. Exiting is correct: a daemon with no store would accept
-        # connections and answer every one of them with silence, which is indistinguishable
+        # No library, or no local store. On a paste-the-URL hosted install that is the
+        # normal state, not a broken one, so fall through to the stdlib HTTP client
+        # rather than exiting.
+        from lib.hosted import open_hosted
+
+        store = open_hosted()
+    if store is None:
+        # Nothing to serve at all. Exiting is correct: a daemon with no backend would
+        # accept connections and answer every one with silence, which is indistinguishable
         # from a working daemon over a store that happens to be empty.
         return 0
     try:
-        store.recall("warm", k=1)  # pay the first-query costs before anyone waits on them
+        # Pay the first-query costs -- imports, page cache, TLS handshake -- before any
+        # prompt is waiting on them. For hosted this is the handshake that turns a 609ms
+        # first call into a 177ms one.
+        store.recall("warm", k=1)
     except Exception:
         pass
     return Daemon(socket_path(store_key()), store).run()

@@ -48,6 +48,7 @@ ALLOWED_PLUGIN_FILES = {
     pathlib.Path("hooks") / "daemon.py",
     pathlib.Path("hooks") / "lib" / "ipc.py",
     pathlib.Path("hooks") / "lib" / "fast.py",
+    pathlib.Path("hooks") / "lib" / "hosted.py",
 }
 
 
@@ -401,9 +402,76 @@ class Daemon(unittest.TestCase):
         `open.py` may use it freely -- it is only reached on the fallback path, where the
         cost is already lost in a 148ms in-process query.
         """
-        for name in ("lib/ipc.py", "lib/fast.py", "recall.py"):
+        for name in ("lib/ipc.py", "lib/fast.py", "recall.py", "lib/hosted.py"):
             source = (HOOKS / name).read_text(encoding="utf-8")
             self.assertNotIn("from pathlib import", source, name)
+
+
+class Hosted(unittest.TestCase):
+    """The stdlib-only path, so a hosted install needs no pip install."""
+
+    def _hosted(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("lib.hosted")
+        finally:
+            sys.path.pop(0)
+
+    def test_never_sends_the_stdlib_user_agent(self) -> None:
+        """Cloudflare refuses `Python-urllib/*` at the edge with error 1010.
+
+        Measured against the live endpoint: the stock agent gets 403/1010 and never
+        reaches the application, while curl's, a browser's and this one all get through
+        to a genuine 401. Nothing in that 403 suggests the client's *name* is the fault,
+        which is what makes it worth a test rather than a comment.
+        """
+        hosted = self._hosted()
+        self.assertTrue(hosted.USER_AGENT)
+        self.assertNotIn("urllib", hosted.USER_AGENT.lower())
+        self.assertNotIn("python", hosted.USER_AGENT.lower())
+        source = (HOOKS / "lib" / "hosted.py").read_text(encoding="utf-8")
+        self.assertIn('"user-agent": USER_AGENT', source)
+
+    def test_uses_a_keepalive_capable_client(self) -> None:
+        """`urlopen` cannot reuse a connection; `http.client` can.
+
+        On the live endpoint the same call costs 609ms on a fresh connection and 177ms on
+        a warm one. Using urllib here would silently forfeit that on every prompt.
+        """
+        source = (HOOKS / "lib" / "hosted.py").read_text(encoding="utf-8")
+        self.assertIn("http.client", source)
+        self.assertNotIn("urllib.request", source)
+
+    def test_imports_nothing_outside_the_standard_library(self) -> None:
+        # The entire point: a hosted install pastes a URL and gets working hooks. An
+        # import of `memvara` here would make that false on exactly the target machine.
+        source = (HOOKS / "lib" / "hosted.py").read_text(encoding="utf-8")
+        self.assertNotIn("import memvara", source)
+        self.assertNotIn("import httpx", source)
+
+    def test_tolerates_a_missing_ca_bundle(self) -> None:
+        """python.org's macOS build does not use the system trust store.
+
+        Without a bundle it raises CERTIFICATE_VERIFY_FAILED against a certificate every
+        other tool on the machine accepts, so `certifi` is preferred and the default
+        context is the fallback rather than the only option.
+        """
+        source = (HOOKS / "lib" / "hosted.py").read_text(encoding="utf-8")
+        self.assertIn("certifi", source)
+        self.assertIn("ssl.create_default_context()", source)
+        self.assertIsNotNone(self._hosted()._context())
+
+    def test_no_credentials_is_not_an_error(self) -> None:
+        hosted = self._hosted()
+        original = hosted.CREDENTIALS
+        hosted.CREDENTIALS = "/nonexistent/credentials.json"
+        try:
+            self.assertIsNone(hosted.credentials())
+            self.assertIsNone(hosted.open_hosted())
+        finally:
+            hosted.CREDENTIALS = original
 
 
 class ReadmeAndLicense(unittest.TestCase):

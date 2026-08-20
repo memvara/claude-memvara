@@ -136,8 +136,21 @@ def store_key() -> str:
             db = os.path.realpath(os.path.expanduser(db))
         except OSError:
             db = os.path.expanduser(db)
+    hosted = ""
+    if not db:
+        # A hosted install has no MEMVARA_DB, so without this every hosted account on the
+        # machine would hash to the same address and share one daemon -- one account's
+        # memories answering another's prompts.
+        try:
+            with open(os.path.join(_HOME, ".memvara", "credentials.json"), encoding="utf-8") as fh:
+                creds = json.load(fh)
+            hosted = f"{creds.get('server_url','')}|{creds.get('project','')}"
+        except (OSError, ValueError):
+            hosted = ""
+
     return "\0".join([
         db,
+        hosted,
         env.get("MEMVARA_MODE", ""),
         env.get("MEMVARA_TENANT", ""),
         env.get("MEMVARA_USER", ""),
