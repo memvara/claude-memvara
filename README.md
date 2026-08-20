@@ -39,12 +39,24 @@ server block in your own client settings, so they open the store the MCP
 server writes to rather than one of their own choosing, and they fall
 silent when there is no store, no library or no credentials.
 
-Capture needs an extractor. Under the default `MEMVARA_LLM=none` the
-library's `NullLLM` stores nothing from prose, so the `Stop` hook exits
-without writing rather than reporting success over an empty store;
-recall is unaffected. Set `MEMVARA_LLM=anthropic` with an
-`ANTHROPIC_API_KEY` to turn capture on — that sends transcripts to a
-model, which the offline default does not.
+Capture needs a model, and uses the one you already pay for. It shells
+out to `claude -p` against your existing Claude Code login, so there is
+no `ANTHROPIC_API_KEY` and no second bill. It does not go through
+`MEMVARA_LLM`, which stays `none`: the library's `NullLLM` accepts prose
+and stores nothing, so facts are written as triples instead.
+
+A headless run costs about 21k tokens of Claude Code's own preamble
+before it reads any of your transcript — roughly $0.018 and 12–14s on
+Haiku, whether it is handed one sentence or twenty. So capture batches:
+nothing runs until 2000 characters of unprocessed conversation have
+accumulated, and below that the watermark stays put so the text joins the
+next batch. Each run appends a line to `~/.memvara/.hooks/capture.log`
+saying how many facts were found and how many were stored, which is the
+only place a failed write is distinguishable from a quiet transcript.
+
+The child is launched with an empty hook set, and refuses to start if it
+finds itself already inside an extraction. Without both, a `Stop` hook
+that spawns Claude would fire the child's `Stop` hook, forever.
 
 ## Other clients
 

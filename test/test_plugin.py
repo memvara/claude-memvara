@@ -11,6 +11,7 @@ import os
 import pathlib
 import re
 import subprocess
+import sys
 import unittest
 import urllib.request
 
@@ -42,6 +43,7 @@ ALLOWED_PLUGIN_FILES = {
     pathlib.Path("hooks") / "capture.py",
     pathlib.Path("hooks") / "lib" / "__init__.py",
     pathlib.Path("hooks") / "lib" / "open.py",
+    pathlib.Path("hooks") / "lib" / "extract.py",
 }
 
 
@@ -204,6 +206,45 @@ class Hooks(unittest.TestCase):
                 )
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(proc.stdout, "", "a hook with no store must print nothing")
+
+    def test_extraction_cannot_recurse(self) -> None:
+        """A Stop hook that spawns Claude must not give the child a Stop hook.
+
+        This is the failure that does not announce itself: the child inherits the same
+        hook set, finishes, fires Stop, spawns another child. Nothing errors — the machine
+        just fills with Claude processes and the bill climbs. Two independent stops are
+        asserted because either one alone is a single point of failure.
+        """
+        source = (HOOKS / "lib" / "extract.py").read_text(encoding="utf-8")
+        # 1. The child is launched with an empty hook set.
+        self.assertIn('"--settings", \'{"hooks":{}}\'', source)
+        # 2. And refuses to start if it finds itself already inside an extraction.
+        self.assertIn("SENTINEL", source)
+
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib.extract import SENTINEL, _payload
+        finally:
+            sys.path.pop(0)
+
+        original = os.environ.get(SENTINEL)
+        os.environ[SENTINEL] = "1"
+        try:
+            self.assertEqual(_payload("anything at all"), "",
+                             "extraction ran despite the recursion sentinel")
+        finally:
+            if original is None:
+                os.environ.pop(SENTINEL, None)
+            else:
+                os.environ[SENTINEL] = original
+
+    def test_capture_batches_rather_than_running_per_turn(self) -> None:
+        """The fixed overhead of a headless run is ~21k tokens regardless of input, so a
+        per-turn call spends the same on one sentence as on twenty. The threshold is the
+        only thing keeping that in proportion."""
+        source = (HOOKS / "capture.py").read_text(encoding="utf-8")
+        self.assertIn("MIN_SPAN_CHARS", source)
+        self.assertRegex(source, r"len\(span\) < MIN_SPAN_CHARS")
 
     def test_hooks_do_not_hardcode_a_store_path(self) -> None:
         # Configuration is discovered from the client's own server block. A literal path
