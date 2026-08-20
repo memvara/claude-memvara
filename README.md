@@ -9,8 +9,13 @@ says how to use it, in one install.
 ```
 
 The first connection opens a browser so you can click Allow. That grant
-lasts 90 days. Nothing is installed on the machine: there is no local
-Python process and we do not use an API key.
+lasts 90 days, and no API key is involved.
+
+The hooks below do run locally, and one of them starts a short-lived
+background process to keep recall fast. Nothing is installed to do it:
+they use the standard library, and the process exits after 30 minutes
+idle. Delete the `hooks/` directory and the plugin is still a working
+MCP server plus the skill.
 
 ## What you get
 
