@@ -1,0 +1,42 @@
+# Merge gate. release.yml calls this workflow so a tag cannot skip the suite.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read skill.lock
+        id: lock
+        run: echo "sha=$(awk -F= '/^sha=/{print $2}' skill.lock)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: memvara/memvara
+          ref: ${{ steps.lock.outputs.sha }}
+          path: _library
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Test
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          MEMVARA_LIBRARY: ${{ github.workspace }}/_library
+        run: python3 -m unittest discover -s test -v

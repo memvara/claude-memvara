@@ -1,0 +1,17 @@
+{
+  "name": "claude-memvara",
+  "description": "Hosted memory for Claude Code.",
+  "owner": {
+    "name": "Memvara",
+    "url": "https://memvara.dev"
+  },
+  "plugins": [
+    {
+      "name": "memvara",
+      "source": "./plugin",
+      "description": "Hosted MCP plus the skill for using it.",
+      "homepage": "https://memvara.dev/docs/agents",
+      "license": "Apache-2.0"
+    }
+  ]
+}

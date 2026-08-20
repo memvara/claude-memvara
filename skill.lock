@@ -1,0 +1,6 @@
+# The library commit whose memvara/skills/memvara/ tree this plugin vendors.
+# CI diffs plugin/skills/memvara against that SHA. skill-sync.yml updates this
+# file when it opens a PR.
+repo=memvara/memvara
+sha=5af7ea57cd0a9b7bbb68cd0bb086c391d4aaa698
+path=memvara/skills/memvara

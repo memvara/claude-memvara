@@ -1,0 +1,64 @@
+# Open a PR when memvara/memvara's packaged skill moves. Does not push to main.
+name: Skill sync
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [skill-changed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch library skill
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/memvara/memvara.git /tmp/memvara
+          src=/tmp/memvara/memvara/skills/memvara
+          if [ ! -f "$src/SKILL.md" ]; then
+            echo "library default branch has no packaged skill yet; skip"
+            echo "changed=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          rm -rf plugin/skills/memvara
+          mkdir -p plugin/skills
+          cp -R "$src" plugin/skills/memvara
+          sha=$(git -C /tmp/memvara rev-parse HEAD)
+          python3 -c "
+          from pathlib import Path
+          Path('skill.lock').write_text(
+              '# The library commit whose memvara/skills/memvara/ tree this plugin vendors.\\n'
+              '# CI diffs plugin/skills/memvara against that SHA. skill-sync.yml updates this\\n'
+              '# file when it opens a PR.\\n'
+              'repo=memvara/memvara\\n'
+              f'sha=$sha\\n'
+              'path=memvara/skills/memvara\\n'
+          )
+          "
+          if git diff --quiet -- plugin/skills/memvara skill.lock; then
+            echo "changed=false" >> "$GITHUB_ENV"
+          else
+            echo "changed=true" >> "$GITHUB_ENV"
+            echo "sha=$sha" >> "$GITHUB_ENV"
+          fi
+
+      - name: Open PR
+        if: env.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore: sync skill from memvara/memvara@${{ env.sha }}"
+          title: "chore: sync skill from memvara/memvara@${{ env.sha }}"
+          body: |
+            Vendored skill drifted from [memvara/memvara](https://github.com/memvara/memvara) `${{ env.sha }}`.
+            This PR only copies `memvara/skills/memvara/` and updates `skill.lock`.
+            CI still has to pass before merge.
+          branch: sync/skill-${{ env.sha }}
+          delete-branch: true
