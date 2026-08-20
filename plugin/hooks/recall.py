@@ -13,12 +13,15 @@ startup included.
 
 from __future__ import annotations
 
+import os.path
 import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# `os.path`, not `pathlib`: importing pathlib costs 10.5ms and this file runs on every
+# prompt. The bootstrap is one string join.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lib.open import emit, open_store, payload  # noqa: E402
+from lib.fast import recall as fast_recall  # noqa: E402
+from lib.ipc import emit, payload  # noqa: E402
 
 #: Enough facts to be useful, few enough to stay out of the way. Recall drops whole notes
 #: weakest-first to fit, so this is a ceiling and not a target.
@@ -39,12 +42,8 @@ def main() -> int:
     if not prompt:
         return 0
 
-    store = open_store()
-    if store is None:
-        return 0
-
     try:
-        emit(store.recall(prompt, k=K, budget=BUDGET, header=HEADER))
+        emit(fast_recall(prompt, k=K, budget=BUDGET, header=HEADER))
     except Exception:
         # A retrieval failure must not become a failed prompt.
         return 0

@@ -45,6 +45,9 @@ ALLOWED_PLUGIN_FILES = {
     pathlib.Path("hooks") / "lib" / "open.py",
     pathlib.Path("hooks") / "lib" / "extract.py",
     pathlib.Path("hooks") / "lib" / "usage.py",
+    pathlib.Path("hooks") / "daemon.py",
+    pathlib.Path("hooks") / "lib" / "ipc.py",
+    pathlib.Path("hooks") / "lib" / "fast.py",
 }
 
 
@@ -325,6 +328,82 @@ class Usage(unittest.TestCase):
         source = (HOOKS / "lib" / "usage.py").read_text(encoding="utf-8")
         self.assertNotIn("remember(", source)
         self.assertNotIn("store.add", source)
+
+
+class Daemon(unittest.TestCase):
+    """The resident recall process. Optional by construction, private by permission."""
+
+    def _ipc(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("lib.ipc")
+        finally:
+            sys.path.pop(0)
+
+    def test_socket_address_separates_stores(self) -> None:
+        """Two stores must never share a daemon.
+
+        A warm handle answers out of one specific database. Reached by a client configured
+        for another, it would return one store's memories in another store's session --
+        a privacy failure that looks exactly like a cache hit.
+        """
+        ipc = self._ipc()
+        a = ipc.socket_path("store-a")
+        b = ipc.socket_path("store-b")
+        self.assertNotEqual(a, b)
+
+    def test_socket_address_changes_when_hook_code_changes(self) -> None:
+        """Edited code must strand the old daemon rather than be served by it.
+
+        A long-lived process keeps running whatever it started with, and nothing about
+        that looks wrong from outside. Folding the source digest into the address means a
+        changed hook simply talks to a different socket.
+        """
+        ipc = self._ipc()
+        import tempfile
+
+        root = pathlib.Path(tempfile.mkdtemp())
+        (root / "lib").mkdir()
+        for name in ipc.CODE_FILES:
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("original", encoding="utf-8")
+        before = ipc.socket_path("k", root=str(root))
+        (root / "recall.py").write_text("edited", encoding="utf-8")
+        self.assertNotEqual(before, ipc.socket_path("k", root=str(root)))
+
+    def test_missing_daemon_is_not_an_error(self) -> None:
+        """`send` collapses every failure to None so the caller falls back.
+
+        Refused connection, stale socket file, hung server, truncated reply: from the
+        client's side these are one condition, and the response to all of them is to
+        query in-process.
+        """
+        ipc = self._ipc()
+        self.assertIsNone(ipc.send("/nonexistent/nowhere.sock", {"q": "x"}, timeout=0.5))
+
+    def test_runtime_directory_is_private(self) -> None:
+        # The socket is a read interface to everything the user has ever stored. The
+        # default umask would leave it readable by every account on the machine.
+        ipc = self._ipc()
+        self.assertEqual(oct(os.stat(ipc.runtime_dir()).st_mode & 0o777), oct(0o700))
+
+    def test_daemon_never_writes(self) -> None:
+        source = (HOOKS / "daemon.py").read_text(encoding="utf-8")
+        for call in (".remember(", ".add(", ".forget(", ".end("):
+            self.assertNotIn(call, source, f"daemon must not {call}")
+
+    def test_fast_path_does_not_import_pathlib(self) -> None:
+        """pathlib costs 10.5ms measured, against a ~35ms client budget.
+
+        `open.py` may use it freely -- it is only reached on the fallback path, where the
+        cost is already lost in a 148ms in-process query.
+        """
+        for name in ("lib/ipc.py", "lib/fast.py", "recall.py"):
+            source = (HOOKS / name).read_text(encoding="utf-8")
+            self.assertNotIn("from pathlib import", source, name)
 
 
 class ReadmeAndLicense(unittest.TestCase):
