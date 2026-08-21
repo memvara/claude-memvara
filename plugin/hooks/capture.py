@@ -29,15 +29,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.extract import triples  # noqa: E402
 from lib.open import open_store, payload  # noqa: E402
+from lib.transcript import span_from_bytes  # noqa: E402
 
 #: Most user turns to ingest in one run. A long turn is normal; a thousand-turn backlog
 #: means the watermark was lost, and replaying all of it is a bill, not a recovery.
 MAX_TURNS = 12
 
-#: Shortest turn worth keeping. "ok", "yes", "do it" carry nothing durable.
-MIN_CHARS = 24
-
-#: Characters of unprocessed user text before extraction is worth running.
+#: Characters of unprocessed transcript before extraction is worth running.
 #:
 #: This threshold is what makes the hook affordable. Extraction boots a headless Claude
 #: session that costs ~21k tokens of its own preamble no matter how much transcript it is
@@ -50,18 +48,6 @@ MIN_SPAN_CHARS = 2000
 #: Where the per-transcript byte offsets live. Beside the store, not in the plugin: the
 #: plugin directory is replaced wholesale on update.
 STATE = Path.home() / ".memvara" / ".hooks" / "capture-state.json"
-
-#: Synthetic user turns. The transcript records slash-command expansions, injected
-#: reminders and tool results as `role: user`; none of them are the user talking, and
-#: ingesting them teaches the store about its own plumbing.
-NOISE = (
-    "<command-message>",
-    "<command-name>",
-    "<system-reminder>",
-    "<local-command-stdout>",
-    "Recalled from Memvara",
-)
-
 
 #: Capture is the one hook whose success is invisible from the transcript, so it keeps a
 #: one-line-per-run record. Bounded by truncation rather than rotation: it is a debugging
@@ -98,52 +84,37 @@ def _write_state(state: dict) -> None:
         pass
 
 
-def _new_turns(transcript: Path, offset: int) -> "tuple[list[str], int]":
-    """User turns after `offset`, and the offset to record next time.
+def _new_span(transcript: Path, offset: int) -> "tuple[str, int]":
+    """Mineable text after `offset`, and the offset to record next time.
 
     Opened in binary and seeked rather than re-read: the point of the watermark is to not
-    pay for the whole file on every turn of a long session.
+    pay for the whole file on every turn of a long session. A lost watermark (truncated
+    file, or offset past EOF) rereads from the start and keeps only the tail, so a
+    thousand-turn backlog does not become one extraction bill.
     """
     try:
         size = transcript.stat().st_size
     except OSError:
-        return [], offset
+        return "", offset
     if size < offset:
         # Truncated or replaced — a different conversation reusing the path. Start over.
         offset = 0
 
-    turns: "list[str]" = []
     try:
         with transcript.open("rb") as fh:
             fh.seek(offset)
             raw = fh.read()
             end = offset + len(raw)
     except OSError:
-        return [], offset
+        return "", offset
 
-    for line in raw.decode("utf-8", "replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        if entry.get("type") != "user":
-            continue
-        message = entry.get("message")
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if not isinstance(content, str):
-            # Tool results arrive as block lists. Nothing the user said is in there.
-            continue
-        text = content.strip()
-        if len(text) < MIN_CHARS or any(marker in text for marker in NOISE):
-            continue
-        turns.append(text)
-
-    return turns[-MAX_TURNS:], end
+    span = span_from_bytes(raw)
+    lines = [line for line in span.splitlines() if line]
+    # ~4 formatted lines per turn (user, assistant, an edit, a result).
+    cap = MAX_TURNS * 4
+    if len(lines) > cap:
+        span = "\n".join(lines[-cap:])
+    return span, end
 
 
 def main() -> int:
@@ -165,9 +136,7 @@ def main() -> int:
 
     key = str(transcript.resolve())
     state = _read_state()
-    turns, end = _new_turns(transcript, int(state.get(key, 0) or 0))
-
-    span = "\n\n".join(turns)
+    span, end = _new_span(transcript, int(state.get(key, 0) or 0))
     if len(span) < MIN_SPAN_CHARS:
         # Not enough new material to justify the fixed overhead of a headless run. Return
         # without touching the watermark so this text is reconsidered with the next turn.

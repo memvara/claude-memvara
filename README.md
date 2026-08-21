@@ -29,13 +29,14 @@ carry: which surface to use, the sequence when a stored fact is
 disputed, scope, clocks, and that `memory_forget` is not erasure.
 Claude Code shows it as `/memvara:memory`.
 
-Three hooks, so memory happens without being asked for:
+Four hooks, so memory happens without being asked for:
 
 | Event | What it does |
 |---|---|
 | `SessionStart` | Opens the session with standing facts, and names the scope it is bound to |
 | `UserPromptSubmit` | Recalls against every prompt |
 | `Stop` | Ingests the turn that just ended |
+| `PreToolUse` | Auto-allows read-only `memory_*` tools; writes still ask |
 
 The hooks try three routes and return the same text from each; only the
 latency differs. A resident daemon answers in ~38 ms. Without one, a
@@ -99,6 +100,35 @@ of its real size.
 The ledger sits beside the store, never inside it. Operational
 accounting is not a fact about you, and must not surface in a recall
 block.
+
+## Teach it your vocabulary
+
+The built-in predicates are a personal-assistant vocabulary. A store of engineering facts
+matches none of them, and an unknown predicate takes the safe default twice over:
+multi-valued, so nothing supersedes it, and slow-decaying, so this morning's deploy still
+ranks as fresh in two years. The first half shows up on the write receipt. The second is
+silent.
+
+Server-side configuration, so it is set where the server is launched:
+
+```bash
+MEMVARA_PREDICATES=engineering        # or: engineering,./ours.toml
+```
+
+A declaration outranks a guess, so a pack corrects a store that already classified
+something wrongly rather than only shaping a fresh one.
+
+## Coming from another memory product
+
+```python
+from memvara.compat import import_mem0, import_supermemory
+```
+
+mem0 records what changed and when, so that import rebuilds supersession. Supermemory
+records current state, so its documents arrive as episodes on their original timestamps
+and nothing invents a history it was never told — which means plain recall answers from
+claims and looks empty until you ask for `include_episodes`. The skill says this at the
+point of use.
 
 ## Other clients
 

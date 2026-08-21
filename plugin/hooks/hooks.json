@@ -33,6 +33,18 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__.*memvara.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/approve.py\"",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

@@ -49,6 +49,8 @@ ALLOWED_PLUGIN_FILES = {
     pathlib.Path("hooks") / "lib" / "ipc.py",
     pathlib.Path("hooks") / "lib" / "fast.py",
     pathlib.Path("hooks") / "lib" / "hosted.py",
+    pathlib.Path("hooks") / "approve.py",
+    pathlib.Path("hooks") / "lib" / "transcript.py",
 }
 
 
@@ -197,12 +199,15 @@ class Hooks(unittest.TestCase):
         body = _json(HOOKS / "hooks.json")
         assert isinstance(body, dict)
         # Recall on every prompt is the whole point; capture is what keeps it fed.
-        self.assertLessEqual({"UserPromptSubmit", "SessionStart", "Stop"},
-                             set(body["hooks"]))
+        # PreToolUse is the SuperMemory-shaped auto-allow for read-only memory_* tools.
+        self.assertLessEqual(
+            {"UserPromptSubmit", "SessionStart", "Stop", "PreToolUse"},
+            set(body["hooks"]),
+        )
 
     def test_hooks_are_silent_and_succeed_with_nothing_configured(self) -> None:
         payload = json.dumps({"prompt": "hello", "transcript_path": "/nonexistent"})
-        for script in ("recall.py", "session_start.py", "capture.py"):
+        for script in ("recall.py", "session_start.py", "capture.py", "approve.py"):
             with self.subTest(script=script):
                 proc = subprocess.run(
                     ["python3", str(HOOKS / script)],
@@ -211,6 +216,51 @@ class Hooks(unittest.TestCase):
                 )
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(proc.stdout, "", "a hook with no store must print nothing")
+
+    def test_readonly_memory_tools_are_allowed_without_a_prompt(self) -> None:
+        payload = json.dumps({"tool_name": "mcp__memvara__memory_search"})
+        proc = subprocess.run(
+            ["python3", str(HOOKS / "approve.py")],
+            input=payload, capture_output=True, text=True,
+            env=self.BARREN, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        body = json.loads(proc.stdout)
+        self.assertEqual(body["hookSpecificOutput"]["permissionDecision"], "allow")
+
+    def test_writes_are_not_auto_approved(self) -> None:
+        payload = json.dumps({"tool_name": "mcp__memvara__memory_forget"})
+        proc = subprocess.run(
+            ["python3", str(HOOKS / "approve.py")],
+            input=payload, capture_output=True, text=True,
+            env=self.BARREN, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+    def test_transcript_mines_edits_and_drops_recall_injection(self) -> None:
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib.transcript import span_from_bytes
+        finally:
+            sys.path.pop(0)
+        raw = "\n".join([
+            json.dumps({"type": "user", "message": {"content": "where is the store"}}),
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "do not store this"},
+                {"type": "text", "text": "Putting it in plugin/"},
+                {"type": "tool_use", "name": "Edit",
+                 "input": {"file_path": "plugin/hooks/open.py"}},
+            ]}}),
+            json.dumps({"type": "user", "message": {
+                "content": "Recalled from Memvara\n- a standing fact"}}),
+        ]).encode()
+        span = span_from_bytes(raw)
+        self.assertIn("User: where is the store", span)
+        self.assertIn("Claude: Putting it in plugin/", span)
+        self.assertIn("Claude used Edit", span)
+        self.assertNotIn("do not store this", span)
+        self.assertNotIn("Recalled from Memvara", span)
 
     def test_extraction_cannot_recurse(self) -> None:
         """A Stop hook that spawns Claude must not give the child a Stop hook.
