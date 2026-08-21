@@ -1,5 +1,5 @@
 ---
-name: memvara
+name: memory
 description: >
   Wire Memvara into an agent or editor, pick the right surface (hosted MCP,
   Python library, REST), and use memory without forging history. Use when the
@@ -60,6 +60,7 @@ transcript. See `references/scopes.md`.
 | What was true then / what we believed then | `references/time.md` |
 | Why did you say that / delete me / DSAR | `references/governance.md` |
 | Moving off mem0 | `references/migrate-mem0.md` |
+| Moving off Supermemory | `references/migrate-supermemory.md` |
 | A worked turn | `references/examples.md` |
 | No skill folder on this client | `references/project-instructions.md` |
 

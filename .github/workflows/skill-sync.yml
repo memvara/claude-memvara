@@ -28,9 +28,21 @@ jobs:
             echo "changed=false" >> "$GITHUB_ENV"
             exit 0
           fi
-          rm -rf plugin/skills/memvara
+          rm -rf plugin/skills/memory
           mkdir -p plugin/skills
-          cp -R "$src" plugin/skills/memvara
+          cp -R "$src" plugin/skills/memory
+          # The library calls this skill 'memvara'. Shipped inside a plugin already
+          # named memvara it would render '/memvara:memvara', so the vendored copy is
+          # renamed to 'memory' -- the one and only edit applied on sync, and the one
+          # test_matches_library_at_lock_sha compensates for when it diffs the bytes.
+          python3 - <<'RENAME'
+          from pathlib import Path
+          p = Path('plugin/skills/memory/SKILL.md')
+          text = p.read_text(encoding='utf-8')
+          if 'name: memvara\n' not in text:
+              raise SystemExit('library frontmatter is no longer "name: memvara"')
+          p.write_text(text.replace('name: memvara\n', 'name: memory\n', 1), encoding='utf-8')
+          RENAME
           sha=$(git -C /tmp/memvara rev-parse HEAD)
           python3 -c "
           from pathlib import Path
@@ -43,7 +55,7 @@ jobs:
               'path=memvara/skills/memvara\\n'
           )
           "
-          if git diff --quiet -- plugin/skills/memvara skill.lock; then
+          if git diff --quiet -- plugin/skills/memory skill.lock; then
             echo "changed=false" >> "$GITHUB_ENV"
           else
             echo "changed=true" >> "$GITHUB_ENV"
@@ -58,7 +70,8 @@ jobs:
           title: "chore: sync skill from memvara/memvara@${{ env.sha }}"
           body: |
             Vendored skill drifted from [memvara/memvara](https://github.com/memvara/memvara) `${{ env.sha }}`.
-            This PR only copies `memvara/skills/memvara/` and updates `skill.lock`.
+            This PR only copies `memvara/skills/memvara/` to `plugin/skills/memory/`
+            (renaming the skill so it reads `/memvara:memory`) and updates `skill.lock`.
             CI still has to pass before merge.
           branch: sync/skill-${{ env.sha }}
           delete-branch: true

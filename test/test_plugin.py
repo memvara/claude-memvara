@@ -11,18 +11,46 @@ import os
 import pathlib
 import re
 import subprocess
+import sys
 import unittest
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "plugin"
-SKILL = PLUGIN / "skills" / "memvara"
+HOOKS = PLUGIN / "hooks"
 HOSTED = "https://app.memvara.dev/mcp"
 REPO_NAME = "memvara/claude-memvara"
 
+#: The skill ships as `memory` so the client renders it `/memvara:memory` instead of
+#: `/memvara:memvara`. The library still calls it `memvara`, which is the right name
+#: everywhere else — including the bare `~/.claude/skills/memvara/` install, where there
+#: is no plugin segment to pair it with. The gap is one frontmatter line, and
+#: `test_matches_library_at_lock_sha` asserts it is the only one.
+SKILL_NAME = "memory"
+LIBRARY_SKILL_NAME = "memvara"
+LIBRARY_SKILL_PATH = "memvara/skills/memvara"
+SKILL = PLUGIN / "skills" / SKILL_NAME
+
+#: Hook scripts are executable content the client runs on every prompt, so the allowlist
+#: names them one by one. A file appearing under `hooks/` that nobody listed here is the
+#: failure this gate exists to catch.
 ALLOWED_PLUGIN_FILES = {
     pathlib.Path(".claude-plugin") / "plugin.json",
     pathlib.Path(".mcp.json"),
+    pathlib.Path("hooks") / "hooks.json",
+    pathlib.Path("hooks") / "recall.py",
+    pathlib.Path("hooks") / "session_start.py",
+    pathlib.Path("hooks") / "capture.py",
+    pathlib.Path("hooks") / "lib" / "__init__.py",
+    pathlib.Path("hooks") / "lib" / "open.py",
+    pathlib.Path("hooks") / "lib" / "extract.py",
+    pathlib.Path("hooks") / "lib" / "usage.py",
+    pathlib.Path("hooks") / "daemon.py",
+    pathlib.Path("hooks") / "lib" / "ipc.py",
+    pathlib.Path("hooks") / "lib" / "fast.py",
+    pathlib.Path("hooks") / "lib" / "hosted.py",
+    pathlib.Path("hooks") / "approve.py",
+    pathlib.Path("hooks") / "lib" / "transcript.py",
 }
 
 
@@ -101,16 +129,399 @@ class SkillTree(unittest.TestCase):
         refs = list((SKILL / "references").glob("*.md"))
         self.assertGreaterEqual(len(refs), 7)
 
+    def test_skill_is_named_for_the_plugin_segment(self) -> None:
+        """`/memvara:memory`, not `/memvara:memvara`.
+
+        The client builds the invocation from the plugin name and the skill's own
+        frontmatter, so a directory rename alone changes nothing. Both are asserted
+        because a mismatch between them is silent.
+        """
+        self.assertEqual(SKILL.name, SKILL_NAME)
+        text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+        self.assertRegex(text, rf"(?m)^name:[ \t]+{re.escape(SKILL_NAME)}[ \t]*$")
+
     def test_matches_library_at_lock_sha(self) -> None:
+        """Vendored bytes equal the library's, except the one line we rename.
+
+        Comparing after a targeted substitution rather than skipping the file keeps the
+        drift gate at full strength: every other byte of the skill still has to match,
+        and the rename itself fails loudly if the library's frontmatter ever stops
+        saying what this expects.
+        """
         lock = _lock()
         self.assertEqual(lock["repo"], "memvara/memvara")
-        self.assertEqual(lock["path"], "memvara/skills/memvara")
+        self.assertEqual(lock["path"], LIBRARY_SKILL_PATH)
         sha = lock["sha"]
         self.assertEqual(len(sha), 40)
+
         for rel in ("SKILL.md", "references/hosted-mcp.md"):
-            expected = _library_bytes(sha, f"memvara/skills/memvara/{rel}")
+            expected = _library_bytes(sha, f"{LIBRARY_SKILL_PATH}/{rel}")
+            if rel == "SKILL.md":
+                old = f"name: {LIBRARY_SKILL_NAME}\n".encode()
+                self.assertIn(old, expected, f"library frontmatter at {sha} is not {old!r}")
+                expected = expected.replace(old, f"name: {SKILL_NAME}\n".encode(), 1)
             got = (SKILL / rel).read_bytes()
             self.assertEqual(got, expected, f"{rel} drifted from {sha}")
+
+
+class Hooks(unittest.TestCase):
+    """The hooks run unattended on every prompt, so the bar is behavioural.
+
+    This file used to assert `hooks/` did not exist. That was the right call while the
+    plugin was only an MCP endpoint and a skill: a hook is code the client executes
+    without being asked, and shipping one is a different promise than shipping prose.
+    The promise is kept here instead of avoided — every script is executed, against a
+    deliberately empty environment, and required to stay silent and succeed.
+    """
+
+    #: Every hook must survive this: no store, no credentials, no library.
+    BARREN = {"HOME": "/nonexistent", "PATH": os.environ.get("PATH", "")}
+
+    def _scripts(self) -> list[str]:
+        body = _json(HOOKS / "hooks.json")
+        assert isinstance(body, dict)
+        found = []
+        for entries in body["hooks"].values():
+            for entry in entries:
+                for hook in entry["hooks"]:
+                    self.assertEqual(hook["type"], "command")
+                    found.append(hook["command"])
+        return found
+
+    def test_every_referenced_script_exists(self) -> None:
+        for command in self._scripts():
+            match = re.search(r"\$\{CLAUDE_PLUGIN_ROOT\}/(\S+?)\"", command)
+            self.assertIsNotNone(match, command)
+            assert match is not None
+            self.assertTrue((PLUGIN / match.group(1)).is_file(), command)
+
+    def test_covers_the_events_that_make_memory_automatic(self) -> None:
+        body = _json(HOOKS / "hooks.json")
+        assert isinstance(body, dict)
+        # Recall on every prompt is the whole point; capture is what keeps it fed.
+        # PreToolUse is the SuperMemory-shaped auto-allow for read-only memory_* tools.
+        self.assertLessEqual(
+            {"UserPromptSubmit", "SessionStart", "Stop", "PreToolUse"},
+            set(body["hooks"]),
+        )
+
+    def test_hooks_are_silent_and_succeed_with_nothing_configured(self) -> None:
+        payload = json.dumps({"prompt": "hello", "transcript_path": "/nonexistent"})
+        for script in ("recall.py", "session_start.py", "capture.py", "approve.py"):
+            with self.subTest(script=script):
+                proc = subprocess.run(
+                    ["python3", str(HOOKS / script)],
+                    input=payload, capture_output=True, text=True,
+                    env=self.BARREN, timeout=30,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, "", "a hook with no store must print nothing")
+
+    def test_readonly_memory_tools_are_allowed_without_a_prompt(self) -> None:
+        payload = json.dumps({"tool_name": "mcp__memvara__memory_search"})
+        proc = subprocess.run(
+            ["python3", str(HOOKS / "approve.py")],
+            input=payload, capture_output=True, text=True,
+            env=self.BARREN, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        body = json.loads(proc.stdout)
+        self.assertEqual(body["hookSpecificOutput"]["permissionDecision"], "allow")
+
+    def test_writes_are_not_auto_approved(self) -> None:
+        payload = json.dumps({"tool_name": "mcp__memvara__memory_forget"})
+        proc = subprocess.run(
+            ["python3", str(HOOKS / "approve.py")],
+            input=payload, capture_output=True, text=True,
+            env=self.BARREN, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+    def test_transcript_mines_edits_and_drops_recall_injection(self) -> None:
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib.transcript import span_from_bytes
+        finally:
+            sys.path.pop(0)
+        raw = "\n".join([
+            json.dumps({"type": "user", "message": {"content": "where is the store"}}),
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "do not store this"},
+                {"type": "text", "text": "Putting it in plugin/"},
+                {"type": "tool_use", "name": "Edit",
+                 "input": {"file_path": "plugin/hooks/open.py"}},
+            ]}}),
+            json.dumps({"type": "user", "message": {
+                "content": "Recalled from Memvara\n- a standing fact"}}),
+        ]).encode()
+        span = span_from_bytes(raw)
+        self.assertIn("User: where is the store", span)
+        self.assertIn("Claude: Putting it in plugin/", span)
+        self.assertIn("Claude used Edit", span)
+        self.assertNotIn("do not store this", span)
+        self.assertNotIn("Recalled from Memvara", span)
+
+    def test_extraction_cannot_recurse(self) -> None:
+        """A Stop hook that spawns Claude must not give the child a Stop hook.
+
+        This is the failure that does not announce itself: the child inherits the same
+        hook set, finishes, fires Stop, spawns another child. Nothing errors — the machine
+        just fills with Claude processes and the bill climbs. Two independent stops are
+        asserted because either one alone is a single point of failure.
+        """
+        source = (HOOKS / "lib" / "extract.py").read_text(encoding="utf-8")
+        # 1. The child is launched with an empty hook set.
+        self.assertIn('"--settings", \'{"hooks":{}}\'', source)
+        # 2. And refuses to start if it finds itself already inside an extraction.
+        self.assertIn("SENTINEL", source)
+
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib.extract import SENTINEL, _payload
+        finally:
+            sys.path.pop(0)
+
+        original = os.environ.get(SENTINEL)
+        os.environ[SENTINEL] = "1"
+        try:
+            result, usage = _payload("anything at all")
+            self.assertEqual(result, "", "extraction ran despite the recursion sentinel")
+            self.assertEqual(usage, {}, "a blocked run must report no tokens spent")
+        finally:
+            if original is None:
+                os.environ.pop(SENTINEL, None)
+            else:
+                os.environ[SENTINEL] = original
+
+    def test_capture_batches_rather_than_running_per_turn(self) -> None:
+        """The fixed overhead of a headless run is ~21k tokens regardless of input, so a
+        per-turn call spends the same on one sentence as on twenty. The threshold is the
+        only thing keeping that in proportion."""
+        source = (HOOKS / "capture.py").read_text(encoding="utf-8")
+        self.assertIn("MIN_SPAN_CHARS", source)
+        self.assertRegex(source, r"len\(span\) < MIN_SPAN_CHARS")
+
+    def test_hooks_do_not_hardcode_a_store_path(self) -> None:
+        # Configuration is discovered from the client's own server block. A literal path
+        # here would silently read a different store than the MCP server writes.
+        for path in HOOKS.rglob("*.py"):
+            raw = path.read_text(encoding="utf-8")
+            self.assertNotIn("MEMVARA_DB=", raw, path)
+            self.assertNotIn("/.memvara/workstation", raw, path)
+
+
+class Usage(unittest.TestCase):
+    """Token accounting for what capture spends."""
+
+    def _usage(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("lib.usage")
+        finally:
+            sys.path.pop(0)
+
+    def test_uses_the_librarys_billing_series(self) -> None:
+        """Names come from the catalogue, not from this repo.
+
+        `write.tokens_in` is documented there as the series to bill on. A hook that
+        invented `capture.tokens` would produce numbers nothing else could aggregate.
+        """
+        usage = self._usage()
+        self.assertEqual(usage.TOKENS_IN, "write.tokens_in")
+        self.assertEqual(usage.TOKENS_OUT, "write.tokens_out")
+
+    def test_satisfies_the_recorder_protocol(self) -> None:
+        usage = self._usage()
+        for method in ("counter", "gauge", "timing"):
+            self.assertTrue(callable(getattr(usage.JsonlRecorder, method, None)), method)
+
+    def test_a_tag_cannot_overwrite_an_envelope_field(self) -> None:
+        """Regression: tags used to be flattened into the record.
+
+        `record_extraction` tags cache rows `kind="cache_read"`, which collided with the
+        envelope's own `kind` (counter/gauge/timing) and silently replaced it. The row
+        stayed valid JSON, so nothing failed and the metric type was simply lost.
+        """
+        usage = self._usage()
+        import tempfile
+
+        path = pathlib.Path(tempfile.mkdtemp()) / "usage.jsonl"
+        usage.JsonlRecorder(path).counter("write.tokens_in", 5, kind="cache_read")
+        record = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(record["kind"], "counter")
+        self.assertEqual(record["tags"]["kind"], "cache_read")
+
+    def test_input_total_includes_cache_reads_and_writes(self) -> None:
+        """The cached preamble *is* the cost of a headless run.
+
+        A measured extraction was 9 fresh input tokens against 21,130 cached. Counting
+        only `input_tokens` would report the run as ~1/2000th of its true size and make
+        the batching threshold look like premature optimisation.
+        """
+        usage = self._usage()
+        import tempfile
+
+        path = pathlib.Path(tempfile.mkdtemp()) / "usage.jsonl"
+        usage.record_extraction(
+            {"input_tokens": 9, "cache_read_input_tokens": 12206,
+             "cache_creation_input_tokens": 8924, "output_tokens": 871},
+            model="m", recorder=usage.JsonlRecorder(path))
+        totals = usage.totals(path)
+        self.assertEqual(totals["write.tokens_in"], 9 + 12206 + 8924)
+        self.assertEqual(totals["write.tokens_out"], 871)
+
+    def test_usage_is_not_written_into_the_memory_store(self) -> None:
+        # Operational accounting belongs beside the store, not in it: "we spent 4,897
+        # tokens" must never surface as a fact about the user in a recall block.
+        source = (HOOKS / "lib" / "usage.py").read_text(encoding="utf-8")
+        self.assertNotIn("remember(", source)
+        self.assertNotIn("store.add", source)
+
+
+class Daemon(unittest.TestCase):
+    """The resident recall process. Optional by construction, private by permission."""
+
+    def _ipc(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("lib.ipc")
+        finally:
+            sys.path.pop(0)
+
+    def test_socket_address_separates_stores(self) -> None:
+        """Two stores must never share a daemon.
+
+        A warm handle answers out of one specific database. Reached by a client configured
+        for another, it would return one store's memories in another store's session --
+        a privacy failure that looks exactly like a cache hit.
+        """
+        ipc = self._ipc()
+        a = ipc.socket_path("store-a")
+        b = ipc.socket_path("store-b")
+        self.assertNotEqual(a, b)
+
+    def test_socket_address_changes_when_hook_code_changes(self) -> None:
+        """Edited code must strand the old daemon rather than be served by it.
+
+        A long-lived process keeps running whatever it started with, and nothing about
+        that looks wrong from outside. Folding the source digest into the address means a
+        changed hook simply talks to a different socket.
+        """
+        ipc = self._ipc()
+        import tempfile
+
+        root = pathlib.Path(tempfile.mkdtemp())
+        (root / "lib").mkdir()
+        for name in ipc.CODE_FILES:
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("original", encoding="utf-8")
+        before = ipc.socket_path("k", root=str(root))
+        (root / "recall.py").write_text("edited", encoding="utf-8")
+        self.assertNotEqual(before, ipc.socket_path("k", root=str(root)))
+
+    def test_missing_daemon_is_not_an_error(self) -> None:
+        """`send` collapses every failure to None so the caller falls back.
+
+        Refused connection, stale socket file, hung server, truncated reply: from the
+        client's side these are one condition, and the response to all of them is to
+        query in-process.
+        """
+        ipc = self._ipc()
+        self.assertIsNone(ipc.send("/nonexistent/nowhere.sock", {"q": "x"}, timeout=0.5))
+
+    def test_runtime_directory_is_private(self) -> None:
+        # The socket is a read interface to everything the user has ever stored. The
+        # default umask would leave it readable by every account on the machine.
+        ipc = self._ipc()
+        self.assertEqual(oct(os.stat(ipc.runtime_dir()).st_mode & 0o777), oct(0o700))
+
+    def test_daemon_never_writes(self) -> None:
+        source = (HOOKS / "daemon.py").read_text(encoding="utf-8")
+        for call in (".remember(", ".add(", ".forget(", ".end("):
+            self.assertNotIn(call, source, f"daemon must not {call}")
+
+    def test_fast_path_does_not_import_pathlib(self) -> None:
+        """pathlib costs 10.5ms measured, against a ~35ms client budget.
+
+        `open.py` may use it freely -- it is only reached on the fallback path, where the
+        cost is already lost in a 148ms in-process query.
+        """
+        for name in ("lib/ipc.py", "lib/fast.py", "recall.py", "lib/hosted.py"):
+            source = (HOOKS / name).read_text(encoding="utf-8")
+            self.assertNotIn("from pathlib import", source, name)
+
+
+class Hosted(unittest.TestCase):
+    """The stdlib-only path, so a hosted install needs no pip install."""
+
+    def _hosted(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("lib.hosted")
+        finally:
+            sys.path.pop(0)
+
+    def test_never_sends_the_stdlib_user_agent(self) -> None:
+        """Cloudflare refuses `Python-urllib/*` at the edge with error 1010.
+
+        Measured against the live endpoint: the stock agent gets 403/1010 and never
+        reaches the application, while curl's, a browser's and this one all get through
+        to a genuine 401. Nothing in that 403 suggests the client's *name* is the fault,
+        which is what makes it worth a test rather than a comment.
+        """
+        hosted = self._hosted()
+        self.assertTrue(hosted.USER_AGENT)
+        self.assertNotIn("urllib", hosted.USER_AGENT.lower())
+        self.assertNotIn("python", hosted.USER_AGENT.lower())
+        source = (HOOKS / "lib" / "hosted.py").read_text(encoding="utf-8")
+        self.assertIn('"user-agent": USER_AGENT', source)
+
+    def test_uses_a_keepalive_capable_client(self) -> None:
+        """`urlopen` cannot reuse a connection; `http.client` can.
+
+        On the live endpoint the same call costs 609ms on a fresh connection and 177ms on
+        a warm one. Using urllib here would silently forfeit that on every prompt.
+        """
+        source = (HOOKS / "lib" / "hosted.py").read_text(encoding="utf-8")
+        self.assertIn("http.client", source)
+        self.assertNotIn("urllib.request", source)
+
+    def test_imports_nothing_outside_the_standard_library(self) -> None:
+        # The entire point: a hosted install pastes a URL and gets working hooks. An
+        # import of `memvara` here would make that false on exactly the target machine.
+        source = (HOOKS / "lib" / "hosted.py").read_text(encoding="utf-8")
+        self.assertNotIn("import memvara", source)
+        self.assertNotIn("import httpx", source)
+
+    def test_tolerates_a_missing_ca_bundle(self) -> None:
+        """python.org's macOS build does not use the system trust store.
+
+        Without a bundle it raises CERTIFICATE_VERIFY_FAILED against a certificate every
+        other tool on the machine accepts, so `certifi` is preferred and the default
+        context is the fallback rather than the only option.
+        """
+        source = (HOOKS / "lib" / "hosted.py").read_text(encoding="utf-8")
+        self.assertIn("certifi", source)
+        self.assertIn("ssl.create_default_context()", source)
+        self.assertIsNotNone(self._hosted()._context())
+
+    def test_no_credentials_is_not_an_error(self) -> None:
+        hosted = self._hosted()
+        original = hosted.CREDENTIALS
+        hosted.CREDENTIALS = "/nonexistent/credentials.json"
+        try:
+            self.assertIsNone(hosted.credentials())
+            self.assertIsNone(hosted.open_hosted())
+        finally:
+            hosted.CREDENTIALS = original
 
 
 class ReadmeAndLicense(unittest.TestCase):
@@ -142,8 +553,7 @@ class Hygiene(unittest.TestCase):
             raw = path.read_text(encoding="utf-8")
             self.assertNotIn("npx", raw, path)
 
-    def test_no_hooks_or_app_json(self) -> None:
-        self.assertFalse((PLUGIN / "hooks").exists())
+    def test_no_app_json_or_commands(self) -> None:
         self.assertFalse((PLUGIN / ".app.json").exists())
         self.assertFalse((PLUGIN / "commands").exists())
 
@@ -152,7 +562,13 @@ class Hygiene(unittest.TestCase):
         for path in SKILL.rglob("*"):
             if path.is_file():
                 allowed.add(path.relative_to(PLUGIN))
-        found = {p.relative_to(PLUGIN) for p in PLUGIN.rglob("*") if p.is_file()}
+        found = {
+            p.relative_to(PLUGIN) for p in PLUGIN.rglob("*")
+            # Running a hook writes bytecode next to it, so __pycache__ appears inside
+            # any installed copy. It is generated, never committed (see .gitignore), and
+            # failing on it would fail every machine that has used the plugin once.
+            if p.is_file() and "__pycache__" not in p.parts
+        }
         extra = found - allowed
         self.assertFalse(extra, f"unexpected plugin files: {sorted(extra)}")
 
