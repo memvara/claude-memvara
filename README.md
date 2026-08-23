@@ -72,7 +72,10 @@ Capture needs a model, and uses the one you already pay for. It shells
 out to `claude -p` against your existing Claude Code login, so there is
 no `ANTHROPIC_API_KEY` and no second bill. It does not go through
 `MEMVARA_LLM`, which stays `none`: the library's `NullLLM` accepts prose
-and stores nothing, so facts are written as triples instead.
+and stores nothing, so facts are written as triples instead. On a hosted
+install there is no local store to open, so capture writes those triples
+over the same MCP endpoint recall reads; a write the endpoint refuses is
+logged as failed rather than counted as stored.
 
 A headless run costs about 21k tokens of Claude Code's own preamble
 before it reads any of your transcript — roughly $0.018 and 12–14s on

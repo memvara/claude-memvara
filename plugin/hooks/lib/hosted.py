@@ -23,8 +23,9 @@ costs. `HTTPSConnection` is the stdlib object that can be held open, and holding
 entire reason the daemon pays for itself on a hosted install: ~390ms cold against
 ~162-287ms warm.
 
-Everything fails to `None`. A hosted store that cannot be reached is a prompt without a
-memory block, never a prompt with an error in it.
+Reads fail to `None`. A hosted store that cannot be reached is a prompt without a memory
+block, never a prompt with an error in it. `remember` is the exception and raises, because
+a write that fails quietly is counted by its caller as a fact that landed.
 """
 
 from __future__ import annotations
@@ -146,7 +147,7 @@ class HostedRecall:
             pass
         self._conn = None
 
-    # -- the one call a hook makes ---------------------------------------------
+    # -- the calls a hook makes ------------------------------------------------
 
     def _ensure_session(self) -> bool:
         if self._session:
@@ -176,13 +177,54 @@ class HostedRecall:
         result = reply.get("result")
         if not isinstance(result, dict):
             return None
-        text = "\n".join(
-            block.get("text", "") for block in result.get("content", [])
-            if isinstance(block, dict) and block.get("type") == "text"
-        ).strip()
+        text = _content_text(result)
         if not text:
             return None
         return f"{header}\n{text}" if header else text
+
+    def remember(self, subject: str, predicate: str, obj: str, *,
+                 confidence: float = 1.0) -> str:
+        """Write one triple, or raise. Returns the server's receipt line.
+
+        Everything on the read path above fails to `None`, because a prompt without a
+        memory block beats a prompt with an error in it. A write inverts that argument. A
+        caller cannot tell a `None` meaning "stored nothing" from one meaning "nothing to
+        store", so a silent failure here is counted as a fact that landed, and the store
+        that gained nothing reports a successful hook. This raises instead, and lets the
+        caller record what went wrong.
+        """
+        if not self._ensure_session():
+            raise RuntimeError("no session on the hosted endpoint")
+        reply = self._rpc("tools/call", {
+            "name": "memory_remember",
+            "arguments": {
+                "subject": subject,
+                "predicate": predicate,
+                "object": obj,
+                "confidence": confidence,
+            },
+        })
+        if not isinstance(reply, dict):
+            raise RuntimeError("no reply to memory_remember")
+        if reply.get("error") is not None:
+            raise RuntimeError(str(reply["error"]))
+        result = reply.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("malformed reply to memory_remember")
+        text = _content_text(result)
+        # A tool that fails answers 200 with isError set, not an HTTP error, so a write
+        # refused by the server arrives looking exactly like one that succeeded.
+        if result.get("isError"):
+            raise RuntimeError(text or "memory_remember reported an error")
+        return text
+
+
+def _content_text(result: dict) -> str:
+    """The text blocks of a tool result, joined. Empty when there are none."""
+    return "\n".join(
+        block.get("text", "") for block in result.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "text"
+    ).strip()
 
 
 def _decode(raw: bytes) -> "dict | None":
