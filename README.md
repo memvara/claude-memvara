@@ -65,8 +65,15 @@ certificate every other tool accepts.
 
 Configuration is discovered from the `memvara` server block in your own
 client settings, so the hooks open the store the MCP server writes to
-rather than one of their own choosing, and they fall silent when there is
-no store, no library and no login.
+rather than one of their own choosing, and they degrade to doing nothing
+when there is no store, no library and no login.
+
+Both hooks say so in the terminal. Plain stdout from a hook is either
+context for the model or nothing at all, depending on the event, and
+neither is visible to the person watching — so a hook that had silently
+stopped working looked exactly like one with nothing to say. Each now
+prints a one-line `systemMessage`: `Memvara · 4 note(s) recalled` before
+the turn, `Memvara · 2 fact(s) stored from this reply` after it.
 
 Capture needs a model, and uses the one you already pay for. It shells
 out to `claude -p` against your existing Claude Code login, so there is
@@ -77,14 +84,25 @@ install there is no local store to open, so capture writes those triples
 over the same MCP endpoint recall reads; a write the endpoint refuses is
 logged as failed rather than counted as stored.
 
-A headless run costs about 21k tokens of Claude Code's own preamble
-before it reads any of your transcript — roughly $0.018 and 12–14s on
-Haiku, whether it is handed one sentence or twenty. So capture batches:
-nothing runs until 2000 characters of unprocessed conversation have
-accumulated, and below that the watermark stays put so the text joins the
-next batch. Each run appends a line to `~/.memvara/.hooks/capture.log`
-saying how many facts were found and how many were stored, which is the
-only place a failed write is distinguishable from a quiet transcript.
+Capture is scoped to one turn. The `Stop` hook mines the reply Claude
+just gave, and the `UserPromptSubmit` hook mines the message you just
+sent, in a process started detached so that no prompt waits on a model
+call. They are separate because they hold different things: a preference
+is stated in the prompt and only obeyed in the reply.
+
+This replaced batching, and it costs more. A headless run is about 21k
+tokens of Claude Code's own preamble before it reads a word of your
+conversation — roughly $0.018 and 12–14s on Haiku, whether handed one
+sentence or twenty — so **budget about two runs per turn**. Batching was
+cheaper and lost data: the old hook kept the last 48 formatted lines of
+each batch while advancing its watermark past everything it had read, so
+on a session with large tool outputs most of the transcript was skipped
+unread and could never be reconsidered. Measured on one session: 630 KB
+consumed, six extractions paid for, only the tail of each ever seen.
+
+Each run appends a line to `~/.memvara/.hooks/capture.log` saying how
+many facts were found and how many were stored, which is where a failed
+write is distinguishable from a quiet turn.
 
 The child is launched with an empty hook set, and refuses to start if it
 finds itself already inside an extraction. Without both, a `Stop` hook

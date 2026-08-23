@@ -144,6 +144,46 @@ def format_entry(entry: dict) -> list[str]:
     return []
 
 
+def last_reply(raw: bytes) -> str:
+    """What Claude said and did in its most recent turn, and nothing earlier.
+
+    The boundary is not "the last entry of type user". Tool results arrive as user
+    entries too, so that boundary would cut the turn at Claude's own last tool call and
+    return a fragment. The real boundary is the last entry that formats to a `User:`
+    line, which is a prompt a person typed.
+
+    Only assistant entries come back. Tool *results* are the environment answering, not
+    the reply, and including them would put command output into the extractor where it
+    reads as fact.
+    """
+    entries = []
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+
+    start = 0
+    for index in range(len(entries) - 1, -1, -1):
+        entry = entries[index]
+        if entry.get("type") != "user":
+            continue
+        if any(line.startswith("User: ") for line in format_entry(entry)):
+            start = index + 1
+            break
+
+    out: list[str] = []
+    for entry in entries[start:]:
+        if entry.get("type") == "assistant":
+            out.extend(format_entry(entry))
+    return "\n".join(out)
+
+
 def span_from_bytes(raw: bytes) -> str:
     """Decode a JSONL slice (the bytes after the watermark) into mineable text."""
     lines_out: list[str] = []

@@ -51,6 +51,8 @@ ALLOWED_PLUGIN_FILES = {
     pathlib.Path("hooks") / "lib" / "hosted.py",
     pathlib.Path("hooks") / "approve.py",
     pathlib.Path("hooks") / "lib" / "transcript.py",
+    pathlib.Path("hooks") / "lib" / "write.py",
+    pathlib.Path("hooks") / "remember_prompt.py",
 }
 
 
@@ -205,17 +207,60 @@ class Hooks(unittest.TestCase):
             set(body["hooks"]),
         )
 
-    def test_hooks_are_silent_and_succeed_with_nothing_configured(self) -> None:
+    def test_hooks_succeed_with_nothing_configured(self) -> None:
+        """No store, no login, no transcript: exit 0 and never a traceback.
+
+        Two of these now print, which is a change from the rule that a hook with nothing
+        configured prints nothing. What that rule protects is the prompt, and a
+        `systemMessage` cannot fail one: it is a line in the terminal. Printing it is how
+        a hook that is working stops being indistinguishable from one that is not, which
+        is the failure that cost the most time here. What must still hold is that the
+        output is well-formed and the exit code is 0.
+        """
+        # The sentinel keeps recall from starting a real extraction: without it this test
+        # spawns `claude -p` and bills the person running the suite.
+        env = dict(self.BARREN, MEMVARA_CAPTURE_ACTIVE="1")
         payload = json.dumps({"prompt": "hello", "transcript_path": "/nonexistent"})
         for script in ("recall.py", "session_start.py", "capture.py", "approve.py"):
             with self.subTest(script=script):
                 proc = subprocess.run(
                     ["python3", str(HOOKS / script)],
                     input=payload, capture_output=True, text=True,
-                    env=self.BARREN, timeout=30,
+                    env=env, timeout=30,
                 )
                 self.assertEqual(proc.returncode, 0, proc.stderr)
-                self.assertEqual(proc.stdout, "", "a hook with no store must print nothing")
+                if proc.stdout.strip():
+                    json.loads(proc.stdout)  # must be the JSON protocol, not loose text
+
+    def test_recall_reports_itself_to_the_person_at_the_terminal(self) -> None:
+        """Plain stdout on this event reaches the model and nobody else.
+
+        The whole point of the JSON reply is `systemMessage`, which is the only field the
+        user sees. A recall hook that silently stopped working looked exactly like one
+        with nothing to say, for a whole session.
+        """
+        env = dict(self.BARREN, MEMVARA_CAPTURE_ACTIVE="1")
+        proc = subprocess.run(
+            ["python3", str(HOOKS / "recall.py")],
+            input=json.dumps({"prompt": "hello"}), capture_output=True, text=True,
+            env=env, timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        body = json.loads(proc.stdout)
+        self.assertIn("Memvara", body["systemMessage"])
+        # Nothing was configured, so there is no context to add -- but the report still
+        # goes out. That asymmetry is the feature.
+        self.assertNotIn("hookSpecificOutput", body)
+
+    def test_recall_does_not_extract_inside_an_extraction(self) -> None:
+        """The prompt writer is spawned by recall, so recursion has to stop here too.
+
+        `lib.extract` already refuses to run under the sentinel, but a hook that spawned
+        the child anyway would pay a process per prompt to learn that.
+        """
+        source = (HOOKS / "recall.py").read_text(encoding="utf-8")
+        self.assertIn("SENTINEL", source)
+        self.assertRegex(source, r"if os\.environ\.get\(SENTINEL\):\s*\n\s*return")
 
     def test_readonly_memory_tools_are_allowed_without_a_prompt(self) -> None:
         payload = json.dumps({"tool_name": "mcp__memvara__memory_search"})
@@ -294,13 +339,48 @@ class Hooks(unittest.TestCase):
             else:
                 os.environ[SENTINEL] = original
 
-    def test_capture_batches_rather_than_running_per_turn(self) -> None:
-        """The fixed overhead of a headless run is ~21k tokens regardless of input, so a
-        per-turn call spends the same on one sentence as on twenty. The threshold is the
-        only thing keeping that in proportion."""
+    def test_capture_mines_one_turn_and_never_skips_text(self) -> None:
+        """Batching was cheaper and lost data, which is not a trade worth making.
+
+        The old hook held text back until 2000 characters had accumulated, mined the last
+        48 formatted lines of it, and moved its watermark past *everything* it had read.
+        On a session with large tool outputs that skipped most of the transcript unread,
+        permanently: 630KB consumed and six extractions paid for, with only the tail of
+        each batch ever seen. Per turn costs more and drops nothing.
+        """
         source = (HOOKS / "capture.py").read_text(encoding="utf-8")
-        self.assertIn("MIN_SPAN_CHARS", source)
-        self.assertRegex(source, r"len\(span\) < MIN_SPAN_CHARS")
+        self.assertNotIn("MIN_SPAN_CHARS", source)
+        self.assertIn("last_reply", source)
+
+    def test_last_reply_is_this_turn_only(self) -> None:
+        """The boundary is the last typed prompt, not the last entry of type `user`.
+
+        Tool results arrive as user entries, so the naive boundary cuts the turn at
+        Claude's own last tool call and mines a fragment of its own reply.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib.transcript import last_reply
+        finally:
+            sys.path.pop(0)
+        entries = [
+            {"type": "user", "message": {"role": "user", "content": "first question"}},
+            {"type": "assistant", "message": {"role": "assistant",
+                                              "content": [{"type": "text", "text": "old answer"}]}},
+            {"type": "user", "message": {"role": "user", "content": "second question"}},
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "name": "Bash", "content": "a.txt"}]}},
+            {"type": "assistant", "message": {"role": "assistant",
+                                              "content": [{"type": "text", "text": "new answer"}]}},
+        ]
+        raw = "\n".join(json.dumps(e) for e in entries).encode("utf-8")
+        reply = last_reply(raw)
+        self.assertIn("new answer", reply)
+        self.assertIn("Claude used Bash", reply, "the tool call is part of the reply")
+        self.assertNotIn("old answer", reply, "the previous turn was mined when it happened")
+        self.assertNotIn("second question", reply, "the prompt is the other hook's job")
 
     def test_hooks_do_not_hardcode_a_store_path(self) -> None:
         # Configuration is discovered from the client's own server block. A literal path

@@ -88,7 +88,10 @@ Each of these was measured, not reasoned about, and each fails silently.
 Today that is `claude-memvara` only. The rules are general.
 
 - **A hook must never fail a prompt.** No store, no library, no credentials, bad config:
-  print nothing, exit 0.
+  exit 0 and let the turn proceed. That governs exit codes and blocking decisions, not
+  silence — `recall.py` and `capture.py` deliberately print a one-line `systemMessage`,
+  because it is the only field on those events the person at the terminal ever sees, and
+  a hook nobody can see working is one nobody notices breaking.
 - **But silence hides breakage, so verify bytes and never timings.** `python3 -S` looked
   like a 55% speedup. It was the hook returning zero bytes — numpy lives in site-packages,
   and the hook's own degrade-to-silence swallowed the ImportError. *The fastest

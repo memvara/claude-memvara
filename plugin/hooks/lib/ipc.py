@@ -213,6 +213,19 @@ def payload() -> "dict":
     return data if isinstance(data, dict) else {}
 
 
+def emit_json(reply: dict) -> None:
+    """Print one JSON object: the hook protocol's structured reply.
+
+    Plain stdout from a hook is either context for the model or nothing at all, depending
+    on the event, and neither is visible to the person watching the terminal. `systemMessage`
+    is, on both of the events this plugin answers, which is the only reason to prefer this
+    over `emit`.
+    """
+    import sys
+
+    sys.stdout.write(json.dumps(reply) + "\n")
+
+
 def emit(text: str) -> None:
     """Print a block for the model, or print nothing.
 
