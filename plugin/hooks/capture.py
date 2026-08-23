@@ -10,7 +10,9 @@ quietly:
 * **It writes.** So it refuses to run against a store that cannot extract. Under
   `MEMVARA_LLM=none` the library's `NullLLM` accepts prose and stores nothing — a hook
   that ignored that would burn a pass over the transcript every turn and look successful
-  while the store stayed empty.
+  while the store stayed empty. It writes over the hosted endpoint when there is no local
+  store, the same route recall takes, and a write that the endpoint refuses raises rather
+  than returning nothing, so the log below can count it as failed instead of stored.
 * **It repeats.** `Stop` fires at the end of every turn against an append-only transcript,
   so without a watermark the same opening exchange is re-ingested all session. The
   watermark is a byte offset per transcript, exactly as durable as the file it describes.
@@ -132,6 +134,16 @@ def main() -> int:
 
     store = open_store()
     if store is None:
+        # A hosted install has no local store to open, and that is its normal state
+        # rather than a broken one: MEMVARA_MODE=cloud cannot build an engine, because
+        # the REST facade exposes none of the low-level calls one needs. Without this
+        # fallback capture returns here on every turn, writes nothing, logs nothing, and
+        # is reported as a hook that succeeded — the exact silence this file's docstring
+        # warns about, arriving through the door next to the one it guards.
+        from lib.hosted import open_hosted
+
+        store = open_hosted()
+    if store is None:
         return 0
 
     key = str(transcript.resolve())
@@ -166,6 +178,10 @@ def main() -> int:
             stored += 1
         except Exception as exc:
             failed.append(f"{subject}/{predicate}: {type(exc).__name__}: {exc}")
+
+    close = getattr(store, "close", None)
+    if close is not None:
+        close()
 
     # Without this line, "the model found one fact" and "two facts were found and one
     # write failed" are the same observation from outside: a store with one new claim and
