@@ -42,23 +42,25 @@ MODEL = "claude-haiku-4-5-20251001"
 TIMEOUT_SEC = 90
 
 PROMPT = """\
-Extract durable facts about the user from the conversation below.
+Extract durable facts from the exchange below: one user message and the reply to it.
 
 Return JSON only, no prose, in exactly this shape:
 {"facts": [{"subject": "user", "predicate": "snake_case_relation", "object": "short value"}]}
 
 Rules:
-- Only facts that would still matter next week.
-- Keep standing instructions and preferences about how work should be done, even when
-  they are stated in the middle of doing that work: "always X", "stop doing Y", "I want
-  Z from now on", a decision about how a thing is built.
+- Only what would still matter next week.
+- Two kinds are worth keeping, and most turns hold at most one of each:
+  1. A standing instruction or preference, even when stated in the middle of the work:
+     "always X", "stop doing Y", "I want Z from now on". Subject is "user".
+  2. A durable decision about the project: what was chosen and why, where something
+     lives, how a thing is released, a constraint that will still bind later. Subject is
+     the component, repo or system it is about -- NOT "user".
 - Skip the mechanics of this session: what a command printed, what a file contains right
   now, what happens next, anything that a later reader would check rather than recall.
 - `object` is the value alone: "Lisbon", not "they live in Lisbon".
-- `subject` is "user" unless the fact is plainly about a named system or third party.
 - Prefer few, high-confidence facts. An empty list is a correct answer.
 
-Conversation:
+Exchange:
 """
 
 

@@ -52,7 +52,6 @@ ALLOWED_PLUGIN_FILES = {
     pathlib.Path("hooks") / "approve.py",
     pathlib.Path("hooks") / "lib" / "transcript.py",
     pathlib.Path("hooks") / "lib" / "write.py",
-    pathlib.Path("hooks") / "remember_prompt.py",
 }
 
 
@@ -97,7 +96,7 @@ class Marketplace(unittest.TestCase):
         body = _json(PLUGIN / ".claude-plugin" / "plugin.json")
         assert isinstance(body, dict)
         self.assertEqual(body["name"], "memvara")
-        self.assertEqual(body["version"], "0.1.2")
+        self.assertEqual(body["version"], "0.1.3")
         self.assertEqual(body["license"], "Apache-2.0")
         self.assertEqual(body["homepage"], "https://memvara.dev/docs/agents")
         self.assertEqual(body["repository"], f"https://github.com/{REPO_NAME}")
@@ -217,9 +216,7 @@ class Hooks(unittest.TestCase):
         is the failure that cost the most time here. What must still hold is that the
         output is well-formed and the exit code is 0.
         """
-        # The sentinel keeps recall from starting a real extraction: without it this test
-        # spawns `claude -p` and bills the person running the suite.
-        env = dict(self.BARREN, MEMVARA_CAPTURE_ACTIVE="1")
+        env = self.BARREN
         payload = json.dumps({"prompt": "hello", "transcript_path": "/nonexistent"})
         for script in ("recall.py", "session_start.py", "capture.py", "approve.py"):
             with self.subTest(script=script):
@@ -239,11 +236,10 @@ class Hooks(unittest.TestCase):
         user sees. A recall hook that silently stopped working looked exactly like one
         with nothing to say, for a whole session.
         """
-        env = dict(self.BARREN, MEMVARA_CAPTURE_ACTIVE="1")
         proc = subprocess.run(
             ["python3", str(HOOKS / "recall.py")],
             input=json.dumps({"prompt": "hello"}), capture_output=True, text=True,
-            env=env, timeout=30,
+            env=self.BARREN, timeout=30,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         body = json.loads(proc.stdout)
@@ -251,16 +247,6 @@ class Hooks(unittest.TestCase):
         # Nothing was configured, so there is no context to add -- but the report still
         # goes out. That asymmetry is the feature.
         self.assertNotIn("hookSpecificOutput", body)
-
-    def test_recall_does_not_extract_inside_an_extraction(self) -> None:
-        """The prompt writer is spawned by recall, so recursion has to stop here too.
-
-        `lib.extract` already refuses to run under the sentinel, but a hook that spawned
-        the child anyway would pay a process per prompt to learn that.
-        """
-        source = (HOOKS / "recall.py").read_text(encoding="utf-8")
-        self.assertIn("SENTINEL", source)
-        self.assertRegex(source, r"if os\.environ\.get\(SENTINEL\):\s*\n\s*return")
 
     def test_readonly_memory_tools_are_allowed_without_a_prompt(self) -> None:
         payload = json.dumps({"tool_name": "mcp__memvara__memory_search"})
@@ -350,37 +336,43 @@ class Hooks(unittest.TestCase):
         """
         source = (HOOKS / "capture.py").read_text(encoding="utf-8")
         self.assertNotIn("MIN_SPAN_CHARS", source)
-        self.assertIn("last_reply", source)
+        self.assertIn("last_turn", source)
 
-    def test_last_reply_is_this_turn_only(self) -> None:
-        """The boundary is the last typed prompt, not the last entry of type `user`.
+    def test_last_turn_is_the_prompt_and_its_reply(self) -> None:
+        """Both halves, and only this turn's.
 
-        Tool results arrive as user entries, so the naive boundary cuts the turn at
-        Claude's own last tool call and mines a fragment of its own reply.
+        The prompt carries the standing instruction and the reply carries what was
+        decided; mining either alone loses one of them. Mining the reply by itself was
+        tried and returned an empty list on every turn of a session, because facts about
+        the user are not in Claude's own words.
+
+        The boundary is deliberately not "the last entry of type user": tool results are
+        user entries too, and that boundary cuts the turn in half.
         """
         sys.path.insert(0, str(HOOKS))
         try:
-            from lib.transcript import last_reply
+            from lib.transcript import last_turn
         finally:
             sys.path.pop(0)
         entries = [
             {"type": "user", "message": {"role": "user", "content": "first question"}},
             {"type": "assistant", "message": {"role": "assistant",
                                               "content": [{"type": "text", "text": "old answer"}]}},
-            {"type": "user", "message": {"role": "user", "content": "second question"}},
+            {"type": "user", "message": {"role": "user", "content": "always open a PR"}},
             {"type": "assistant", "message": {"role": "assistant", "content": [
-                {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "git push"}}]}},
             {"type": "user", "message": {"role": "user", "content": [
-                {"type": "tool_result", "name": "Bash", "content": "a.txt"}]}},
+                {"type": "tool_result", "name": "Bash", "content": "pushed"}]}},
             {"type": "assistant", "message": {"role": "assistant",
-                                              "content": [{"type": "text", "text": "new answer"}]}},
+                                              "content": [{"type": "text", "text": "opened #4"}]}},
         ]
         raw = "\n".join(json.dumps(e) for e in entries).encode("utf-8")
-        reply = last_reply(raw)
-        self.assertIn("new answer", reply)
-        self.assertIn("Claude used Bash", reply, "the tool call is part of the reply")
-        self.assertNotIn("old answer", reply, "the previous turn was mined when it happened")
-        self.assertNotIn("second question", reply, "the prompt is the other hook's job")
+        turn = last_turn(raw)
+        self.assertIn("User: always open a PR", turn, "the instruction lives in the prompt")
+        self.assertIn("Claude: opened #4", turn, "what was decided lives in the reply")
+        self.assertIn("Claude used Bash", turn)
+        self.assertNotIn("old answer", turn, "the previous turn was mined when it happened")
+        self.assertNotIn("first question", turn)
 
     def test_hooks_do_not_hardcode_a_store_path(self) -> None:
         # Configuration is discovered from the client's own server block. A literal path
