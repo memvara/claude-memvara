@@ -144,17 +144,21 @@ def format_entry(entry: dict) -> list[str]:
     return []
 
 
-def last_reply(raw: bytes) -> str:
-    """What Claude said and did in its most recent turn, and nothing earlier.
+def last_turn(raw: bytes) -> str:
+    """The exchange that just ended: the last typed prompt and the reply to it.
 
-    The boundary is not "the last entry of type user". Tool results arrive as user
-    entries too, so that boundary would cut the turn at Claude's own last tool call and
-    return a fragment. The real boundary is the last entry that formats to a `User:`
-    line, which is a prompt a person typed.
+    Both halves, because they carry different things and neither is enough on its own. A
+    standing instruction is stated in the prompt — "always open a PR", "stop asking me
+    about X" — while what was actually decided, and where it landed, is in the reply.
 
-    Only assistant entries come back. Tool *results* are the environment answering, not
-    the reply, and including them would put command output into the extractor where it
-    reads as fact.
+    Mining the reply alone was tried and does not work. It asks a model to find durable
+    facts *about the user* in Claude's own words, and the model correctly answers that
+    there are none: measured over one session, fifteen extractions in an hour returned an
+    empty list every time while costing a full run each.
+
+    The boundary is the last entry that formats to a `User:` line. Tool results are also
+    entries of type `user`, so the naive boundary cuts the turn in half; and a prompt that
+    survives the noise filter is a prompt somebody typed.
     """
     entries = []
     for line in raw.decode("utf-8", "replace").splitlines():
@@ -168,19 +172,22 @@ def last_reply(raw: bytes) -> str:
         if isinstance(entry, dict):
             entries.append(entry)
 
-    start = 0
+    start = None
     for index in range(len(entries) - 1, -1, -1):
         entry = entries[index]
         if entry.get("type") != "user":
             continue
         if any(line.startswith("User: ") for line in format_entry(entry)):
-            start = index + 1
+            start = index
             break
+    if start is None:
+        # No typed prompt in the window. Mining everything from here would re-mine turns
+        # that were already handled when they happened.
+        return ""
 
     out: list[str] = []
     for entry in entries[start:]:
-        if entry.get("type") == "assistant":
-            out.extend(format_entry(entry))
+        out.extend(format_entry(entry))
     return "\n".join(out)
 
 

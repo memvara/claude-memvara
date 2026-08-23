@@ -73,7 +73,7 @@ context for the model or nothing at all, depending on the event, and
 neither is visible to the person watching — so a hook that had silently
 stopped working looked exactly like one with nothing to say. Each now
 prints a one-line `systemMessage`: `Memvara · 4 note(s) recalled` before
-the turn, `Memvara · 2 fact(s) stored from this reply` after it.
+the turn, `Memvara · 2 fact(s) stored from this turn` after it.
 
 Capture needs a model, and uses the one you already pay for. It shells
 out to `claude -p` against your existing Claude Code login, so there is
@@ -84,17 +84,23 @@ install there is no local store to open, so capture writes those triples
 over the same MCP endpoint recall reads; a write the endpoint refuses is
 logged as failed rather than counted as stored.
 
-Capture is scoped to one turn. The `Stop` hook mines the reply Claude
-just gave, and the `UserPromptSubmit` hook mines the message you just
-sent, in a process started detached so that no prompt waits on a model
-call. They are separate because they hold different things: a preference
-is stated in the prompt and only obeyed in the reply.
+Capture is scoped to one turn and runs once per turn. The `Stop` hook
+mines the whole exchange — the prompt you typed and the reply it got —
+because the two halves hold different things: a standing instruction is
+stated in the prompt, while what was actually decided and where it landed
+is in the reply.
 
-This replaced batching, and it costs more. A headless run is about 21k
-tokens of Claude Code's own preamble before it reads a word of your
-conversation — roughly $0.018 and 12–14s on Haiku, whether handed one
-sentence or twenty — so **budget about two runs per turn**. Batching was
-cheaper and lost data: the old hook kept the last 48 formatted lines of
+Mining them separately was tried first and is worth recording as a
+failure. Asking a model for durable facts *about the user* in Claude's
+own reply returns nothing, correctly: measured over one session, fifteen
+extractions in an hour returned an empty list every time and paid a full
+run for each. One run over both halves is half the cost and sees all the
+evidence.
+
+A headless run is about 21k tokens of Claude Code's own preamble before
+it reads a word of your conversation — roughly $0.018 and 12–14s on
+Haiku, whether handed one sentence or twenty — so **budget one run per
+turn**. Batching was cheaper still and lost data: the old hook kept the last 48 formatted lines of
 each batch while advancing its watermark past everything it had read, so
 on a session with large tool outputs most of the transcript was skipped
 unread and could never be reconsidered. Measured on one session: 630 KB
