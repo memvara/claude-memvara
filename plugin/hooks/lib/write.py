@@ -81,11 +81,17 @@ def store_facts(store: Any, facts: Iterable[Any], turn: str = "",
     reports. A hook mining a transcript is not that, and an audit that cannot tell the two
     apart cannot review either.
 
-    All three are library-only. The hosted `memory_remember` tool takes seven arguments and
-    `sources` and `extractor` are not among them, and its schema is closed, so sending one
-    is a hard rejection rather than a silent ignore. `memory_type` it does take. On a hosted
-    install provenance is therefore unavailable, and `capture.py` stores the turn as its own
-    episode instead — searchable, if not linked.
+    `sources` is library-only. The hosted `memory_remember` tool does not take it and its
+    schema is closed, so sending one is a hard rejection rather than a silent ignore; on a
+    hosted install `capture.py` stores the turn as its own episode instead — searchable, if
+    not linked. `memory_type` both routes take.
+
+    `extractor` now goes over both, and the hosted client asks the server whether it takes
+    the argument rather than assuming it does, because a server older than the argument
+    rejects the whole write rather than dropping the field. See `HostedRecall.accepts`.
+    Until that server ships, a hosted claim keeps reporting itself as "Derived by user" —
+    which is not a blank but an assertion, and the one that let a hook's own inference be
+    read back a session later as something the user had stated.
 
     `hosted` is passed in rather than sniffed off the object, and the first attempt did sniff
     it: "no `registry` attribute and no `add_episode`" looked like a safe capability test and
@@ -106,8 +112,8 @@ def store_facts(store: Any, facts: Iterable[Any], turn: str = "",
         kwargs: dict = {"confidence": 0.7}
         if memory_type:
             kwargs["memory_type"] = memory_type
+        kwargs["extractor"] = "claude-code-hook"
         if not hosted:
-            kwargs["extractor"] = "claude-code-hook"
             episode = _episode(turn)
             if episode is not None:
                 kwargs["sources"] = [episode]

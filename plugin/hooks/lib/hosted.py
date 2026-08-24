@@ -98,6 +98,7 @@ class HostedRecall:
         self._base = base_url.rstrip("/")
         self._conn = None
         self._session: "str | None" = None
+        self._schemas: "dict[str, set[str]] | None" = None
         self._id = 0
 
     # -- transport -------------------------------------------------------------
@@ -195,6 +196,34 @@ class HostedRecall:
         self._rpc("notifications/initialized")
         return True
 
+    def accepts(self, tool: str, argument: str) -> bool:
+        """Whether the server's schema for `tool` actually has `argument`.
+
+        Asked rather than assumed, because argument validation on the other end is closed:
+        an argument the server has not heard of is a hard rejection, not a silent ignore.
+        A client that guesses wrong therefore loses the whole write rather than losing one
+        field, which is the wrong way round for a field that only adds provenance.
+
+        One `tools/list` per process answers it for every call afterwards, and a probe that
+        fails answers False -- so an older server, or no answer at all, costs the provenance
+        and keeps the fact.
+        """
+        if self._schemas is None:
+            self._schemas = {}
+            if self._ensure_session():
+                reply = self._rpc("tools/list", {})
+                result = reply.get("result") if isinstance(reply, dict) else None
+                listed = result.get("tools") if isinstance(result, dict) else None
+                for entry in listed if isinstance(listed, list) else []:
+                    if not isinstance(entry, dict):
+                        continue
+                    schema = entry.get("inputSchema")
+                    props = schema.get("properties") if isinstance(schema, dict) else None
+                    name = entry.get("name")
+                    if isinstance(name, str) and isinstance(props, dict):
+                        self._schemas[name] = set(props)
+        return argument in self._schemas.get(tool, set())
+
     def _call(self, tool: str, arguments: dict) -> str:
         """One tool call. Returns its text, or raises `HostedError`.
 
@@ -284,7 +313,8 @@ class HostedRecall:
     def remember(self, subject: str, predicate: str, obj: str, *,
                  confidence: float = 1.0,
                  memory_type: "str | None" = None,
-                 true_since: "str | None" = None) -> str:
+                 true_since: "str | None" = None,
+                 extractor: "str | None" = None) -> str:
         """Write one triple, or raise. Returns the server's receipt line.
 
         Reads and writes both raise now, but for different reasons, and the write's is the
@@ -308,6 +338,11 @@ class HostedRecall:
             args["memory_type"] = memory_type
         if true_since:
             args["true_since"] = true_since
+        if extractor and self.accepts("memory_remember", "extractor"):
+            # Sent only when the server says it takes it. Left off, the claim reports
+            # itself as "Derived by user", which is what let a hook's own inference be
+            # read back in a later session as something the user had stated.
+            args["extractor"] = extractor
         return self._call("memory_remember", args)
 
 
