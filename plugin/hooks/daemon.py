@@ -21,8 +21,18 @@ How it stops running, since nothing tells it to:
 * **Singleton by bind.** Two sessions starting at once both try to bind; the loser sees
   `EADDRINUSE` and exits quietly, leaving the winner serving both.
 
-Reads only. It never writes to the store, so a crash cannot corrupt anything, and the
-worst a wedged daemon costs is a client timeout and a fallback.
+Reads only. It never writes to the store, so a crash cannot corrupt anything.
+
+**A failed query is not an empty answer.** It used to be: every exception collapsed to `""`,
+which the client could not tell from "this store has nothing relevant" and therefore treated
+as authoritative. One wedged client behind this process then disabled recall for a whole
+session, silently, while the fallback that exists for exactly that case never fired. The
+reply is JSON now -- `{"ok": true, "text": ...}` or `{"ok": false}` -- so the client can tell
+the two apart and fall through on the second.
+
+Changing the wire format needs no version negotiation: the socket name digests the hook
+sources, so a daemon running the old code is addressed by a different name and the two never
+meet.
 """
 
 from __future__ import annotations
@@ -43,6 +53,16 @@ from lib.open import open_store  # noqa: E402
 #: Requests are small; anything larger is not a query we generated.
 MAX_REQUEST_BYTES = 64 * 1024
 
+#: Consecutive failed queries after which this process gives up and exits.
+#:
+#: A backend that has broken permanently -- expired credentials, a session the server will
+#: never honour again -- fails every query identically, and holding the socket for the full
+#: idle timeout means every prompt in that window pays a round trip to learn nothing. Exiting
+#: hands the address back: the next client finds no daemon, takes the fallback route, and
+#: spawns a replacement that opens a fresh backend. Small, because the cost of being wrong is
+#: one respawn and the cost of being right is the rest of the session.
+MAX_CONSECUTIVE_FAILURES = 3
+
 
 class Daemon:
     def __init__(self, path: str, store: object) -> None:
@@ -50,20 +70,33 @@ class Daemon:
         self.store = store
         self.last_seen = time.monotonic()
         self._lock = threading.Lock()
+        self.failures = 0
 
     # -- serving ---------------------------------------------------------------
 
-    def _answer(self, request: dict) -> str:
+    def _answer(self, request: dict) -> dict:
         query = str(request.get("q") or "").strip()
         if not query:
-            return ""
-        kwargs = {
-            "k": int(request.get("k") or 6),
-            "budget": int(request.get("budget") or 700),
-        }
+            return {"ok": True, "text": ""}
+        try:
+            kwargs = {
+                "k": int(request.get("k") or 6),
+                "budget": int(request.get("budget") or 700),
+            }
+        except (TypeError, ValueError):
+            # A request this process cannot parse. Reported as a failed query, but
+            # deliberately NOT counted against `failures`: the backend is fine, and letting
+            # a malformed request retire a healthy daemon would hand any buggy client a way
+            # to turn recall off for the session. It used to raise from here, past a
+            # docstring promising it never would -- `_serve` caught the ValueError and
+            # dropped the connection without a reply, which the client reads as "no daemon"
+            # and survives, so the bug was invisible from every side.
+            return {"ok": False}
         header = request.get("header")
         if header:
             kwargs["header"] = str(header)
+        if request.get("include_episodes"):
+            kwargs["include_episodes"] = True
         try:
             # Serialised deliberately. The store is a read handle over SQLite and is not
             # documented as thread-safe; a per-prompt hook has no concurrency worth the
@@ -73,10 +106,18 @@ class Daemon:
                 # hosted one is a `HostedRecall` holding a kept-alive TLS connection,
                 # which is the whole reason a hosted install wants a daemon: the same
                 # request costs 609ms on a fresh connection and 177ms on a warm one.
-                return str(self.store.recall(query, **kwargs) or "")
+                #
+                # Both raise on failure and return text on success, which is what lets one
+                # `except` cover both backends without knowing which one it holds.
+                text = str(self.store.recall(query, **kwargs) or "")
+                self.failures = 0
+                return {"ok": True, "text": text}
         except Exception:
-            # A failed query is an empty answer, never a dead daemon.
-            return ""
+            # Still never a raised exception out of here -- but no longer an empty string
+            # either, because the client cannot act on what it cannot see.
+            with self._lock:
+                self.failures += 1
+            return {"ok": False}
 
     def _serve(self, conn: socket.socket) -> None:
         with conn:
@@ -94,7 +135,7 @@ class Daemon:
                 request = json.loads(b"".join(chunks).decode("utf-8", "replace"))
                 if not isinstance(request, dict):
                     return
-                conn.sendall(self._answer(request).encode("utf-8"))
+                conn.sendall(json.dumps(self._answer(request)).encode("utf-8"))
             except (OSError, ValueError, socket.timeout):
                 # Client vanished mid-exchange, or sent nonsense. Neither is fatal.
                 return
@@ -132,6 +173,13 @@ class Daemon:
                         return 0
                     continue
                 self.last_seen = time.monotonic()
+                if self.failures >= MAX_CONSECUTIVE_FAILURES:
+                    # The failures were counted by earlier clients; this one is dropped
+                    # without a reply. That is deliberate and not a lost answer: a dropped
+                    # connection is one of the cases `ipc.send` already collapses to None,
+                    # so this client falls through to the in-process route and gets a real
+                    # answer -- which is more than the reply we were about to send it.
+                    return 0
                 threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
         finally:
             server.close()

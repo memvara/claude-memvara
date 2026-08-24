@@ -10,6 +10,21 @@ with `MEMVARA_SESSION` set writes memory no later session can see, and a read-on
 accepts no writes at all; in both cases a model that does not know will promise to
 remember something and be wrong. Stating the binding up front makes that promise checkable
 before it is made.
+
+**This hook did nothing at all on a hosted install until 0.1.4.** It opened the store with
+`open_store()` and returned on `None` -- which is the *normal* answer on a paste-the-URL
+install, where there is no local database and no library to read one with. Recall and
+capture both grew a hosted fallback; this one was missed, so the hook whose whole purpose is
+to open a session already knowing the user had never once produced output on the install
+that most people have. It resolves the backend the same way the others do now, and it says
+so in the terminal, because the only reason this went unnoticed for so long is that a hook
+that prints nothing looks exactly like a hook that has nothing to say.
+
+Episodes are on here and off in the per-prompt hook, deliberately. `include_episodes`
+defaults to false in the core because a claim is a settled reading of what was said and an
+excerpt is not, so mixing them lets something the user once said outrank something known to
+be true. That argument is about the per-prompt block competing for a handful of slots. An
+opening brief is the other case: narrative background is exactly what it is for.
 """
 
 from __future__ import annotations
@@ -19,7 +34,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lib.open import emit, open_store  # noqa: E402
+from lib.ipc import emit_json, plural  # noqa: E402
+from lib.write import open_writer  # noqa: E402
 
 #: Wider than the per-prompt hook: this runs once per session, not once per turn.
 K = 10
@@ -33,8 +49,8 @@ HEADER = (
 )
 
 
-def _binding(store: object) -> str:
-    """One line naming the scope and how much it holds, or '' if it cannot be read.
+def _local_binding(store: object) -> str:
+    """The binding line from a library handle, or '' if it cannot be read.
 
     `scope` means two different things on the two classes this can be handed. On a
     `ScopedMemvara` it is the bound `Scope`; on a bare `Memvara` it is the *method* that
@@ -49,9 +65,35 @@ def _binding(store: object) -> str:
         visible = scoped.count()
     except Exception:
         return ""
+    return _binding_line(scope, f"{visible} claim(s)")
 
-    line = f"Memvara scope: {scope} (tenant/user/agent/session; '*' means unbound), " \
-           f"{visible} claim(s) visible."
+
+def _hosted_binding(store: object) -> str:
+    """The binding line from the hosted endpoint's own `memory_stats` report.
+
+    The server already formats the scope and the count, so this reads them back rather than
+    deriving a second version that could disagree with the first.
+    """
+    try:
+        report = str(store.stats() or "")  # type: ignore[attr-defined]
+    except Exception:
+        return ""
+    scope, visible = "", ""
+    for line in report.splitlines():
+        line = line.strip()
+        if line.startswith("scope:"):
+            # "scope: tenant/user/agent/session  (tenant/user/...; '*' means unbound)"
+            scope = line[len("scope:"):].strip().split()[0]
+        elif line.startswith("visible at this scope:"):
+            visible = line[len("visible at this scope:"):].strip()
+    if not scope:
+        return ""
+    return _binding_line(scope, visible or "an unreported number of claim(s)")
+
+
+def _binding_line(scope: str, visible: str) -> str:
+    line = (f"Memvara scope: {scope} (tenant/user/agent/session; '*' means unbound), "
+            f"{visible} visible.")
     if not scope.endswith("*"):
         # The session segment is bound, so anything written now is invisible to the next
         # session. Say so here rather than letting it be discovered by a lost fact.
@@ -61,23 +103,45 @@ def _binding(store: object) -> str:
 
 
 def main() -> int:
-    store = open_store()
+    store, close = open_writer()
     if store is None:
+        emit_json({"systemMessage": "Memvara · not configured"})
         return 0
 
-    parts = []
-    binding = _binding(store)
-    if binding:
-        parts.append(binding)
-
+    # `open_writer` is named for its first caller, but what it does is resolve whichever
+    # backend answers -- local library first, hosted second -- which is exactly what this
+    # hook needs and what it used to be missing.
+    hosted = close is not None
     try:
-        notes = store.recall(QUERY, k=K, budget=BUDGET, header=HEADER)
-    except Exception:
-        notes = ""
-    if notes and notes.strip():
-        parts.append(notes.rstrip())
+        parts = []
+        binding = _hosted_binding(store) if hosted else _local_binding(store)
+        if binding:
+            parts.append(binding)
 
-    emit("\n\n".join(parts))
+        try:
+            notes = str(store.recall(QUERY, k=K, budget=BUDGET, header=HEADER,
+                                     include_episodes=True) or "")
+        except Exception:
+            notes = ""
+        if notes.strip():
+            parts.append(notes.rstrip())
+    finally:
+        if close is not None:
+            close()
+
+    if not parts:
+        emit_json({"systemMessage": "Memvara · nothing stored yet"})
+        return 0
+
+    count = sum(1 for line in "\n\n".join(parts).splitlines() if line.startswith("- "))
+    emit_json({
+        "systemMessage": (f"Memvara · session opened with {plural(count)}"
+                          if count else "Memvara · session opened"),
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": "\n\n".join(parts),
+        },
+    })
     return 0
 
 

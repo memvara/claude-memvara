@@ -6,6 +6,8 @@ a wrong URL or an npx block is how this repo goes wrong.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -96,7 +98,7 @@ class Marketplace(unittest.TestCase):
         body = _json(PLUGIN / ".claude-plugin" / "plugin.json")
         assert isinstance(body, dict)
         self.assertEqual(body["name"], "memvara")
-        self.assertEqual(body["version"], "0.1.3")
+        self.assertEqual(body["version"], "0.1.4")
         self.assertEqual(body["license"], "Apache-2.0")
         self.assertEqual(body["homepage"], "https://memvara.dev/docs/agents")
         self.assertEqual(body["repository"], f"https://github.com/{REPO_NAME}")
@@ -259,6 +261,173 @@ class Hooks(unittest.TestCase):
         body = json.loads(proc.stdout)
         self.assertEqual(body["hookSpecificOutput"]["permissionDecision"], "allow")
 
+    def test_every_readonly_memory_tool_is_allowed_without_a_prompt(self) -> None:
+        """The list must cover every read, not the reads that existed when it was written.
+
+        `memory_neighborhood` and `memory_paths` were missing for exactly that reason. A
+        read that prompts is a read the model learns not to make, so an incomplete
+        allowlist quietly narrows what memory is used for.
+        """
+        for leaf in ("memory_recall", "memory_search", "memory_since", "memory_history",
+                     "memory_why", "memory_stats", "memory_neighborhood", "memory_paths"):
+            with self.subTest(tool=leaf):
+                proc = subprocess.run(
+                    ["python3", str(HOOKS / "approve.py")],
+                    input=json.dumps({"tool_name": f"mcp__memvara__{leaf}"}),
+                    capture_output=True, text=True, env=self.BARREN, timeout=10,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                body = json.loads(proc.stdout)
+                self.assertEqual(
+                    body["hookSpecificOutput"]["permissionDecision"], "allow")
+
+    def test_recall_distinguishes_nothing_found_from_could_not_ask(self) -> None:
+        """Three outcomes, three messages. Two of them used to read identically.
+
+        A hosted client whose session had gone stale answered every query with silence for
+        a whole session while the banner said "no matching notes" each time. From the
+        terminal that is what an empty store looks like, and nobody investigates an empty
+        store. The words have to differ or the failure stays invisible.
+        """
+        source = (HOOKS / "recall.py").read_text(encoding="utf-8")
+        for phrase in ("recall failed", "no matching memories", "recalled"):
+            self.assertIn(phrase, source)
+
+    def test_counts_read_as_english(self) -> None:
+        """`1 memories stored from this turn` is what a machine writes, not a person.
+
+        Shared between the three hooks rather than written out in each, because the bug is
+        not getting it wrong once — it is getting it right in two places and forgetting the
+        third.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib.ipc import plural
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(plural(0), "0 memories")
+        self.assertEqual(plural(1), "1 memory")
+        self.assertEqual(plural(2), "2 memories")
+        for hook in ("recall.py", "capture.py", "session_start.py"):
+            source = (HOOKS / hook).read_text(encoding="utf-8")
+            self.assertIn("plural(", source, f"{hook} must use the shared pluraliser")
+
+    def test_an_unconfigured_install_is_not_reported_as_a_failure(self) -> None:
+        """Four outcomes, four messages. "not configured" is the one added last.
+
+        Splitting "asked and got nothing" from "could not ask" left a third case wearing the
+        wrong label: an install with no database, no library and no credentials has nothing
+        to ask, and calling that a failure sends someone who has simply not logged in to
+        read a log that will tell them nothing. It is still *reported*, because a hook that
+        prints nothing is indistinguishable from one that has stopped working — which is the
+        failure this whole file exists to stop repeating.
+        """
+        proc = subprocess.run(
+            ["python3", str(HOOKS / "recall.py")],
+            input=json.dumps({"prompt": "hello there friend", "session_id": "s"}),
+            capture_output=True, text=True, env=self.BARREN, timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        body = json.loads(proc.stdout)
+        self.assertIn("not configured", body["systemMessage"])
+        self.assertNotIn("failed", body["systemMessage"])
+        self.assertNotIn("hookSpecificOutput", body)
+
+        source = (HOOKS / "recall.py").read_text(encoding="utf-8")
+        for phrase in ("not configured", "recall failed", "no matching memories",
+                       "recalled"):
+            self.assertIn(phrase, source, "each outcome needs its own words")
+
+    def test_a_memory_already_injected_is_not_injected_again(self) -> None:
+        """Turn 1 puts it in context; turn 5 must not put it there a second time.
+
+        The block stays in the conversation once injected, so repeating it spends budget a
+        genuinely new memory could have had, and makes the banner report the same number
+        every turn whether or not anything was learned.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            recall = importlib.import_module("recall")
+        finally:
+            sys.path.pop(0)
+
+        block = (recall.HEADER + "\n- user prefers absolute paths\n- user lives in Delhi")
+        header, bullets = recall._split(block)
+        self.assertEqual(header, recall.HEADER)
+        self.assertEqual(len(bullets), 2, "only `- ` lines are memories")
+
+        seen = {recall._digest(bullets[0])}
+        fresh = [b for b in bullets if recall._digest(b) not in seen]
+        self.assertEqual(fresh, [bullets[1]])
+
+        # Whitespace must not make one memory look like two.
+        self.assertEqual(recall._digest("- a   b"), recall._digest("- a b"))
+
+    def test_per_prompt_recall_asks_for_claims_before_episodes(self) -> None:
+        """Claims first. Episodes only when the structured layer came back thin.
+
+        `include_episodes` is off by default in the core because a claim is a settled
+        reading of what was said and an excerpt is not — mixing them lets something the
+        user once said outrank something known to be true. A regression here inverts that
+        ranking and has no other symptom.
+        """
+        source = (HOOKS / "recall.py").read_text(encoding="utf-8")
+        first = source.index("block, ok = fast_recall(")
+        escalation = source.index("include_episodes=True")
+        self.assertLess(first, escalation, "the plain call must come first")
+        self.assertIn("if len(fresh) < THIN:", source,
+                      "episodes are conditional, not the default")
+
+    def test_session_start_works_without_a_local_store(self) -> None:
+        """The hosted install is the default one, and this hook never ran on it.
+
+        It opened the store with `open_store()`, which answers None when there is no local
+        database and no library to read one with — the normal state on a paste-the-URL
+        install. Recall and capture both grew a hosted fallback and this one did not, so
+        the hook that exists to open a session already knowing the user had never once
+        produced output for most people who installed it.
+
+        Driven through `main()` with a stubbed backend rather than grepped for. The grep
+        version of this test survived the fallback being removed, because the name it
+        looked for still appeared at the call site while the import beside it was wrong.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            session_start = importlib.import_module("session_start")
+        finally:
+            sys.path.pop(0)
+
+        class HostedOnly:
+            """No `.scope`, no `.count` — exactly what the stdlib client offers."""
+
+            def stats(self):
+                return ("scope: prj_x/*/*/*  (tenant/user/agent/session)\n"
+                        "writes: enabled\nvisible at this scope: 204 claim(s)")
+
+            def recall(self, query, **kw):
+                return "HEAD:\n- user prefers tabs"
+
+        original = session_start.open_writer
+        session_start.open_writer = lambda: (HostedOnly(), lambda: None)
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                code = session_start.main()
+        finally:
+            session_start.open_writer = original
+
+        self.assertEqual(code, 0)
+        body = json.loads(buffer.getvalue())
+        context = body["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("prj_x/*/*/*", context, "the binding must survive the hosted route")
+        self.assertIn("204 claim(s)", context)
+        self.assertIn("user prefers tabs", context, "and so must the memories")
+        self.assertIn("memory", body["systemMessage"])
+
     def test_writes_are_not_auto_approved(self) -> None:
         payload = json.dumps({"tool_name": "mcp__memvara__memory_forget"})
         proc = subprocess.run(
@@ -316,7 +485,7 @@ class Hooks(unittest.TestCase):
         original = os.environ.get(SENTINEL)
         os.environ[SENTINEL] = "1"
         try:
-            result, usage = _payload("anything at all")
+            result, usage = _payload("anything at all", "prompt")
             self.assertEqual(result, "", "extraction ran despite the recursion sentinel")
             self.assertEqual(usage, {}, "a blocked run must report no tokens spent")
         finally:
@@ -381,6 +550,175 @@ class Hooks(unittest.TestCase):
             raw = path.read_text(encoding="utf-8")
             self.assertNotIn("MEMVARA_DB=", raw, path)
             self.assertNotIn("/.memvara/workstation", raw, path)
+
+
+class Extraction(unittest.TestCase):
+    """What a captured memory is allowed to be.
+
+    Two defects met here, and both produced rows that looked fine in a browser. The model
+    was asked to invent a predicate per fact, and an invented predicate is never registered,
+    and an unregistered predicate is multi-valued forever -- so nothing it wrote could ever
+    supersede anything, and one preference about file paths ended up occupying four live
+    claims under four names. And the object was specified as "the value alone", which is
+    right for `lives_in` and useless for a preference, where the value IS the instruction:
+    the store still holds `deployment_approach = verification_first`, which no later session
+    can act on.
+    """
+
+    def _extract(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("lib.extract")
+        finally:
+            sys.path.pop(0)
+
+    def _facts(self, extract, reply: str):
+        original = extract._payload
+        extract._payload = lambda text, prompt: (reply, {})
+        try:
+            return extract.triples("irrelevant")
+        finally:
+            extract._payload = original
+
+    def test_an_invented_predicate_is_dropped(self) -> None:
+        extract = self._extract()
+        facts = self._facts(extract, json.dumps({"facts": [
+            {"subject": "user", "predicate": "deployment_approach",
+             "object": "verification first, always"},
+        ]}))
+        self.assertEqual(facts, [], "an unregistered predicate supersedes nothing")
+
+    def test_a_valueless_object_is_dropped(self) -> None:
+        """`user wants hooks printed to terminal = "true"` is a fact with its value missing.
+
+        It answers nothing, and it still costs a slot and a line of recall budget.
+
+        Tested against `lives_in` rather than `prefers` on purpose. `prefers` also carries a
+        minimum length, and a mutation run showed that floor catching every one of these
+        four characters before the emptiness rule was reached -- so the test passed with
+        the rule it names deleted. A terse predicate leaves only the rule under test.
+        """
+        extract = self._extract()
+        for value in ("true", "yes", "done", "n/a", "-", ""):
+            with self.subTest(object=value):
+                facts = self._facts(extract, json.dumps({"facts": [
+                    {"subject": "user", "predicate": "lives_in", "object": value},
+                ]}))
+                self.assertEqual(facts, [], f"{value!r} is not a place to live")
+        kept = self._facts(extract, json.dumps({"facts": [
+            {"subject": "user", "predicate": "lives_in", "object": "Delhi"}]}))
+        self.assertEqual(len(kept), 1, "the filter must not reject real short values")
+
+    def test_a_procedural_memory_must_carry_its_own_context(self) -> None:
+        """A later session cannot see this conversation, so the object has to stand alone.
+
+        Dropping a thin one is right rather than harsh: the preference will be stated again,
+        and a label sitting in the slot makes the good version look like a duplicate when it
+        finally arrives.
+        """
+        extract = self._extract()
+        thin = self._facts(extract, json.dumps({"facts": [
+            {"subject": "user", "predicate": "prefers", "object": "absolute paths"},
+        ]}))
+        self.assertEqual(thin, [])
+
+        rich_object = (
+            "always cite files by full absolute path, never a relative one, because work "
+            "spans three sibling repositories plus worktrees under each and a relative "
+            "path names a file in two trees at once"
+        )
+        kept = self._facts(extract, json.dumps({"facts": [
+            {"subject": "user", "predicate": "prefers", "object": rich_object},
+        ]}))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].memory_type, "procedural",
+                         "a standing instruction filed as `semantic` is invisible to the "
+                         "`procedural` filter, which is the filter that looks for it")
+
+    def test_a_terse_predicate_keeps_its_short_value(self) -> None:
+        """The length floor applies to `prefers`, not to `lives_in`."""
+        extract = self._extract()
+        facts = self._facts(extract, json.dumps({"facts": [
+            {"subject": "user", "predicate": "lives_in", "object": "New Delhi"},
+        ]}))
+        self.assertEqual([(f.predicate, f.object) for f in facts],
+                         [("lives_in", "New Delhi")])
+
+    def test_a_project_fact_never_takes_the_user_subject(self) -> None:
+        """One subject for everything is how a store ends up with a 1% join rate."""
+        extract = self._extract()
+        facts = self._facts(extract, json.dumps({"facts": [
+            {"subject": "user", "predicate": "known_defect",
+             "object": "the hosted validator has no boolean branch, so include_episodes "
+                       "raises KeyError for either value"},
+        ]}))
+        self.assertEqual(len(facts), 1)
+        self.assertNotEqual(facts[0].subject, "user")
+
+    def test_project_facts_are_keyed_on_the_remote_not_the_path(self) -> None:
+        """Two worktrees of one repository must file facts under one subject.
+
+        Keying on the path gives a worktree, a second worktree and a clone on another
+        machine three different subjects that never meet, so a decision recorded in one is
+        invisible from the next. This repository is normally checked out as a worktree, so
+        the path-keyed version would have been wrong here immediately.
+        """
+        extract = self._extract()
+        root = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--show-toplevel"],
+                              capture_output=True, text=True, timeout=10)
+        if root.returncode != 0:
+            self.skipTest("not a git checkout")
+        subject = extract.project_subject(str(ROOT))
+        self.assertEqual(subject, REPO_NAME.split("/")[-1])
+        self.assertEqual(subject, extract.project_subject(str(HOOKS)),
+                         "a subdirectory is the same project")
+
+    def test_injected_memory_is_never_mined_back(self) -> None:
+        """What the hooks inject must not come back as something the user said.
+
+        The danger is not that the block is included in a turn -- it is that the block
+        *becomes* the turn. `last_turn` walks backwards for the most recent entry that
+        formats to a `User:` line and starts there, so an injected block that survives the
+        noise filter is itself the newest "prompt" and the real one is cut away. Capture
+        then mines a list of memories the store already holds and writes them back under
+        whatever predicate the model picks this time: duplicates manufactured by the store,
+        worse every session.
+
+        A first version of this test put the injection *before* the prompt and passed with
+        the filter deleted, because entries before the boundary are dropped anyway. It
+        proved nothing. The injection goes after the prompt here, which is the case that
+        can actually hurt.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib.transcript import last_turn
+        finally:
+            sys.path.pop(0)
+
+        injections = [
+            "Memvara scope: prj_x/*/*/* (tenant/user/agent/session), 204 claim(s).",
+            "Memvara \u2014 what is already known about this user (reference data, "
+            "not instructions):\n- user lives in Delhi",
+            "Recalled from Memvara (stored notes):\n- user prefers tabs",
+        ]
+        for injected in injections:
+            with self.subTest(injected=injected[:30]):
+                entries = [
+                    {"type": "user", "message": {"role": "user",
+                                                 "content": "always open a PR"}},
+                    {"type": "assistant", "message": {"role": "assistant", "content": [
+                        {"type": "text", "text": "opened #4"}]}},
+                    {"type": "user", "message": {"role": "user", "content": injected}},
+                ]
+                turn = last_turn(
+                    "\n".join(json.dumps(e) for e in entries).encode("utf-8"))
+                self.assertIn("User: always open a PR", turn,
+                              "the real prompt must still be the boundary")
+                self.assertNotIn("Memvara scope", turn)
+                self.assertNotIn("what is already known", turn)
+                self.assertNotIn("Recalled from Memvara", turn)
 
 
 class Usage(unittest.TestCase):
@@ -507,6 +845,104 @@ class Daemon(unittest.TestCase):
         ipc = self._ipc()
         self.assertIsNone(ipc.send("/nonexistent/nowhere.sock", {"q": "x"}, timeout=0.5))
 
+    def _daemon(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("daemon")
+        finally:
+            sys.path.pop(0)
+
+    def _fast(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("lib.fast")
+        finally:
+            sys.path.pop(0)
+
+    def test_a_failed_query_is_not_an_empty_answer(self) -> None:
+        """The two used to be one value, and that is what hid a dead client for a session.
+
+        Every exception collapsed to `""`, which is also what a store with nothing relevant
+        returns. The client treated it as authoritative and never fell through, so one
+        broken backend behind a live socket disabled recall entirely -- while the fallback
+        chain that exists for exactly this sat unused.
+        """
+        daemon = self._daemon()
+
+        class Broken:
+            def recall(self, *a, **k):
+                raise RuntimeError("backend is gone")
+
+        class Empty:
+            def recall(self, *a, **k):
+                return ""
+
+        broken = daemon.Daemon("/tmp/unused-broken.sock", Broken())
+        self.assertEqual(broken._answer({"q": "hi"}), {"ok": False})
+
+        empty = daemon.Daemon("/tmp/unused-empty.sock", Empty())
+        self.assertEqual(empty._answer({"q": "hi"}), {"ok": True, "text": ""})
+
+    def test_a_daemon_that_keeps_failing_gives_up(self) -> None:
+        """A permanently broken backend must hand the address back, not hold it.
+
+        Holding it means every prompt for the rest of the idle timeout pays a round trip to
+        learn nothing. Exiting lets the next client take the fallback route and spawn a
+        replacement that opens a fresh backend.
+        """
+        daemon = self._daemon()
+
+        class Broken:
+            def recall(self, *a, **k):
+                raise RuntimeError("gone")
+
+        d = daemon.Daemon("/tmp/unused.sock", Broken())
+        for _ in range(daemon.MAX_CONSECUTIVE_FAILURES):
+            d._answer({"q": "hi"})
+        self.assertGreaterEqual(d.failures, daemon.MAX_CONSECUTIVE_FAILURES)
+
+    def test_recall_falls_through_when_the_daemon_reports_failure(self) -> None:
+        """`ok: false` must not end the search; `ok: true` with no text must."""
+        fast = self._fast()
+        self.assertIsNone(fast._served(None), "no daemon at all")
+        self.assertIsNone(fast._served(json.dumps({"ok": False})), "daemon failed")
+        self.assertIsNone(fast._served("not json at all"), "unreadable reply")
+        self.assertEqual(fast._served(json.dumps({"ok": True, "text": ""})), "",
+                         "a healthy daemon with nothing relevant is authoritative")
+        self.assertEqual(
+            fast._served(json.dumps({"ok": True, "text": "- a memory"})), "- a memory")
+
+    def test_the_daemon_reads_every_argument_the_client_sends(self) -> None:
+        """A dropped argument makes the two routes disagree, silently and only sometimes.
+
+        `include_episodes` was sent by the client and never read here, so the daemon route
+        answered a request for claims-plus-episodes with claims only -- and reported success,
+        because from the client's side a well-formed `ok: true` reply is authoritative. The
+        in-process route honoured it. Same call, two answers, no error on either side, and
+        the difference appears only once a daemon happens to be up.
+
+        The invariant is that every route returns the same text and only latency differs.
+        Comparing the two sets of argument names is the cheapest thing that enforces it.
+        """
+        client = (HOOKS / "lib" / "fast.py").read_text(encoding="utf-8")
+        served = (HOOKS / "daemon.py").read_text(encoding="utf-8")
+
+        sent = set(re.findall(r'request\["(\w+)"\]\s*=', client))
+        literal = re.search(r"request = \{([^}]*)\}", client)
+        if literal:
+            sent |= set(re.findall(r'"(\w+)":', literal.group(1)))
+        read = set(re.findall(r'request\.get\("(\w+)"\)', served))
+
+        self.assertTrue(sent, "no request keys found — the parse is wrong, not the code")
+        self.assertEqual(sent - read, set(),
+                         f"the client sends {sorted(sent - read)} and the daemon never "
+                         "reads it, so the daemon route silently answers a different "
+                         "question from the in-process one")
+
     def test_runtime_directory_is_private(self) -> None:
         # The socket is a read interface to everything the user has ever stored. The
         # default umask would leave it readable by every account on the machine.
@@ -540,6 +976,78 @@ class Hosted(unittest.TestCase):
             return importlib.import_module("lib.hosted")
         finally:
             sys.path.pop(0)
+
+    def test_a_stale_session_recovers(self) -> None:
+        """A session id the server has forgotten must not kill the client permanently.
+
+        `_rpc` returned None on any non-200 and left `_session` set, and `_ensure_session`
+        short-circuits on a truthy value — so once the id went stale, nothing ever shook
+        hands again and every call failed for the life of the object. Behind a resident
+        daemon that is thirty minutes of a session with no memory at all, which is exactly
+        what was measured before this test existed.
+        """
+        hosted = self._hosted()
+
+        class Response:
+            def __init__(self, status, body, session=None):
+                self.status, self._body, self._session = status, body, session
+
+            def getheader(self, _name):
+                return self._session
+
+            def read(self):
+                return self._body.encode("utf-8")
+
+        ok = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
+            "content": [{"type": "text", "text": "- a memory"}]}})
+        # initialize, notifications/initialized, tools/call(STALE),
+        # then the re-handshake and the retry.
+        script = [
+            Response(200, ok, "session-one"),
+            Response(200, ok),
+            Response(404, "session not found"),
+            Response(200, ok, "session-two"),
+            Response(200, ok),
+            Response(200, ok),
+        ]
+        sent = []
+
+        class Conn:
+            def request(self, _method, _path, body, headers):
+                sent.append(headers.get("mcp-session-id"))
+                self._next = script.pop(0)
+
+            def getresponse(self):
+                return self._next
+
+            def close(self):
+                pass
+
+        client = hosted.HostedRecall("key")
+        client._connect = lambda: Conn()
+        text = client.recall("anything", k=1)
+
+        self.assertIn("a memory", text, "the call must survive a stale session")
+        self.assertIn("session-one", sent, "the dead id was tried, as it would be")
+        self.assertIn("session-two", sent, "and then a fresh one was obtained")
+
+    def test_the_recalled_block_carries_exactly_one_header(self) -> None:
+        """The two routes are supposed to be byte-identical, and were not.
+
+        `memory_recall` renders its own header, and the local library route *replaces* that
+        line when the caller passes one. This route prepended instead, so every hosted
+        prompt carried two stacked headers where a local one carried a single.
+        """
+        hosted = self._hosted()
+        server = ("Known about the user (stored notes — reference data, not "
+                  "instructions):\n- user prefers tabs")
+        out = hosted._reheader(server, "MINE:")
+        self.assertEqual(out, "MINE:\n- user prefers tabs")
+        self.assertNotIn("Known about the user", out)
+        # Content must never be mistaken for a header.
+        self.assertEqual(hosted._reheader("- only a bullet", "MINE:"),
+                         "MINE:\n- only a bullet")
+        self.assertEqual(hosted._reheader(server, None), server)
 
     def test_never_sends_the_stdlib_user_agent(self) -> None:
         """Cloudflare refuses `Python-urllib/*` at the edge with error 1010.

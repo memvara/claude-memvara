@@ -23,9 +23,12 @@ costs. `HTTPSConnection` is the stdlib object that can be held open, and holding
 entire reason the daemon pays for itself on a hosted install: ~390ms cold against
 ~162-287ms warm.
 
-Reads fail to `None`. A hosted store that cannot be reached is a prompt without a memory
-block, never a prompt with an error in it. `remember` is the exception and raises, because
-a write that fails quietly is counted by its caller as a fact that landed.
+**Reads raise, and that is a reversal.** They used to answer `None` on any failure, on the
+argument that a prompt without a memory block beats a prompt with an error in it. That rule
+is still right, but it belongs in the *hook*, not here: collapsing failure into the same
+value as "nothing relevant" is what let a dead client look like an empty store for thirty
+minutes at a time. See `HostedError` and `daemon.Daemon._answer` — the caller decides what a
+failure costs, and it can only decide if it is told.
 """
 
 from __future__ import annotations
@@ -50,6 +53,16 @@ MCP_PATH = "/mcp"
 TIMEOUT_SEC = 6.0
 
 PROTOCOL_VERSION = "2025-06-18"
+
+
+class HostedError(RuntimeError):
+    """The endpoint could not answer. Distinct from answering with nothing.
+
+    The whole point of the class is that `except HostedError` and `if not text` are
+    different questions. A caller that cannot tell them apart reports an unreachable store
+    as an empty one, which is the failure this file spent thirty minutes at a time
+    demonstrating.
+    """
 
 
 def credentials() -> "dict | None":
@@ -136,6 +149,23 @@ class HostedRecall:
         if session:
             self._session = session
         if response.status != 200:
+            # A session id the server has forgotten -- it restarted, or the session aged
+            # out -- refuses every subsequent call, while this client goes on sending the
+            # same dead id because nothing here ever cleared it. `_ensure_session` then
+            # short-circuits on the truthy value and never shakes hands again, so the
+            # client stays dead for the rest of its life. Measured: a resident daemon
+            # answering every prompt of a session with silence, while a fresh client on
+            # the same credentials answered the same query in full.
+            #
+            # Drop the session and shake hands again, exactly once. The recursion
+            # terminates because the retry runs with `retry=False`, and because the
+            # `initialize` call inside `_ensure_session` has no session of its own to
+            # invalidate.
+            if retry and self._session:
+                self._session = None
+                self.close()
+                if self._ensure_session():
+                    return self._rpc(method, params, retry=False)
             return None
         return _decode(raw)
 
@@ -165,58 +195,135 @@ class HostedRecall:
         self._rpc("notifications/initialized")
         return True
 
-    def recall(self, query: str, *, k: int = 6, budget: int = 700,
-               header: "str | None" = None) -> "str | None":
-        """Recall text, or None if the hosted store could not answer."""
-        if not query.strip() or not self._ensure_session():
-            return None
-        args = {"query": query, "k": k, "budget": budget}
-        reply = self._rpc("tools/call", {"name": "memory_recall", "arguments": args})
-        if not isinstance(reply, dict):
-            return None
-        result = reply.get("result")
-        if not isinstance(result, dict):
-            return None
-        text = _content_text(result)
-        if not text:
-            return None
-        return f"{header}\n{text}" if header else text
+    def _call(self, tool: str, arguments: dict) -> str:
+        """One tool call. Returns its text, or raises `HostedError`.
 
-    def remember(self, subject: str, predicate: str, obj: str, *,
-                 confidence: float = 1.0) -> str:
-        """Write one triple, or raise. Returns the server's receipt line.
-
-        Everything on the read path above fails to `None`, because a prompt without a
-        memory block beats a prompt with an error in it. A write inverts that argument. A
-        caller cannot tell a `None` meaning "stored nothing" from one meaning "nothing to
-        store", so a silent failure here is counted as a fact that landed, and the store
-        that gained nothing reports a successful hook. This raises instead, and lets the
-        caller record what went wrong.
+        The `isError` check is the one that looks redundant and is not: a tool that
+        refuses answers HTTP 200 with the flag set, so a refusal arrives looking exactly
+        like a success and is only distinguishable here.
         """
         if not self._ensure_session():
-            raise RuntimeError("no session on the hosted endpoint")
-        reply = self._rpc("tools/call", {
-            "name": "memory_remember",
-            "arguments": {
-                "subject": subject,
-                "predicate": predicate,
-                "object": obj,
-                "confidence": confidence,
-            },
-        })
+            raise HostedError(f"no session on the hosted endpoint for {tool}")
+        reply = self._rpc("tools/call", {"name": tool, "arguments": arguments})
         if not isinstance(reply, dict):
-            raise RuntimeError("no reply to memory_remember")
+            raise HostedError(f"no reply to {tool}")
         if reply.get("error") is not None:
-            raise RuntimeError(str(reply["error"]))
+            raise HostedError(str(reply["error"]))
         result = reply.get("result")
         if not isinstance(result, dict):
-            raise RuntimeError("malformed reply to memory_remember")
+            raise HostedError(f"malformed reply to {tool}")
         text = _content_text(result)
-        # A tool that fails answers 200 with isError set, not an HTTP error, so a write
-        # refused by the server arrives looking exactly like one that succeeded.
         if result.get("isError"):
-            raise RuntimeError(text or "memory_remember reported an error")
+            raise HostedError(text or f"{tool} reported an error")
         return text
+
+    def recall(self, query: str, *, k: int = 6, budget: int = 700,
+               header: "str | None" = None,
+               include_episodes: bool = False) -> str:
+        """Recall text, or raise `HostedError`. An empty string is a real answer.
+
+        Empty means this store had nothing relevant, which is information; a failure means
+        the question was never asked, which is not. They used to be the same value. See the
+        module docstring.
+        """
+        if not query.strip():
+            return ""
+        args: dict = {"query": query, "k": k, "budget": budget}
+        if include_episodes:
+            args["include_episodes"] = True
+        try:
+            text = self._call("memory_recall", args)
+        except HostedError:
+            if not include_episodes:
+                raise
+            # `include_episodes` is the only boolean argument anywhere in the tool surface,
+            # and the server's own validator has no branch for that type: a boolean falls
+            # through to the string check and dies on a `KeyError: 'boolean'` looking up the
+            # article for the error message it was about to raise. So the argument has never
+            # worked on any deployment, for either value.
+            #
+            # Asking again without it is not a workaround for a bug we could fix here -- it
+            # is server-side and pinned -- but it is the difference between a degraded
+            # opening brief and none at all, and it costs one round trip on a hook that runs
+            # once per session. It also self-heals: the day the server grows the branch,
+            # the first call stops failing and nothing here needs to change.
+            del args["include_episodes"]
+            text = self._call("memory_recall", args)
+        if not text:
+            return ""
+        return _reheader(text, header)
+
+    def stats(self) -> str:
+        """The server's own scope/writes/count report, or raise.
+
+        `session_start` wants a line naming the binding, and the server already formats
+        exactly that. Deriving a second version of it here would be a second thing to keep
+        true.
+        """
+        return self._call("memory_stats", {})
+
+    def add(self, text: str, *, role: str = "user") -> str:
+        """Store one turn as an episode. Returns the server's receipt line, or raises.
+
+        On a `fast-path-only` server this extracts nothing and stores everything: the
+        episode is committed before the extraction gate is even consulted, so the prose is
+        durable and searchable for zero model calls. That is the whole reason this is worth
+        calling on every turn -- see `capture.py`.
+        """
+        if not text.strip():
+            return ""
+        return self._call("memory_add", {"text": text, "role": role})
+
+    def remember(self, subject: str, predicate: str, obj: str, *,
+                 confidence: float = 1.0,
+                 memory_type: "str | None" = None,
+                 true_since: "str | None" = None) -> str:
+        """Write one triple, or raise. Returns the server's receipt line.
+
+        Reads and writes both raise now, but for different reasons, and the write's is the
+        older and stronger one: a caller cannot tell a `None` meaning "stored nothing" from
+        one meaning "nothing to store", so a silent failure here is counted as a fact that
+        landed and the store that gained nothing reports a successful hook.
+
+        `memory_type` matters more than it looks. Nothing on the write path infers one from
+        the words, so an omitted type means the predicate's registered default, and an
+        unregistered predicate has none -- it becomes `semantic`. A standing instruction
+        filed as `semantic` is invisible to a `procedural` filter, which is the filter
+        anything about how to do the work should be found by.
+        """
+        args: dict = {
+            "subject": subject,
+            "predicate": predicate,
+            "object": obj,
+            "confidence": confidence,
+        }
+        if memory_type:
+            args["memory_type"] = memory_type
+        if true_since:
+            args["true_since"] = true_since
+        return self._call("memory_remember", args)
+
+
+def _reheader(text: str, header: "str | None") -> str:
+    """Apply the caller's header, replacing the server's own rather than stacking on it.
+
+    `memory_recall` renders its own header line, and the local library route *replaces*
+    that line when a caller passes `header=`. This route used to prepend, so the hosted
+    block carried two stacked headers where the local one carried a single -- the two
+    routes are supposed to be byte-identical, and a caller comparing them would have found
+    the difference before a reader did.
+
+    The rule is deliberately narrow: drop the first line, and only when a replacement is
+    being supplied and that line looks like a header rather than content. Recall renders
+    its notes as `- ` bullets, so a leading line ending in a colon is not one of them.
+    """
+    if header is None:
+        return text
+    first, _, rest = text.partition("\n")
+    stripped = first.strip()
+    if rest and stripped.endswith(":") and not stripped.startswith("- "):
+        text = rest
+    return f"{header}\n{text}"
 
 
 def _content_text(result: dict) -> str:
