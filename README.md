@@ -68,12 +68,22 @@ client settings, so the hooks open the store the MCP server writes to
 rather than one of their own choosing, and they degrade to doing nothing
 when there is no store, no library and no login.
 
-The hooks say so in the terminal. Plain stdout from a hook is either
-context for the model or nothing at all, depending on the event, and
-neither is visible to the person watching — so a hook that had silently
-stopped working looked exactly like one with nothing to say. Each prints
-a one-line `systemMessage`: `Memvara · 4 memories recalled` before the
-turn, `Memvara · 2 memories stored from this turn` after it (and `1 memory`, singular, when there is one).
+The hooks say so, but not all in the same place. Plain stdout from a hook
+is either context for the model or nothing at all, depending on the
+event, and neither is visible to the person watching — so a hook that had
+silently stopped working looked exactly like one with nothing to say.
+
+Recall and session start are synchronous and print a one-line
+`systemMessage`: `Memvara · 4 memories recalled` before the turn (and
+`1 memory`, singular, when there is one).
+
+Capture prints nothing, because it runs `async`. Extraction shells out to
+`claude -p` and takes 12–14 seconds, and a synchronous `Stop` hook holds
+the turn open for all of it; async hands the turn straight back. The
+client discards an async hook's output, so the report moves to
+`~/.memvara/.hooks/capture.log` rather than being dropped — every path
+that reaches a decision writes a line there, including the ones that
+decide to do nothing.
 
 Recall distinguishes three outcomes, and two of them used to read the
 same. `Memvara · no matching memories` means the store was asked and had

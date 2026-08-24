@@ -293,6 +293,34 @@ class Hooks(unittest.TestCase):
         for phrase in ("recall failed", "no matching memories", "recalled"):
             self.assertIn(phrase, source)
 
+    def test_capture_is_async_and_therefore_reports_to_the_log(self) -> None:
+        """Async is why capture prints nothing, and the log is why that is still honest.
+
+        Extraction takes 12-14s and a synchronous `Stop` hook holds the turn open for all
+        of it. Async hands the turn straight back — but the client discards an async hook's
+        output, so a `systemMessage` there is not merely unread, it is impossible.
+
+        That reverses this repository's own rule that a hook must be visible, and the rule
+        was right: a hook nobody can see working is one nobody notices breaking. So the
+        obligation moved rather than lapsed. Both halves are asserted here, because either
+        one alone is a defect — async with no log is a silent hook, and a log with no async
+        is a turn held open for nothing.
+        """
+        stop = _json(HOOKS / "hooks.json")["hooks"]["Stop"][0]["hooks"][0]
+        self.assertTrue(stop.get("async"), "capture must not hold the turn open")
+
+        source = (HOOKS / "capture.py").read_text(encoding="utf-8")
+        self.assertNotIn("emit_json", source,
+                         "an async hook's output is discarded; printing implies otherwise")
+        self.assertIn("log(", source, "the log is the only account left")
+
+        # Every branch that reaches a decision must leave a trace. The guard clauses above
+        # it return before anything happens and are legitimately silent.
+        body = source[source.index("def main()"):source.index("def _keep_turn")]
+        decisions = body[body.index("turn = _turn(transcript)"):]
+        for fragment in ("no turn to mine", "skipped=", "no store or login", "facts=0"):
+            self.assertIn(fragment, decisions, f"{fragment!r} must be logged")
+
     def test_counts_read_as_english(self) -> None:
         """`1 memories stored from this turn` is what a machine writes, not a person.
 
@@ -308,7 +336,9 @@ class Hooks(unittest.TestCase):
         self.assertEqual(plural(0), "0 memories")
         self.assertEqual(plural(1), "1 memory")
         self.assertEqual(plural(2), "2 memories")
-        for hook in ("recall.py", "capture.py", "session_start.py"):
+        # capture.py is absent on purpose: it runs async, the client discards an async
+        # hook's output, and it therefore has no count to render for anyone.
+        for hook in ("recall.py", "session_start.py"):
             source = (HOOKS / hook).read_text(encoding="utf-8")
             self.assertIn("plural(", source, f"{hook} must use the shared pluraliser")
 

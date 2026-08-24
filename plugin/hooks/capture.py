@@ -20,6 +20,19 @@ its watermark past *all* of it, so on a session with large tool outputs most of 
 transcript was skipped unread and could never be reconsidered. Measured on one session:
 630KB consumed, six extractions paid for, and only the tail of each batch ever seen.
 
+**It runs async, and therefore silently.** Extraction shells out to `claude -p` and takes
+12-14 seconds, and a synchronous `Stop` hook holds the turn open for all of it. Async hands
+the turn back immediately -- but the client discards an async hook's output, so the
+`systemMessage` this used to print could not survive the change and is gone rather than
+merely unread.
+
+That reverses a rule this repository states in CLAUDE.md, and the reason it was stated is
+still true: a hook nobody can see working is one nobody notices breaking. The compensating
+channel is `~/.memvara/.hooks/capture.log`, and the obligation moved there rather than
+disappearing -- every path that reaches a decision writes a line, including the ones that
+decide to do nothing. `recall.py` is unaffected: it is synchronous, it is the hook that
+gates the prompt, and it still reports itself in the terminal.
+
 Per-turn costs more and loses nothing. The two guards that remain:
 
 * **It writes.** A hosted install has no local store, so writes go over the MCP endpoint
@@ -37,7 +50,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.extract import project_subject, triples  # noqa: E402
-from lib.ipc import emit_json, plural  # noqa: E402
 from lib.open import payload  # noqa: E402
 from lib.transcript import last_turn  # noqa: E402
 from lib.write import log, open_writer, store_facts  # noqa: E402
@@ -162,7 +174,7 @@ def main() -> int:
 
     turn = _turn(transcript)
     if not turn.strip():
-        emit_json({"systemMessage": "Memvara · nothing in this turn to record"})
+        log("no turn to mine")
         return 0
 
     # Recorded before extraction, not after: a run that dies mid-way must not leave the
@@ -173,13 +185,11 @@ def main() -> int:
     worth, why = _worth_mining(turn)
     if not worth:
         log(f"turn={len(turn)}c skipped={why}")
-        emit_json({"systemMessage": f"Memvara · nothing to record ({why})"})
         return 0
 
     store, close = open_writer()
     if store is None:
         log(f"turn={len(turn)}c stored=0 failed=no store or login")
-        emit_json({"systemMessage": "Memvara · no store to write to — see capture.log"})
         return 0
 
     try:
@@ -187,7 +197,6 @@ def main() -> int:
         facts = triples(turn, str(data.get("cwd") or "") or None)
         if not facts:
             log(f"turn={len(turn)}c facts=0 episode={'yes' if kept else 'no'}")
-            emit_json({"systemMessage": "Memvara · no durable memories in this turn"})
             return 0
         stored, failed = store_facts(store, facts, turn, hosted=close is not None)
     finally:
@@ -198,12 +207,6 @@ def main() -> int:
         f"episode={'yes' if kept else 'no'}"
         + ("; failed=" + "; ".join(failed) if failed else ""))
 
-    if failed:
-        emit_json({"systemMessage":
-                   f"Memvara · {stored} stored, {len(failed)} failed — see capture.log"})
-    else:
-        emit_json({"systemMessage":
-                   f"Memvara · {plural(stored)} stored from this turn"})
     return 0
 
 

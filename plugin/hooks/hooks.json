@@ -1,5 +1,5 @@
 {
-  "description": "Memvara: recall on every prompt, capture when a turn ends.",
+  "description": "Memvara: recall on every prompt, capture when a turn ends. Capture runs async so a 12-14s extraction never holds the turn open; async hook output is discarded by the client, so its record is ~/.memvara/.hooks/capture.log rather than a systemMessage.",
   "hooks": {
     "SessionStart": [
       {
@@ -29,6 +29,7 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/capture.py\"",
+            "async": true,
             "timeout": 120
           }
         ]
