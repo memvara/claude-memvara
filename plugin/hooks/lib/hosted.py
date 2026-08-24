@@ -219,7 +219,8 @@ class HostedRecall:
 
     def recall(self, query: str, *, k: int = 6, budget: int = 700,
                header: "str | None" = None,
-               include_episodes: bool = False) -> str:
+               include_episodes: bool = False,
+               memory_types: "list[str] | None" = None) -> str:
         """Recall text, or raise `HostedError`. An empty string is a real answer.
 
         Empty means this store had nothing relevant, which is information; a failure means
@@ -231,6 +232,12 @@ class HostedRecall:
         args: dict = {"query": query, "k": k, "budget": budget}
         if include_episodes:
             args["include_episodes"] = True
+        if memory_types:
+            # The tool has always taken this and this client never sent it, which is why
+            # the standing procedural set could not be asked for separately from everything
+            # else -- and a preference that applies to every turn was competing per prompt
+            # with facts that apply to one.
+            args["memory_types"] = list(memory_types)
         try:
             text = self._call("memory_recall", args)
         except HostedError:

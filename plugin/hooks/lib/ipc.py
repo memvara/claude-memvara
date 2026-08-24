@@ -213,6 +213,40 @@ def payload() -> "dict":
     return data if isinstance(data, dict) else {}
 
 
+#: Bounded by truncation rather than rotation, like the capture log beside it: a debugging
+#: aid that needs its own maintenance is worse than no aid.
+LOG_MAX_BYTES = 64 * 1024
+
+
+def log_line(name: str, text: str) -> None:
+    """Append one line to `~/.memvara/.hooks/<name>.log`, or give up quietly.
+
+    A second logger, deliberately, rather than reusing `lib.write.log`: that module imports
+    `pathlib` for the writing hooks that can afford it, and this one is called from the
+    per-prompt path where the same import costs 10.5ms measured. `os.path` and a plain
+    `open` do the whole job.
+
+    It exists because the write path has had a token ledger since 0.1.2 and the read path
+    has had none -- so the hook that spends context on every single prompt was the one
+    nobody could measure, which is exactly how it came to spend four times what it needed
+    to without anyone noticing.
+    """
+    import time
+
+    directory = os.path.join(_HOME, ".memvara", ".hooks")
+    path = os.path.join(directory, f"{name}.log")
+    try:
+        os.makedirs(directory, exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > LOG_MAX_BYTES:
+            with open(path, "w", encoding="utf-8"):
+                pass
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "+00:00"
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{stamp} {text}\n")
+    except OSError:
+        pass
+
+
 def plural(n: int, word: str = "memory", many: str = "memories") -> str:
     """`1 memory`, `2 memories`. Shared so the three hooks cannot drift apart on it."""
     return f"{n} {word if n == 1 else many}"

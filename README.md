@@ -97,6 +97,38 @@ client re-handshakes instead of holding a dead session id, the daemon
 answers `{"ok": false}` instead of an empty string, and the client only
 treats `ok: true` as authoritative.
 
+**Storage is rich; injection is clipped.** They are different jobs. A
+memory worth keeping carries its reasoning — that is what stopped captured
+facts being useless one-liners — and it made each about four times bigger.
+Measured over eight real prompts against a 222-claim store: median
+injected memory 48 tokens, p90 237, max 503, and four lines over 150
+tokens accounted for **39% of every token injected**.
+
+So the block now carries excerpts of at most 160 characters and one line
+saying so, while the whole note stays stored, stays embedded, and is what
+`memory_search` returns. With `k=4` and a 300-token budget that is a **75%
+cut in what recall costs**, measured end to end on the same eight prompts:
+3,073 fresh tokens before, 731 after.
+
+When the structured layer comes back thin, a second pass asks for the raw
+turns as well. That pass **selects wider than the claims pass and injects
+no wider** — `k` is the candidate cap episodes have to win a slot inside,
+and episodes are down-weighted against claims, so a narrower cap means
+none ever places. Measured against the deployed server, `k=2` returned an
+episode at no budget at all. What bounds the cost is the clip: a
+1,853-character median episode arrives as a 160-character pointer.
+
+Standing preferences moved with it. Procedural memories apply to every
+turn, so they are asked for once in the opening block — where they are
+paid for once and then cached — instead of being retrieved again on each
+prompt, where they also crowded out the incidental facts that prompt was
+actually about.
+
+What recall spends is now written to `~/.memvara/.hooks/recall.log`, per
+prompt. The write path has had a token ledger since 0.1.2 and the read
+path had none, which is how the hook that spends context on every single
+prompt became the one nobody could measure.
+
 A prompt that is purely a reply — "yes please", "go ahead" — is searched
 together with the last prompt that had a topic in it, not on its own. The
 query used to be the prompt verbatim, and two function words retrieve

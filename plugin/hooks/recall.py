@@ -51,20 +51,65 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.fast import recall as fast_recall  # noqa: E402
-from lib.ipc import emit_json, payload, plural  # noqa: E402
+from lib.ipc import emit_json, log_line, payload, plural  # noqa: E402
 
 #: Enough memories to be useful, few enough to stay out of the way. Recall drops whole
 #: notes weakest-first to fit, so this is a ceiling and not a target.
-K = 6
+#:
+#: Four rather than six, and 300 rather than 700, because both were picked before anything
+#: was measured. Four clipped memories carry more distinct facts than one unclipped one --
+#: at 700 a single procedural note could take the whole block.
+K = 4
+BUDGET = 300
 
-#: Roughly the token budget the block may spend. The library measures with a length
-#: heuristic that reads non-Latin scripts as smaller than they are, so leave headroom.
-BUDGET = 700
+#: Characters kept from each memory when it is injected. Storage is untouched: the whole
+#: note stays in the store, is what gets embedded, and is what `memory_search` returns.
+#:
+#: This is the difference between a memory worth keeping and a memory worth pushing. Making
+#: procedural objects carry their reasoning is what stopped them being useless one-liners,
+#: and it made each one about four times larger. Measured over eight real prompts against a
+#: 222-claim store: median injected memory 48 tokens, p90 237, max 503, and **four lines
+#: over 150 tokens accounted for 39% of every token injected**. Clipping alone, changing
+#: nothing else, removes 51% of the block.
+MAX_INJECTED_CHARS = 160
+
+#: Said once, when anything was actually shortened. Roughly twelve tokens, and it is what
+#: turns a truncated push into a pointer: the model can go and read the rest.
+MORE = "(excerpts — memory_search returns any of these in full)"
 
 #: Below this many fresh memories, ask again for the raw turns as well. A prompt the
 #: structured layer had little for is exactly the case where narrative excerpts cannot
 #: outrank anything, which is the objection that keeps them off by default.
-THIN = 2
+#:
+#: One, not two. Two was calibrated against a 700-token budget returning six memories;
+#: at 300 returning one to three, "fewer than two" is the normal case and the escalation
+#: fired on 5 of 8 real prompts instead of 2 of 8 -- an extra round trip on most turns,
+#: bought by tightening the budget it was tuned against.
+THIN = 1
+
+#: The escalation's own k and budget, and both are LARGER than the claims pass. That is
+#: not a lapse in the budget discipline everything else here follows -- it is what the
+#: measurement says, and the first version of this got it exactly backwards.
+#:
+#: `k` is the candidate cap that episodes must win a slot inside, and episodes are
+#: deliberately down-weighted against claims, so shrinking k to "bound" the escalation
+#: guaranteed no episode could ever place. Measured against the deployed server on a query
+#: whose answer is a stored turn:
+#:
+#:     k \ budget    300    600   1200   2000
+#:     k=2            -      -      -      -
+#:     k=4            -   episode episode episode
+#:     k=6            -      -      -   episode
+#:
+#: Not monotonic, and the reason is the interaction: more claim slots means claims fill the
+#: budget first and crowd the episode out, so a larger k needs a larger budget to show the
+#: same result. `k=2, budget=300` -- what this shipped with -- is the dead zone. It fired on
+#: most prompts and could not return an episode at any budget.
+#:
+#: So: select generously, inject tersely. The budget gates what is *selected*; MAX_INJECTED
+#: _CHARS gates what is *sent*, and clips a 1,853-character median episode to a pointer.
+EPISODE_K = 4
+EPISODE_BUDGET = 600
 
 #: Prompts that are not questions to the model: a slash command, a bash escape, a comment.
 #: Silence is right for these -- the user typed a command and is not waiting on memory.
@@ -185,6 +230,13 @@ def _anaphoric(prompt: str) -> bool:
     return words[0].strip(".!?") in OPENERS or len(prompt) < MIN_SUBSTANTIVE_CHARS
 
 
+def _clip(line: str) -> str:
+    """One memory line, shortened for injection. Never for storage."""
+    if len(line) <= MAX_INJECTED_CHARS:
+        return line
+    return line[:MAX_INJECTED_CHARS].rstrip() + "…"
+
+
 def _split(block: str) -> "tuple[str, list[str]]":
     """The block's header and its memory lines.
 
@@ -245,8 +297,8 @@ def main() -> int:
         # trip on an already-thin prompt, and it starts working the day the server is
         # fixed, with no release here.
         try:
-            wider, wider_ok = fast_recall(query, k=K, budget=BUDGET, header=HEADER,
-                                          include_episodes=True)
+            wider, wider_ok = fast_recall(query, k=EPISODE_K, budget=EPISODE_BUDGET,
+                                          header=HEADER, include_episodes=True)
         except Exception:
             wider, wider_ok = "", False
         if wider_ok and wider:
@@ -269,14 +321,25 @@ def main() -> int:
 
     _write_state(session, seen + [_digest(line) for line in fresh], topic)
 
+    # Deduplicated on the full line and injected clipped: the hash has to identify the
+    # memory, not the excerpt, or raising MAX_INJECTED_CHARS would make everything already
+    # in context look new.
+    clipped = [_clip(line) for line in fresh]
+    lines = [header] + clipped
+    if any(short != full for short, full in zip(clipped, fresh)):
+        lines.append(MORE)
+    block_text = "\n".join(lines)
+
     label = f"Memvara · {plural(len(fresh))} recalled"
     if repeats:
         label += f" · {repeats} already in context"
+    log_line("recall", f"recalled={len(fresh)} repeats={repeats} injected={len(block_text)}c "
+        f"clipped={sum(1 for s_, f_ in zip(clipped, fresh) if s_ != f_)}")
     emit_json({
         "systemMessage": label,
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": "\n".join([header] + fresh),
+            "additionalContext": block_text,
         },
     })
     return 0
