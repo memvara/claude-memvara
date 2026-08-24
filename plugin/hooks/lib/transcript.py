@@ -49,6 +49,57 @@ NOISE = (
 )
 
 
+#: The subset of NOISE that marks a block *this plugin injected into the turn*. It is the
+#: only record of what was put in front of the model before it replied, which is what
+#: `injected_memories` reads it back for: a memory the model was shown and then restated is
+#: not a new observation, and mining it writes the store's own output back into the store.
+RECALL_MARKERS = (
+    "Recalled from Memvara",
+    "Memvara — what is already known about this user",
+    "Memvara — how this user wants work done",
+)
+
+
+def _injected_lines(text: str) -> list[str]:
+    """The memory bullets out of an injected block, or nothing if this is not one."""
+    if not any(marker in text for marker in RECALL_MARKERS):
+        return []
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("- ") and len(line) > 4:
+            out.append(line[2:].strip())
+    return out
+
+
+def _entry_injected(entry: dict) -> list[str]:
+    """Injected memory bullets carried by one transcript entry."""
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if isinstance(content, str):
+        return _injected_lines(content)
+    if not isinstance(content, list):
+        return []
+    out: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            out.extend(_injected_lines(str(block.get("text") or "")))
+    return out
+
+
+def user_lines(turn: str) -> str:
+    """Only the halves of `turn` the person actually typed.
+
+    The speaker prefixes are written by `format_user`/`format_assistant` above, so this is
+    the one place that has to know they exist. Callers use it to ask whether a fact is
+    supported by what the user said, as distinct from what the assistant concluded.
+    """
+    return "\n".join(line[6:] for line in turn.splitlines()
+                     if line.startswith("User: "))
+
+
 def _clean(text: str) -> str:
     text = text.strip()
     if not text:
@@ -160,8 +211,8 @@ def format_entry(entry: dict) -> list[str]:
     return []
 
 
-def last_turn(raw: bytes) -> str:
-    """The exchange that just ended: the last typed prompt and the reply to it.
+def last_turn_with_injections(raw: bytes) -> "tuple[str, list[str]]":
+    """The exchange that just ended, and the memories this plugin injected into it: the last typed prompt and the reply to it.
 
     Both halves, because they carry different things and neither is enough on its own. A
     standing instruction is stated in the prompt — "always open a PR", "stop asking me
@@ -199,12 +250,26 @@ def last_turn(raw: bytes) -> str:
     if start is None:
         # No typed prompt in the window. Mining everything from here would re-mine turns
         # that were already handled when they happened.
-        return ""
+        return "", []
 
     out: list[str] = []
     for entry in entries[start:]:
         out.extend(format_entry(entry))
-    return "\n".join(out)
+
+    # Injections are gathered from the whole window rather than from the turn boundary,
+    # and that is not laziness. A recall block is written *before* the prompt it answers,
+    # and the SessionStart block sits at the top of the session -- so a scan that started
+    # at the boundary would collect almost none of them and the echo filter would pass
+    # everything. They are only ever used as a blocklist, so a wider net costs nothing.
+    injected: list[str] = []
+    for entry in entries:
+        injected.extend(_entry_injected(entry))
+    return "\n".join(out), injected
+
+
+def last_turn(raw: bytes) -> str:
+    """The mined text alone. See `last_turn_with_injections` for what it drops."""
+    return last_turn_with_injections(raw)[0]
 
 
 def span_from_bytes(raw: bytes) -> str:

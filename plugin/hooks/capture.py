@@ -51,7 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.extract import project_subject, triples  # noqa: E402
 from lib.open import payload  # noqa: E402
-from lib.transcript import last_turn  # noqa: E402
+from lib.transcript import last_turn_with_injections  # noqa: E402
 from lib.write import log, open_writer, store_facts  # noqa: E402
 
 #: How much of the tail to parse looking for the turn boundary. One turn is far smaller
@@ -136,17 +136,23 @@ def _write_state(state: dict) -> None:
         pass
 
 
-def _turn(transcript: Path) -> str:
-    """The formatted text of the turn that just ended, or an empty string."""
+def _turn(transcript: Path) -> "tuple[str, list[str]]":
+    """The turn that just ended, and the memories this plugin injected into it.
+
+    The second half is not decoration. Recall puts stored notes in front of the model
+    before it replies; if the reply restates one, mining it writes the store's own output
+    back into the store as though it were something new. Handing them to the extractor is
+    what lets it tell an observation from an echo.
+    """
     try:
         size = transcript.stat().st_size
         with transcript.open("rb") as fh:
             fh.seek(max(0, size - TAIL_BYTES))
             raw = fh.read()
     except OSError:
-        return ""
-    text = last_turn(raw)
-    return text[-MAX_TURN_CHARS:] if len(text) > MAX_TURN_CHARS else text
+        return "", []
+    text, injected = last_turn_with_injections(raw)
+    return (text[-MAX_TURN_CHARS:] if len(text) > MAX_TURN_CHARS else text), injected
 
 
 def main() -> int:
@@ -172,7 +178,7 @@ def main() -> int:
         # Stop fired twice over one reply. Nothing has been added since the last run.
         return 0
 
-    turn = _turn(transcript)
+    turn, injected = _turn(transcript)
     if not turn.strip():
         log("no turn to mine")
         return 0
@@ -194,7 +200,7 @@ def main() -> int:
 
     try:
         kept = _keep_turn(store, turn, str(data.get("cwd") or ""))
-        facts = triples(turn, str(data.get("cwd") or "") or None)
+        facts = triples(turn, str(data.get("cwd") or "") or None, injected=injected)
         if not facts:
             log(f"turn={len(turn)}c facts=0 episode={'yes' if kept else 'no'}")
             return 0

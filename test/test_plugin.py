@@ -319,7 +319,7 @@ class Hooks(unittest.TestCase):
         # Every branch that reaches a decision must leave a trace. The guard clauses above
         # it return before anything happens and are legitimately silent.
         body = source[source.index("def main()"):source.index("def _keep_turn")]
-        decisions = body[body.index("turn = _turn(transcript)"):]
+        decisions = body[body.index("_turn(transcript)"):]
         for fragment in ("no turn to mine", "skipped=", "no store or login", "facts=0"):
             self.assertIn(fragment, decisions, f"{fragment!r} must be logged")
 
@@ -818,11 +818,11 @@ class Extraction(unittest.TestCase):
         finally:
             sys.path.pop(0)
 
-    def _facts(self, extract, reply: str):
+    def _facts(self, extract, reply: str, turn: str = "irrelevant", injected=()):
         original = extract._payload
         extract._payload = lambda text, prompt: (reply, {})
         try:
-            return extract.triples("irrelevant")
+            return extract.triples(turn, injected=injected)
         finally:
             extract._payload = original
 
@@ -897,9 +897,55 @@ class Extraction(unittest.TestCase):
             {"subject": "user", "predicate": "known_defect",
              "object": "the hosted validator has no boolean branch, so include_episodes "
                        "raises KeyError for either value"},
-        ]}))
+        ]}), turn="Tool result (Bash, ok): include_episodes raised KeyError")
         self.assertEqual(len(facts), 1)
         self.assertNotEqual(facts[0].subject, "user")
+
+    def test_a_note_the_model_was_shown_is_not_a_new_observation(self) -> None:
+        """The loop this whole filter exists to break.
+
+        Recall puts a stored note in front of the model. The model repeats it. Capture
+        mines the reply and writes it again -- so the store reads its own output back as
+        fresh evidence, and a claim nothing new supports gains a second row that agrees
+        with it. Measured on the real store: an inference the assistant made at 16:34 was
+        quoted to the user ninety minutes later as their own recorded note.
+
+        The user restating it is a different event and stays. That is the whole reason the
+        test asserts both halves: a filter that dropped the second would silently stop
+        recording anything the user repeats.
+        """
+        extract = self._extract()
+        note = ("always cite files by full absolute path, never a relative one, because "
+                "work spans three sibling repositories plus worktrees under each")
+        reply = json.dumps({"facts": [
+            {"subject": "user", "predicate": "prefers", "object": note}]})
+
+        echoed = self._facts(extract, reply, turn="Claude: " + note, injected=[note])
+        self.assertEqual(echoed, [], "the assistant repeating a recalled note is not news")
+
+        spoken = self._facts(extract, reply, turn="User: " + note, injected=[note])
+        self.assertEqual(len(spoken), 1, "the user restating it is a real observation")
+
+    def test_values_that_appear_nowhere_in_the_turn_are_dropped(self) -> None:
+        """Numbers and identifiers have to come from the exchange, prose does not.
+
+        A rich object is meant to be composed rather than quoted, so holding its wording
+        to the turn would reject the good ones. Its *values* are different: a model that
+        is summarising uses the ones in front of it.
+        """
+        extract = self._extract()
+        reply = json.dumps({"facts": [
+            {"subject": "user", "predicate": "known_defect",
+             "object": "shared_buffers sits at the 128MB default while the embeddings "
+                       "table is 1.6GB, so vector queries wait on disk"}]})
+
+        self.assertEqual(
+            self._facts(extract, reply, turn="Claude: we should look at postgres tuning"),
+            [], "values nobody measured must not become a recorded defect")
+        kept = self._facts(
+            extract, reply,
+            turn="Tool result (Bash, ok): shared_buffers = 128MB; embeddings 1.6GB")
+        self.assertEqual(len(kept), 1, "the same fact, once the turn actually shows it")
 
     def test_project_facts_are_keyed_on_the_remote_not_the_path(self) -> None:
         """Two worktrees of one repository must file facts under one subject.
@@ -1394,6 +1440,118 @@ class Hosted(unittest.TestCase):
             self.assertIsNone(hosted.open_hosted())
         finally:
             hosted.CREDENTIALS = original
+
+
+class Provenance(unittest.TestCase):
+    """Who derived a fact, and whether a reader can tell.
+
+    `extractor` defaults to `"api"`, and that default is an assertion rather than a blank:
+    `memory_why` renders it "Derived by user". A hook that leaves it unset has recorded
+    its own inference as something the person said, and the recall header then presents it
+    under a line about what is known about the user. That is not a labelling nit -- it is
+    how one guess came back to the model wearing the user's authority and was cited to
+    them as corroboration for itself.
+    """
+
+    def _mod(self, name: str):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module(name)
+        finally:
+            sys.path.pop(0)
+
+    def test_extractor_is_sent_only_when_the_server_takes_it(self) -> None:
+        """Argument validation on the far end is closed, so guessing costs the write.
+
+        An argument the server has not heard of is a hard rejection, not a silent ignore.
+        A client that sent `extractor` hopefully would lose the whole fact against any
+        server older than the argument -- trading a recorded fact for a provenance field,
+        which is the wrong way round. So it asks, and a server that says no still gets the
+        write.
+        """
+        hosted = self._mod("lib.hosted")
+        sent: dict = {}
+
+        def client(schema):
+            c = hosted.HostedRecall.__new__(hosted.HostedRecall)
+            c._schemas = {"memory_remember": schema}
+            c._call = lambda tool, args: sent.update(args) or "ok"
+            return c
+
+        base = {"subject", "predicate", "object", "confidence"}
+        client(base | {"extractor"}).remember(
+            "user", "lives_in", "Delhi", extractor="claude-code-hook")
+        self.assertEqual(sent.get("extractor"), "claude-code-hook")
+
+        sent.clear()
+        client(base).remember("user", "lives_in", "Delhi", extractor="claude-code-hook")
+        self.assertNotIn("extractor", sent, "an older server must not be sent it")
+        self.assertEqual(sent.get("object"), "Delhi", "and must still get the fact")
+
+    def test_a_hook_write_names_what_derived_it_on_both_routes(self) -> None:
+        """The local route always could; the hosted one could not until the server took it.
+
+        Asserted for both because the hosted route is the one that produced the defect,
+        and a fix that only reached the library route would have left the actual install
+        reporting its own inferences as the user's statements.
+        """
+        write = self._mod("lib.write")
+        for hosted in (False, True):
+            with self.subTest(hosted=hosted):
+                seen: dict = {}
+
+                class Store:
+                    def remember(self, subject, predicate, obj, **kw):
+                        seen.update(kw)
+
+                write.store_facts(Store(), [("user", "lives_in", "Delhi", "semantic")],
+                                  turn="User: I live in Delhi", hosted=hosted)
+                self.assertEqual(seen.get("extractor"), "claude-code-hook")
+
+    def test_every_injected_header_is_a_noise_marker(self) -> None:
+        """Reword a header without the marker and the block starts being mined.
+
+        The three headers are what recall and SessionStart put in front of the model, and
+        `RECALL_MARKERS` is what keeps those blocks out of the text capture reads back. The
+        coupling is invisible: nothing fails, the store just begins accumulating copies of
+        what it already holds, and it gets worse every session rather than settling.
+        """
+        transcript = self._mod("lib.transcript")
+        recall = self._mod("recall")
+        session_start = self._mod("session_start")
+        for header in (recall.HEADER, session_start.HEADER,
+                       session_start.STANDING_HEADER):
+            with self.subTest(header=header[:40]):
+                self.assertTrue(
+                    any(marker in header for marker in transcript.RECALL_MARKERS),
+                    f"no marker matches {header!r}; injected blocks would be mined")
+
+    def test_an_injected_block_is_read_out_of_the_turn_but_never_into_it(self) -> None:
+        """Both halves matter, and they pull in opposite directions.
+
+        The block must not reach the extractor -- mining it re-records what is already
+        stored. And it must still be *read*, because it is the only record of what the
+        model was shown before it replied, which is what tells an echo from an
+        observation. A block sits before the prompt it answers, so scanning from the turn
+        boundary would find none of them.
+        """
+        transcript = self._mod("lib.transcript")
+        rows = [
+            {"type": "user", "message": {"content":
+                "Recalled from Memvara (notes):\n- user prefers absolute paths\n"
+                "- memvara version 0.1.5"}},
+            {"type": "user", "message": {"content": "what did we decide?"}},
+            {"type": "assistant", "message": {"content": "we decided to ship it"}},
+        ]
+        raw = "\n".join(json.dumps(r) for r in rows).encode("utf-8")
+        text, injected = transcript.last_turn_with_injections(raw)
+
+        self.assertEqual(injected,
+                         ["user prefers absolute paths", "memvara version 0.1.5"])
+        self.assertNotIn("Recalled from Memvara", text)
+        self.assertIn("what did we decide?", text)
 
 
 class ReadmeAndLicense(unittest.TestCase):

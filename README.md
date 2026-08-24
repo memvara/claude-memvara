@@ -181,11 +181,39 @@ can act on. Predicates that carry instructions now require the reasoning
 and the concrete detail with them, and a memory too thin to be applied is
 dropped rather than stored.
 
-Two limits worth stating plainly. The hosted `memory_remember` tool takes
-seven arguments and neither `sources` nor `extractor` is among them, so
-on a hosted install a captured fact has no attached provenance and
-`memory_why` will say so — the episode above is the compensating
-mechanism, searchable if not linked. And the engineering predicate pack
+**A fact is attributed to whoever actually said it.** The mined turn is
+labelled — `User:` is what you typed, `Claude:` is what the assistant
+wrote, `Tool result` is what a command returned — and the extractor is
+told that a fact about *you* may come only from your own lines, and that
+a project fact needs evidence rather than the assistant's analysis,
+however confident that analysis sounds.
+
+This closed a loop rather than tidying an edge case. An inference the
+assistant made about a Postgres memory setting was mined out of its own
+reply, stored as a project fact, recalled ninety minutes later into
+another session under a header saying these were notes about the user,
+and quoted back to them as their own note corroborating the inference.
+Nothing errored at any step, and each retelling made the guess look
+better supported.
+
+Two mechanical checks back the instruction up, because a prompt can be
+ignored. A memory this plugin injected into the turn, which the model
+then merely repeated, is dropped unless your own half of the exchange
+supports it — otherwise recall feeds capture and one guess becomes
+several stored rows that agree with each other. And identifiers,
+versions and measurements have to appear somewhere in the turn; prose
+does not, because a memory worth keeping is composed rather than quoted.
+
+Two limits worth stating plainly. `sources` is still not among the hosted
+`memory_remember` arguments, so on a hosted install a captured fact has
+no attached source turn — the episode above is the compensating
+mechanism, searchable if not linked. `extractor` *is* sent now, so a
+captured fact reports itself as `claude-code-hook` instead of
+`Derived by user`, which is what let a mined inference read back as
+something you had stated; but only against a server new enough to accept
+the argument, and the client asks before sending, because argument
+validation there is closed and a wrong guess costs the whole write rather
+than the one field. And the engineering predicate pack
 is loaded server-side through `MEMVARA_PREDICATES`, which
 `app.memvara.dev` does not set, so project predicates land unregistered
 there however this plugin writes them.
