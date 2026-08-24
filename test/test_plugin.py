@@ -12,6 +12,8 @@ import json
 import os
 import pathlib
 import re
+import shutil
+import tempfile
 import subprocess
 import sys
 import unittest
@@ -367,6 +369,105 @@ class Hooks(unittest.TestCase):
         for phrase in ("not configured", "recall failed", "no matching memories",
                        "recalled"):
             self.assertIn(phrase, source, "each outcome needs its own words")
+
+    def _recall(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("recall")
+        finally:
+            sys.path.pop(0)
+
+    def test_an_anaphoric_prompt_is_told_apart_from_a_real_one(self) -> None:
+        """"yes please" has nothing in it to search on, and the query was the prompt.
+
+        A vector search over two function words returns arbitrary neighbours: measured on a
+        real store, a turn approving a memory cleanup was handed notes about pricing tiers
+        and an unrelated project's zip layout. No error, no signal, the whole block's
+        budget spent on noise.
+
+        The two errors here are not symmetric, which is why the rule is tuned to guess
+        towards substantive. Reading a terse prompt as substantive costs one weak query and
+        self-corrects. Reading a real prompt as anaphoric freezes the carried topic, so
+        every later turn searches something stale — it compounds. A first draft had "what"
+        and "why" among the openers and did exactly that.
+        """
+        recall = self._recall()
+        for prompt in ("yes please", "Yes", "yes, add that fix to #7",
+                       "go ahead with all 8", "why?", "do it", "ok"):
+            self.assertTrue(recall._anaphoric(prompt), f"{prompt!r} is a reply")
+        for prompt in ("what does the user prefer for file path citation style",
+                       "fix the daemon protocol", "run the tests",
+                       "add a boolean branch to the validator"):
+            self.assertFalse(recall._anaphoric(prompt), f"{prompt!r} is about something")
+
+    def test_the_carried_topic_only_advances_on_a_substantive_prompt(self) -> None:
+        """Three "yes" replies in a row all search the last prompt that had a topic in it.
+
+        Driven through `main()`, not through the state helpers. A first version of this
+        test round-tripped `_write_state`/`_read_state` and asserted nothing about the line
+        that decides what gets written — so it passed with that line replaced by `topic =
+        prompt`, which is the bug: one "yes" and the carried topic becomes "yes".
+        """
+        recall = self._recall()
+        directory = tempfile.mkdtemp()
+        original_dir, original_recall = recall.SEEN_DIR, recall.fast_recall
+        recall.SEEN_DIR = directory
+        asked = []
+
+        def fake_recall(query, **kw):
+            # Two bullets, not one: a single fresh memory is below THIN and triggers the
+            # episode escalation, which makes a second call per turn and puts turn 0's
+            # retry where the test expects turn 1's query.
+            asked.append(query)
+            return f"{recall.HEADER}\n- memory {len(asked)}a\n- memory {len(asked)}b", True
+
+        recall.fast_recall = fake_recall
+        try:
+            for prompt in ("the file path citation style across repos", "yes please",
+                           "yes", "go ahead"):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    recall.main.__globals__["payload"] = lambda p=prompt: {
+                        "prompt": p, "session_id": "s"}
+                    recall.main()
+
+            _, carried = recall._read_state("s")
+            self.assertEqual(carried, "the file path citation style across repos",
+                             "three replies in a row must not move the topic")
+            self.assertEqual(len(asked), 4, "one recall per turn, no escalation")
+            self.assertEqual(asked[0], "the file path citation style across repos")
+            self.assertEqual(asked[1:], [f"{carried} yes please", f"{carried} yes",
+                                         f"{carried} go ahead"],
+                             "each reply searches the carried topic AND its own words")
+        finally:
+            recall.SEEN_DIR = original_dir
+            recall.fast_recall = original_recall
+            shutil.rmtree(directory)
+
+    def test_session_state_survives_junk_and_the_format_it_used_to_have(self) -> None:
+        """An upgrade mid-session costs the carried query, never the dedup."""
+        recall = self._recall()
+        directory = tempfile.mkdtemp()
+        original = recall.SEEN_DIR
+        recall.SEEN_DIR = directory
+        try:
+            recall._write_state("s", ["h1"], "the file path citation style")
+            self.assertEqual(recall._read_state("s"),
+                             (["h1"], "the file path citation style"))
+
+            # A bare list is the format this file used before it carried a query.
+            with open(os.path.join(directory, "old.json"), "w", encoding="utf-8") as fh:
+                json.dump(["h2"], fh)
+            self.assertEqual(recall._read_state("old"), (["h2"], ""))
+
+            for junk in ("not json", "{}", '{"seen": "no", "query": 5}', "[1, 2]"):
+                with open(os.path.join(directory, "j.json"), "w", encoding="utf-8") as fh:
+                    fh.write(junk)
+                self.assertEqual(recall._read_state("j"), ([], ""), junk)
+        finally:
+            recall.SEEN_DIR = original
+            shutil.rmtree(directory)
 
     def test_a_memory_already_injected_is_not_injected_again(self) -> None:
         """Turn 1 puts it in context; turn 5 must not put it there a second time.

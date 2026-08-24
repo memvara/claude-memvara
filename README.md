@@ -97,6 +97,16 @@ client re-handshakes instead of holding a dead session id, the daemon
 answers `{"ok": false}` instead of an empty string, and the client only
 treats `ok: true` as authoritative.
 
+A prompt that is purely a reply — "yes please", "go ahead" — is searched
+together with the last prompt that had a topic in it, not on its own. The
+query used to be the prompt verbatim, and two function words retrieve
+arbitrary neighbours: measured on a real store, a turn approving a memory
+cleanup was handed notes about pricing tiers and an unrelated project's
+zip layout. Never an error, just the whole block's budget spent on noise.
+The carried topic is prepended rather than substituted, so "yes, add that
+fix to #7" still carries the `#7`, and it only advances when you say
+something with a topic in it.
+
 `Memvara · 3 memories recalled · 4 already in context` is the fourth
 shape. A memory injected on turn 1 is still in the conversation on turn
 5, so re-injecting it spends budget a genuinely new memory could have
