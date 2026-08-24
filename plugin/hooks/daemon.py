@@ -97,6 +97,9 @@ class Daemon:
             kwargs["header"] = str(header)
         if request.get("include_episodes"):
             kwargs["include_episodes"] = True
+        types = request.get("memory_types")
+        if isinstance(types, list) and types:
+            kwargs["memory_types"] = [str(t) for t in types]
         try:
             # Serialised deliberately. The store is a read handle over SQLite and is not
             # documented as thread-safe; a per-prompt hook has no concurrency worth the

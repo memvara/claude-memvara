@@ -100,7 +100,7 @@ class Marketplace(unittest.TestCase):
         body = _json(PLUGIN / ".claude-plugin" / "plugin.json")
         assert isinstance(body, dict)
         self.assertEqual(body["name"], "memvara")
-        self.assertEqual(body["version"], "0.1.4")
+        self.assertEqual(body["version"], "0.1.5")
         self.assertEqual(body["license"], "Apache-2.0")
         self.assertEqual(body["homepage"], "https://memvara.dev/docs/agents")
         self.assertEqual(body["repository"], f"https://github.com/{REPO_NAME}")
@@ -323,6 +323,81 @@ class Hooks(unittest.TestCase):
         for fragment in ("no turn to mine", "skipped=", "no store or login", "facts=0"):
             self.assertIn(fragment, decisions, f"{fragment!r} must be logged")
 
+    def test_nothing_injected_exceeds_the_clip(self) -> None:
+        """Storage stays rich; injection does not. They are different jobs.
+
+        Making procedural objects carry their reasoning is what stopped them being useless
+        one-liners — and it made each about four times bigger. Measured over eight real
+        prompts against a 222-claim store: median injected memory 48 tokens, p90 237, max
+        503, and four lines over 150 tokens accounted for 39% of every token injected. The
+        whole note is still stored, still embedded, still what memory_search returns.
+        """
+        recall = self._recall()
+        long_line = "- " + "x" * 900
+        clipped = recall._clip(long_line)
+        self.assertLessEqual(len(clipped), recall.MAX_INJECTED_CHARS + 1)
+        self.assertTrue(clipped.endswith("…"))
+        short = "- already short"
+        self.assertEqual(recall._clip(short), short, "a short memory is untouched")
+
+    def test_the_block_says_when_it_is_showing_excerpts(self) -> None:
+        """A pointer is what turns a truncated push into something the model can follow.
+
+        Present only when something was actually shortened: promising that memory_search
+        has more, on a block where it does not, is a lie the model cannot check.
+        """
+        recall = self._recall()
+        source = (HOOKS / "recall.py").read_text(encoding="utf-8")
+        self.assertIn("memory_search", recall.MORE)
+        self.assertIn("if any(short != full", source,
+                      "the pointer must be conditional on something being clipped")
+
+    def test_dedup_hashes_the_memory_not_the_excerpt(self) -> None:
+        """Otherwise raising the clip makes everything already in context look new."""
+        source = (HOOKS / "recall.py").read_text(encoding="utf-8")
+        write = source.index("_write_state(session, seen + [_digest(line) for line in fresh]")
+        clip = source.index("clipped = [_clip(line) for line in fresh]")
+        self.assertLess(write, clip, "hash the full line, then clip for display")
+
+    def test_the_episode_pass_is_bounded_below_the_claims_pass(self) -> None:
+        """An episode is a whole turn of raw prose — the largest thing this hook can inject.
+
+        It arrives on exactly the prompts where the structured layer came back thin, so an
+        unbounded second pass would spend the most context on the turns that had the least
+        to say.
+        """
+        recall = self._recall()
+        self.assertLess(recall.EPISODE_K, recall.K)
+        source = (HOOKS / "recall.py").read_text(encoding="utf-8")
+        self.assertIn("k=EPISODE_K", source)
+
+    def test_the_standing_set_is_asked_for_where_it_is_paid_for_once(self) -> None:
+        """Procedural memories apply to every turn, so they belong in the opening block.
+
+        Retrieved per prompt they are paid for again each time and crowd out the incidental
+        facts that prompt was actually about. The split is the design; a regression that
+        quietly asks for everything in both places has no symptom but the bill.
+        """
+        opening = (HOOKS / "session_start.py").read_text(encoding="utf-8")
+        per_prompt = (HOOKS / "recall.py").read_text(encoding="utf-8")
+        self.assertIn('STANDING = ["procedural"]', opening)
+        self.assertIn("memory_types=STANDING", opening)
+        self.assertNotIn("memory_types", per_prompt,
+                         "the per-prompt hook must not re-retrieve the standing set")
+
+    def test_the_read_path_is_metered(self) -> None:
+        """The write path has had a token ledger since 0.1.2 and the read path had none.
+
+        So the hook that spends context on every prompt was the one nobody could measure,
+        which is how it came to spend four times what it needed to without anyone noticing.
+        """
+        source = (HOOKS / "recall.py").read_text(encoding="utf-8")
+        self.assertIn('log_line("recall"', source)
+        self.assertIn("injected=", source)
+        # And it must not drag pathlib onto the per-prompt path to do it.
+        self.assertNotIn("from pathlib import",
+                         (HOOKS / "lib" / "ipc.py").read_text(encoding="utf-8"))
+
     def test_counts_read_as_english(self) -> None:
         """`1 memories stored from this turn` is what a machine writes, not a person.
 
@@ -540,6 +615,10 @@ class Hooks(unittest.TestCase):
                         "writes: enabled\nvisible at this scope: 204 claim(s)")
 
             def recall(self, query, **kw):
+                # The standing set is a separate, narrower request. Answering the two the
+                # same way would let the split be removed without this test noticing.
+                if kw.get("memory_types") == ["procedural"]:
+                    return "STANDING:\n- user always opens a PR"
                 return "HEAD:\n- user prefers tabs"
 
         original = session_start.open_writer
@@ -557,7 +636,9 @@ class Hooks(unittest.TestCase):
         self.assertIn("prj_x/*/*/*", context, "the binding must survive the hosted route")
         self.assertIn("204 claim(s)", context)
         self.assertIn("user prefers tabs", context, "and so must the memories")
-        self.assertIn("memory", body["systemMessage"])
+        self.assertIn("user always opens a PR", context,
+                      "the standing procedural set is asked for separately, and here")
+        self.assertIn("2 memories", body["systemMessage"])
 
     def test_writes_are_not_auto_approved(self) -> None:
         payload = json.dumps({"tool_name": "mcp__memvara__memory_forget"})
@@ -1161,6 +1242,54 @@ class Hosted(unittest.TestCase):
         self.assertIn("a memory", text, "the call must survive a stale session")
         self.assertIn("session-one", sent, "the dead id was tried, as it would be")
         self.assertIn("session-two", sent, "and then a fresh one was obtained")
+
+    def test_memory_types_reaches_the_wire(self) -> None:
+        """The tool always took it and this client never sent it.
+
+        Which is why the standing procedural set could not be asked for separately from
+        everything else, and a preference that applies to every turn competed per prompt
+        with facts that applied to one. Asserted on the request body rather than on the
+        source: a grep for the argument name passes while the line that puts it in the
+        payload is deleted, which is how the first version of this test was written.
+        """
+        hosted = self._hosted()
+        sent = []
+
+        class Response:
+            status = 200
+
+            def getheader(self, _name):
+                return "s"
+
+            def read(self):
+                return json.dumps({"result": {"content": [
+                    {"type": "text", "text": "- a memory"}]}}).encode("utf-8")
+
+        class Conn:
+            def request(self, _m, _p, body, _headers):
+                sent.append(json.loads(body))
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                pass
+
+        client = hosted.HostedRecall("key")
+        client._connect = lambda: Conn()
+        client._session = "s"
+        client.recall("anything", memory_types=["procedural"])
+
+        calls = [b for b in sent if b.get("method") == "tools/call"]
+        self.assertTrue(calls, "no tool call was made")
+        self.assertEqual(calls[-1]["params"]["arguments"].get("memory_types"),
+                         ["procedural"], "the filter never left the client")
+
+        sent.clear()
+        client.recall("anything")
+        calls = [b for b in sent if b.get("method") == "tools/call"]
+        self.assertNotIn("memory_types", calls[-1]["params"]["arguments"],
+                         "omitted when not asked for, so the default stays the tool's")
 
     def test_the_recalled_block_carries_exactly_one_header(self) -> None:
         """The two routes are supposed to be byte-identical, and were not.

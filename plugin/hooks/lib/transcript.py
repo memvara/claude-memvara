@@ -44,6 +44,7 @@ NOISE = (
     "<local-command-stdout>",
     "Recalled from Memvara",
     "Memvara — what is already known about this user",
+    "Memvara — how this user wants work done",
     "Memvara scope:",
 )
 

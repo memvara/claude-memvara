@@ -68,7 +68,8 @@ def _spawn(root: str) -> None:
 
 
 def recall(query: str, *, k: int = 6, budget: int = 700, header: str | None = None,
-           include_episodes: bool = False, spawn: bool = True) -> "tuple[str, bool | None]":
+           include_episodes: bool = False, memory_types: "list[str] | None" = None,
+           spawn: bool = True) -> "tuple[str, bool | None]":
     """Recall text for `query`, by whatever route is available.
 
     Returns `(text, ok)` with three states, because there are three things that can happen
@@ -103,6 +104,8 @@ def recall(query: str, *, k: int = 6, budget: int = 700, header: str | None = No
             request["header"] = header
         if include_episodes:
             request["include_episodes"] = True
+        if memory_types:
+            request["memory_types"] = list(memory_types)
         answer = send(path, request)
         served = _served(answer)
         if served is not None:
@@ -126,7 +129,8 @@ def recall(query: str, *, k: int = 6, budget: int = 700, header: str | None = No
             return "", None
         try:
             text = client.recall(query, k=k, budget=budget, header=header,
-                                 include_episodes=include_episodes)
+                                 include_episodes=include_episodes,
+                                 memory_types=memory_types)
         except Exception:
             # Including HostedError. Nothing below this to fall through to -- but the
             # caller still has a banner to print, and "could not ask" is not "nothing
@@ -144,6 +148,8 @@ def recall(query: str, *, k: int = 6, budget: int = 700, header: str | None = No
             kwargs["header"] = header
         if include_episodes:
             kwargs["include_episodes"] = True
+        if memory_types:
+            kwargs["memory_types"] = list(memory_types)
         text = str(store.recall(query, **kwargs) or "")
     except Exception:
         if spawn and path is not None:
