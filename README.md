@@ -110,6 +110,14 @@ saying so, while the whole note stays stored, stays embedded, and is what
 cut in what recall costs**, measured end to end on the same eight prompts:
 3,073 fresh tokens before, 731 after.
 
+When the structured layer comes back thin, a second pass asks for the raw
+turns as well. That pass **selects wider than the claims pass and injects
+no wider** — `k` is the candidate cap episodes have to win a slot inside,
+and episodes are down-weighted against claims, so a narrower cap means
+none ever places. Measured against the deployed server, `k=2` returned an
+episode at no budget at all. What bounds the cost is the clip: a
+1,853-character median episode arrives as a 160-character pointer.
+
 Standing preferences moved with it. Procedural memories apply to every
 turn, so they are asked for once in the opening block — where they are
 paid for once and then cached — instead of being retrieved again on each

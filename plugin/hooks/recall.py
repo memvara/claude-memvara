@@ -80,13 +80,36 @@ MORE = "(excerpts — memory_search returns any of these in full)"
 #: Below this many fresh memories, ask again for the raw turns as well. A prompt the
 #: structured layer had little for is exactly the case where narrative excerpts cannot
 #: outrank anything, which is the objection that keeps them off by default.
-THIN = 2
+#:
+#: One, not two. Two was calibrated against a 700-token budget returning six memories;
+#: at 300 returning one to three, "fewer than two" is the normal case and the escalation
+#: fired on 5 of 8 real prompts instead of 2 of 8 -- an extra round trip on most turns,
+#: bought by tightening the budget it was tuned against.
+THIN = 1
 
-#: How many episodes that second pass may bring back. Deliberately smaller than K: an
-#: episode is a whole turn of raw prose, so it is the largest thing this hook can inject
-#: and it arrives on exactly the prompts where recall was already struggling. Bounded and
-#: clipped like everything else -- an excerpt is a pointer, not a transcript.
-EPISODE_K = 2
+#: The escalation's own k and budget, and both are LARGER than the claims pass. That is
+#: not a lapse in the budget discipline everything else here follows -- it is what the
+#: measurement says, and the first version of this got it exactly backwards.
+#:
+#: `k` is the candidate cap that episodes must win a slot inside, and episodes are
+#: deliberately down-weighted against claims, so shrinking k to "bound" the escalation
+#: guaranteed no episode could ever place. Measured against the deployed server on a query
+#: whose answer is a stored turn:
+#:
+#:     k \ budget    300    600   1200   2000
+#:     k=2            -      -      -      -
+#:     k=4            -   episode episode episode
+#:     k=6            -      -      -   episode
+#:
+#: Not monotonic, and the reason is the interaction: more claim slots means claims fill the
+#: budget first and crowd the episode out, so a larger k needs a larger budget to show the
+#: same result. `k=2, budget=300` -- what this shipped with -- is the dead zone. It fired on
+#: most prompts and could not return an episode at any budget.
+#:
+#: So: select generously, inject tersely. The budget gates what is *selected*; MAX_INJECTED
+#: _CHARS gates what is *sent*, and clips a 1,853-character median episode to a pointer.
+EPISODE_K = 4
+EPISODE_BUDGET = 600
 
 #: Prompts that are not questions to the model: a slash command, a bash escape, a comment.
 #: Silence is right for these -- the user typed a command and is not waiting on memory.
@@ -274,7 +297,7 @@ def main() -> int:
         # trip on an already-thin prompt, and it starts working the day the server is
         # fixed, with no release here.
         try:
-            wider, wider_ok = fast_recall(query, k=EPISODE_K, budget=BUDGET,
+            wider, wider_ok = fast_recall(query, k=EPISODE_K, budget=EPISODE_BUDGET,
                                           header=HEADER, include_episodes=True)
         except Exception:
             wider, wider_ok = "", False

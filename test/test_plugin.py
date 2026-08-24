@@ -359,17 +359,49 @@ class Hooks(unittest.TestCase):
         clip = source.index("clipped = [_clip(line) for line in fresh]")
         self.assertLess(write, clip, "hash the full line, then clip for display")
 
-    def test_the_episode_pass_is_bounded_below_the_claims_pass(self) -> None:
-        """An episode is a whole turn of raw prose — the largest thing this hook can inject.
+    def test_the_episode_pass_selects_wider_and_injects_no_wider(self) -> None:
+        """Select generously, inject tersely. The first version had this backwards.
 
-        It arrives on exactly the prompts where the structured layer came back thin, so an
-        unbounded second pass would spend the most context on the turns that had the least
-        to say.
+        `EPISODE_K` was set *below* `K` to "bound" the escalation, on the reasoning that an
+        episode is the largest thing this hook can inject. But `k` is the candidate cap that
+        episodes have to win a slot inside, and episodes are deliberately down-weighted
+        against claims — so shrinking it guaranteed no episode could ever place. Measured
+        against the deployed server, on a query whose answer is a stored turn:
+
+            k \ budget    300    600   1200   2000
+            k=2            -      -      -      -
+            k=4            -   episode episode episode
+            k=6            -      -      -   episode
+
+        `k=2, budget=300` — what it shipped with — is the dead zone: it fired on most
+        prompts and could not return an episode at any budget.
+
+        What bounds the cost is the clip, not the candidate cap. So the selection pass is
+        allowed to be wider than the claims pass, and every line it returns still goes
+        through `_clip` — a 1,853-character median episode arrives as a 160-character
+        pointer.
         """
         recall = self._recall()
-        self.assertLess(recall.EPISODE_K, recall.K)
+        self.assertGreaterEqual(recall.EPISODE_K, recall.K,
+                                "a narrower candidate cap means episodes never place")
+        self.assertGreater(recall.EPISODE_BUDGET, recall.BUDGET,
+                           "claims fill the budget first; episodes need room to survive")
         source = (HOOKS / "recall.py").read_text(encoding="utf-8")
-        self.assertIn("k=EPISODE_K", source)
+        self.assertIn("k=EPISODE_K, budget=EPISODE_BUDGET", source)
+
+    def test_the_escalation_trigger_is_calibrated_to_the_budget(self) -> None:
+        """`THIN` counts memories, so it only means anything against a given budget.
+
+        Two was set when the block returned six; at a 300-token budget returning one to
+        three, "fewer than two" is the ordinary case. Measured over eight real prompts, the
+        escalation went from firing on 2 of 8 to 5 of 8 — an extra round trip on most turns,
+        bought entirely by tightening the budget it was tuned against.
+        """
+        recall = self._recall()
+        self.assertLess(recall.THIN, recall.K,
+                        "a trigger at or above K fires on every prompt")
+        self.assertLessEqual(recall.THIN, 1,
+                             "at BUDGET=300 the claims pass often returns one memory")
 
     def test_the_standing_set_is_asked_for_where_it_is_paid_for_once(self) -> None:
         """Procedural memories apply to every turn, so they belong in the opening block.
