@@ -213,6 +213,11 @@ def payload() -> "dict":
     return data if isinstance(data, dict) else {}
 
 
+def plural(n: int, word: str = "memory", many: str = "memories") -> str:
+    """`1 memory`, `2 memories`. Shared so the three hooks cannot drift apart on it."""
+    return f"{n} {word if n == 1 else many}"
+
+
 def emit_json(reply: dict) -> None:
     """Print one JSON object: the hook protocol's structured reply.
 

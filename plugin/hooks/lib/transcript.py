@@ -24,12 +24,27 @@ SKIP_TOOL_PREFIXES = ("mcp__",)
 MAX_TOOL_ARG = 120
 MAX_TOOL_RESULT = 240
 
+#: Text that is this plugin talking to itself. Anything carrying one of these is dropped
+#: whole rather than mined.
+#:
+#: The last two are the SessionStart block, and they matter more than they look. Capture
+#: mines the turn it just watched; SessionStart injects a block of already-stored memories
+#: into the very first turn of a session. Without these markers that block is read back as
+#: conversation, re-extracted, and written again under whatever predicate the model picks
+#: this time -- a feedback loop that manufactures duplicates of facts already in the store,
+#: and one that gets worse every session rather than settling.
+#:
+#: It has never fired, because SessionStart produced no output at all on a hosted install
+#: until 0.1.4. Fixing that hook without adding these two lines in the same commit would
+#: have turned a dead hook into an actively harmful one.
 NOISE = (
     "<command-message>",
     "<command-name>",
     "<system-reminder>",
     "<local-command-stdout>",
     "Recalled from Memvara",
+    "Memvara — what is already known about this user",
+    "Memvara scope:",
 )
 
 

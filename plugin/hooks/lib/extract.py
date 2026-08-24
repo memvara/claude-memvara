@@ -28,7 +28,10 @@ import os
 import re
 import subprocess
 
+from typing import NamedTuple
+
 from .usage import record_extraction
+from .write import log
 
 #: Set in the child's environment. If a hook ever sees this, it is running underneath an
 #: extraction and must not start another one.
@@ -41,30 +44,214 @@ MODEL = "claude-haiku-4-5-20251001"
 #: entry in hooks.json must allow more than this or the kill lands in the wrong place.
 TIMEOUT_SEC = 90
 
-PROMPT = """\
+#: The predicates a hook is allowed to write, and what each one is.
+#:
+#: This list exists because of a defect that produces no error and no log line. `remember()`
+#: normalizes a predicate but never *registers* one, and registration is where cardinality
+#: lives -- so a predicate this store has not seen is multi-valued forever, and multi-valued
+#: means nothing it writes ever supersedes anything. The old prompt asked the model to invent
+#: a `snake_case_relation` per fact, so every turn minted a fresh slot that could never
+#: reconcile with the last one. Measured on a real store: one preference about file paths
+#: occupying four separate live claims under four invented predicates, none superseding any
+#: other, all four competing for the same recall budget.
+#:
+#: The 23 here are the core's builtins (`memvara/schema.py`), which are registered and
+#: therefore do supersede. The engineering set below them is a shipped pack -- and is NOT
+#: loaded on the hosted deployment, so those land unregistered today. That is fine for the
+#: genuinely multi-valued ones and wrong for the single-valued ones; see the README.
+#:
+#: `rich` is the half that fixes what gets stored rather than where. A terse object is right
+#: for `lives_in` ("Lisbon") and useless for `prefers`, where the value IS the instruction
+#: and its reasons. See PROMPT.
+VOCABULARY: "dict[str, tuple[str, bool]]" = {
+    # predicate: (memory_type, rich)
+    # -- identity, single-valued and effectively permanent --
+    "name": ("semantic", False),
+    "born_on": ("semantic", False),
+    "born_in": ("semantic", False),
+    "pronouns": ("semantic", False),
+    "speaks": ("semantic", False),
+    # -- circumstance, changes over years --
+    "lives_in": ("semantic", False),
+    "works_at": ("semantic", False),
+    "job_title": ("semantic", False),
+    "timezone": ("semantic", False),
+    "relationship_status": ("semantic", False),
+    "owns_pet": ("semantic", False),
+    # -- taste --
+    "likes": ("semantic", False),
+    "dislikes": ("semantic", False),
+    "allergic_to": ("semantic", False),
+    "dietary_restriction": ("semantic", False),
+    # -- how the user wants work done: the ones that matter in a coding session --
+    "prefers": ("procedural", True),
+    "prefers_tool": ("procedural", False),
+    "communication_style": ("procedural", True),
+    "never_do": ("procedural", True),
+    # -- what is happening now --
+    "working_on": ("episodic", False),
+    "goal": ("episodic", True),
+    "mood": ("semantic", False),
+    "located_now": ("semantic", False),
+    # -- project facts. Subject is the repo, never "user". --
+    "depends_on": ("semantic", False),
+    "rejected": ("semantic", True),
+    "known_defect": ("semantic", True),
+    "blocked_by": ("semantic", True),
+    "version": ("semantic", False),
+    "build_status": ("semantic", False),
+    "endpoint": ("semantic", False),
+    "owner": ("semantic", False),
+    "deploys_to": ("semantic", False),
+}
+
+#: Predicates whose subject must be a project, not the user.
+PROJECT_PREDICATES = frozenset({
+    "depends_on", "rejected", "known_defect", "blocked_by", "version",
+    "build_status", "endpoint", "owner", "deploys_to",
+})
+
+#: Objects that carry no value. A fact whose object is one of these is a fact whose object
+#: went missing: the store holds `user wants hooks printed to terminal = "true"`, which
+#: answers nothing a later session could act on and still occupies a slot and a recall line.
+EMPTY_OBJECTS = frozenset({
+    "true", "false", "yes", "no", "none", "null", "n/a", "na", "unknown",
+    "done", "ok", "okay", "todo", "tbd", "-",
+})
+
+#: Shortest object a `rich` predicate may have. A five-word procedural memory is the defect
+#: this whole file is being changed to fix, not a saving -- "verification_first" is not a
+#: preference anyone can apply, it is a label for one.
+MIN_RICH_OBJECT_CHARS = 60
+
+#: Longest object, so one runaway extraction cannot put a whole turn in a slot.
+MAX_OBJECT_CHARS = 1200
+
+
+def _vocabulary_lines() -> str:
+    """The vocabulary as the model sees it: name, subject, and how long the value runs."""
+    out = []
+    for predicate, (_mtype, rich) in VOCABULARY.items():
+        subject = "<project>" if predicate in PROJECT_PREDICATES else "user"
+        shape = "full sentences" if rich else "short value"
+        out.append(f"  {predicate} (subject: {subject}, object: {shape})")
+    return "\n".join(out)
+
+
+PROMPT_HEAD = """\
 Extract durable facts from the exchange below: one user message and the reply to it.
 
 Return JSON only, no prose, in exactly this shape:
-{"facts": [{"subject": "user", "predicate": "snake_case_relation", "object": "short value"}]}
+{"facts": [{"subject": "user", "predicate": "prefers", "object": "..."}]}
 
-Rules:
-- Only what would still matter next week.
-- Two kinds are worth keeping, and most turns hold at most one of each:
-  1. A standing instruction or preference, even when stated in the middle of the work:
-     "always X", "stop doing Y", "I want Z from now on". Subject is "user".
-  2. A durable decision about the project: what was chosen and why, where something
-     lives, how a thing is released, a constraint that will still bind later. Subject is
-     the component, repo or system it is about -- NOT "user".
-- Skip the mechanics of this session: what a command printed, what a file contains right
-  now, what happens next, anything that a later reader would check rather than recall.
-- `object` is the value alone: "Lisbon", not "they live in Lisbon".
-- Prefer few, high-confidence facts. An empty list is a correct answer.
+## Use only these predicates
+
+Pick the closest one. If nothing fits, return no fact -- do NOT invent a predicate.
+An invented predicate can never replace an older value of the same fact, so it makes the
+store worse, not bigger.
+
+"""
+
+PROMPT_TAIL = """
+## Subject
+
+- "user" for anything about the person: how they want work done, who they are.
+- The project key given above for anything about the code, the repo or the system.
+  Never file a project fact under "user".
+
+## What is worth keeping
+
+Only what would still matter next week. Most turns hold at most one or two facts, and an
+empty list is a correct and common answer.
+
+Keep: a standing instruction or preference, even stated mid-work ("always X", "stop doing
+Y", "from now on Z"); a durable decision about the project -- what was chosen and why,
+where something lives, what is known to be broken, what was deliberately rejected.
+
+Skip: the mechanics of this session. What a command printed, what a file contains right
+now, what you are about to do next, whether a step succeeded. A later reader would look
+those up, not recall them.
+
+## How long the object runs -- this is the part that is usually got wrong
+
+For a short-value predicate the object is the bare value: "Lisbon", not "they live in
+Lisbon".
+
+For a full-sentences predicate the object IS the memory, and it must stand on its own in a
+session that cannot see this conversation. State the instruction, why it matters, and the
+concrete detail that makes it applicable. A reader who has never seen this exchange must be
+able to act on it without asking a question.
+
+Too thin -- do not do this:
+  {"subject": "user", "predicate": "prefers", "object": "verification_first"}
+  {"subject": "user", "predicate": "prefers", "object": "absolute paths"}
+
+Right:
+  {"subject": "user", "predicate": "prefers",
+   "object": "always cite files by full absolute path, never a relative one --
+   /Applications/workstation/memvara-cloud/docs/legal/DPA.md, not docs/legal/DPA.md.
+   Work spans three sibling repos plus git worktrees under each, so a relative path names
+   a file in two or three trees at once and the reader cannot tell which. Applies to prose,
+   tables, PR bodies and markdown link text alike."}
+
+  {"subject": "user", "predicate": "never_do",
+   "object": "never trust a subagent's own completion report as evidence. Across an
+   eight-agent run every agent's work was sound and every agent's self-verification had a
+   hole. Re-measure each shard yourself with a script that names its own files, and compare
+   against a fixed baseline rather than counting defects."}
 
 Exchange:
 """
 
 
-def _payload(text: str) -> "tuple[str, dict]":
+def project_subject(cwd: "str | None" = None) -> str:
+    """The subject to file this repository's facts under.
+
+    Keyed on the git *remote*, not the path, and that is the whole point. Two worktrees of
+    one repository are two paths, and a clone on another machine is a third; keying on the
+    path files the same project's facts under three different subjects that never meet, so
+    a decision recorded in one worktree is invisible from the next. The remote is the same
+    string in all three.
+
+    Falls back to the directory name when there is no remote, which is the best available
+    answer for a repo that has never been pushed.
+    """
+    cwd = cwd or os.getcwd()
+    name = ""
+    try:
+        remote = subprocess.run(
+            ["git", "-C", cwd, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if remote.returncode == 0:
+            url = remote.stdout.strip().rstrip("/")
+            if url.endswith(".git"):
+                url = url[:-4]
+            name = url.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+    except (OSError, subprocess.SubprocessError):
+        name = ""
+    if not name:
+        try:
+            root = subprocess.run(
+                ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if root.returncode == 0 and root.stdout.strip():
+                name = os.path.basename(root.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            name = ""
+    name = name or os.path.basename(os.path.abspath(cwd))
+    return re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-") or "project"
+
+
+def build_prompt(cwd: "str | None" = None) -> str:
+    """The extraction prompt, with this repository's project key baked in."""
+    return (PROMPT_HEAD + _vocabulary_lines()
+            + f"\n\nThe project key for this repository is: {project_subject(cwd)}\n"
+            + PROMPT_TAIL)
+
+
+def _payload(text: str, prompt: str) -> "tuple[str, dict]":
     """The model's reply and what it cost, or `('', {})` if the run failed.
 
     Cost is returned rather than discarded because here is the only place it exists.
@@ -86,7 +273,7 @@ def _payload(text: str) -> "tuple[str, dict]":
                 "--settings", '{"hooks":{}}',
                 "--model", MODEL,
                 "--output-format", "json",
-                PROMPT + text,
+                prompt + text,
             ],
             capture_output=True, text=True, timeout=TIMEOUT_SEC, env=env,
         )
@@ -126,26 +313,75 @@ def _facts(result: str) -> "list[dict]":
     return facts if isinstance(facts, list) else []
 
 
-def triples(text: str) -> "list[tuple[str, str, str]]":
-    """`(subject, predicate, object)` for everything worth storing in `text`.
+class Fact(NamedTuple):
+    subject: str
+    predicate: str
+    object: str
+    memory_type: str
 
-    Predicates are normalised to snake_case here rather than trusted from the model: an
-    unregistered predicate is many-valued forever in this store, so two spellings of one
-    relation never reconcile and both keep answering.
+
+def triples(text: str, cwd: "str | None" = None) -> "list[Fact]":
+    """Everything worth storing in `text`, as facts this store can actually reconcile.
+
+    The model is asked for a closed vocabulary and is not trusted to have obeyed. Three
+    checks, and each one exists because the store on this machine holds the thing it
+    rejects:
+
+    * **An unlisted predicate is dropped.** It cannot supersede anything, so writing it
+      adds a permanent second answer to a question that already had one.
+    * **A valueless object is dropped.** `... = "true"` is a fact whose value went missing.
+    * **A thin object under a full-sentences predicate is dropped.** `prefers =
+      "verification_first"` is a label for a preference rather than the preference, and a
+      later session can do nothing with it. Dropping is right rather than harsh: the same
+      preference will be stated again, and a thin claim in the slot makes the good one
+      look like a duplicate when it arrives.
+
+    Every drop is logged, because a vocabulary that is too narrow and a model that is
+    ignoring it look identical from the store, and only one of them is fixed here.
     """
-    result, usage = _payload(text)
+    prompt = build_prompt(cwd)
+    result, usage = _payload(text, prompt)
     if usage:
         # Recorded before the reply is even parsed: the tokens were spent whether or not
         # the model returned anything usable.
         record_extraction(usage, model=MODEL)
 
-    out: "list[tuple[str, str, str]]" = []
+    out: "list[Fact]" = []
+    dropped: "list[str]" = []
+    project = project_subject(cwd)
+
     for fact in _facts(result):
         if not isinstance(fact, dict):
             continue
+        predicate = re.sub(r"[^a-z0-9]+", "_",
+                           str(fact.get("predicate") or "").lower()).strip("_")
+        obj = " ".join(str(fact.get("object") or "").split())
         subject = str(fact.get("subject") or "user").strip() or "user"
-        predicate = re.sub(r"[^a-z0-9]+", "_", str(fact.get("predicate") or "").lower()).strip("_")
-        obj = str(fact.get("object") or "").strip()
-        if predicate and obj:
-            out.append((subject, predicate, obj))
+
+        spec = VOCABULARY.get(predicate)
+        if spec is None:
+            dropped.append(f"{predicate}: not in vocabulary")
+            continue
+        if not obj or obj.lower() in EMPTY_OBJECTS:
+            dropped.append(f"{predicate}: empty object {obj!r}")
+            continue
+        memory_type, rich = spec
+        if rich and len(obj) < MIN_RICH_OBJECT_CHARS:
+            dropped.append(f"{predicate}: object too thin ({len(obj)}c) {obj!r}")
+            continue
+        if len(obj) > MAX_OBJECT_CHARS:
+            obj = obj[:MAX_OBJECT_CHARS].rstrip() + "..."
+
+        # The model is told which subject each predicate takes; this makes it true rather
+        # than hoping. A project fact filed under "user" is how a store ends up with one
+        # subject and a 1% join rate.
+        if predicate in PROJECT_PREDICATES:
+            subject = project if subject in ("user", "", project) else subject
+        else:
+            subject = "user"
+
+        out.append(Fact(subject, predicate, obj, memory_type))
+
+    if dropped:
+        log("dropped " + "; ".join(dropped))
     return out

@@ -34,8 +34,8 @@ Four hooks, so memory happens without being asked for:
 | Event | What it does |
 |---|---|
 | `SessionStart` | Opens the session with standing facts, and names the scope it is bound to |
-| `UserPromptSubmit` | Recalls against every prompt |
-| `Stop` | Ingests the turn that just ended |
+| `UserPromptSubmit` | Recalls against every prompt, skipping what it has already injected |
+| `Stop` | Keeps the turn that just ended, and mines it for facts |
 | `PreToolUse` | Auto-allows read-only `memory_*` tools; writes still ask |
 
 The hooks try three routes and return the same text from each; only the
@@ -68,21 +68,95 @@ client settings, so the hooks open the store the MCP server writes to
 rather than one of their own choosing, and they degrade to doing nothing
 when there is no store, no library and no login.
 
-Both hooks say so in the terminal. Plain stdout from a hook is either
-context for the model or nothing at all, depending on the event, and
-neither is visible to the person watching — so a hook that had silently
-stopped working looked exactly like one with nothing to say. Each now
-prints a one-line `systemMessage`: `Memvara · 4 note(s) recalled` before
-the turn, `Memvara · 2 fact(s) stored from this turn` after it.
+The hooks say so, but not all in the same place. Plain stdout from a hook
+is either context for the model or nothing at all, depending on the
+event, and neither is visible to the person watching — so a hook that had
+silently stopped working looked exactly like one with nothing to say.
 
-Capture needs a model, and uses the one you already pay for. It shells
-out to `claude -p` against your existing Claude Code login, so there is
-no `ANTHROPIC_API_KEY` and no second bill. It does not go through
-`MEMVARA_LLM`, which stays `none`: the library's `NullLLM` accepts prose
-and stores nothing, so facts are written as triples instead. On a hosted
-install there is no local store to open, so capture writes those triples
+Recall and session start are synchronous and print a one-line
+`systemMessage`: `Memvara · 4 memories recalled` before the turn (and
+`1 memory`, singular, when there is one).
+
+Capture prints nothing, because it runs `async`. Extraction shells out to
+`claude -p` and takes 12–14 seconds, and a synchronous `Stop` hook holds
+the turn open for all of it; async hands the turn straight back. The
+client discards an async hook's output, so the report moves to
+`~/.memvara/.hooks/capture.log` rather than being dropped — every path
+that reaches a decision writes a line there, including the ones that
+decide to do nothing.
+
+Recall distinguishes three outcomes, and two of them used to read the
+same. `Memvara · no matching memories` means the store was asked and had
+nothing; `Memvara · recall failed — see capture.log` means it could not
+be asked at all. Collapsing those into one message is how a hosted client
+whose session id had gone stale went on reporting an empty store for a
+whole session — from the terminal that is indistinguishable from a store
+that is genuinely empty, and nobody investigates an empty store. Three
+separate defects had to line up for it, and each is now closed: the
+client re-handshakes instead of holding a dead session id, the daemon
+answers `{"ok": false}` instead of an empty string, and the client only
+treats `ok: true` as authoritative.
+
+A prompt that is purely a reply — "yes please", "go ahead" — is searched
+together with the last prompt that had a topic in it, not on its own. The
+query used to be the prompt verbatim, and two function words retrieve
+arbitrary neighbours: measured on a real store, a turn approving a memory
+cleanup was handed notes about pricing tiers and an unrelated project's
+zip layout. Never an error, just the whole block's budget spent on noise.
+The carried topic is prepended rather than substituted, so "yes, add that
+fix to #7" still carries the `#7`, and it only advances when you say
+something with a topic in it.
+
+`Memvara · 3 memories recalled · 4 already in context` is the fourth
+shape. A memory injected on turn 1 is still in the conversation on turn
+5, so re-injecting it spends budget a genuinely new memory could have
+had. Hashes of what has already gone in are kept per session under
+`~/.memvara/.hooks/recalled/`.
+
+Capture keeps two things per turn, because they fail differently. The
+turn itself goes in as an episode — searchable prose, the reasoning and
+the sentence you actually typed, which is the part a triple loses. On a
+`fast-path-only` server, which is what the hosted endpoint reports, that
+costs one round trip and no tokens at all: the episode is committed
+before the extraction gate is consulted, and billing counts net-new
+claims rather than episodes.
+
+Then it mines the turn for facts. That half needs a model, and uses the
+one you already pay for: it shells out to `claude -p` against your
+existing Claude Code login, so there is no `ANTHROPIC_API_KEY` and no
+second bill. It does not go through `MEMVARA_LLM`, which stays `none`.
+On a hosted install there is no local store to open, so capture writes
 over the same MCP endpoint recall reads; a write the endpoint refuses is
 logged as failed rather than counted as stored.
+
+**Facts are written from a closed vocabulary.** The model picks from the
+core's registered predicates and returns nothing when none fit, rather
+than inventing one per fact. This is not tidiness. `remember()`
+normalizes a predicate but never registers one, and an unregistered
+predicate is multi-valued forever — so an invented predicate can never
+supersede an older value of the same fact. Measured on a real store: one
+preference about file paths occupying four live claims under four
+invented names, none replacing any other, all four competing for the same
+recall budget. Project facts take the repository as their subject, keyed
+on the git *remote* rather than the path, so two worktrees and a clone on
+another machine file into one place instead of three.
+
+**And the object has to stand on its own.** The old prompt asked for
+"the value alone", which is right for `lives_in` ("Lisbon") and useless
+for a preference, where the value *is* the instruction: the store still
+holds `deployment_approach = verification_first`, which no later session
+can act on. Predicates that carry instructions now require the reasoning
+and the concrete detail with them, and a memory too thin to be applied is
+dropped rather than stored.
+
+Two limits worth stating plainly. The hosted `memory_remember` tool takes
+seven arguments and neither `sources` nor `extractor` is among them, so
+on a hosted install a captured fact has no attached provenance and
+`memory_why` will say so — the episode above is the compensating
+mechanism, searchable if not linked. And the engineering predicate pack
+is loaded server-side through `MEMVARA_PREDICATES`, which
+`app.memvara.dev` does not set, so project predicates land unregistered
+there however this plugin writes them.
 
 Capture is scoped to one turn and runs once per turn. The `Stop` hook
 mines the whole exchange — the prompt you typed and the reply it got —
@@ -106,9 +180,20 @@ on a session with large tool outputs most of the transcript was skipped
 unread and could never be reconsidered. Measured on one session: 630 KB
 consumed, six extractions paid for, only the tail of each ever seen.
 
+Because the bill is per run and not per token — 239 runs measured over
+four days spent 2,491 fresh input tokens against 8.0M of preamble — the
+only lever left is running less often. Capture skips a turn whose whole
+typed prompt is a continuation (`yes`, `do it`, `continue`) or is very
+short, unless it contains a word that suggests a decision. The filter is
+deliberately timid: a skipped turn is a fact lost with no trace, and the
+saving is one run.
+
 Each run appends a line to `~/.memvara/.hooks/capture.log` saying how
-many facts were found and how many were stored, which is where a failed
-write is distinguishable from a quiet turn.
+many facts were found, how many were stored, whether the turn itself was
+kept, and what was dropped for falling outside the vocabulary — which is
+where a failed write is distinguishable from a quiet turn, and where a
+vocabulary that is too narrow is distinguishable from a model ignoring
+it.
 
 The child is launched with an empty hook set, and refuses to start if it
 finds itself already inside an extraction. Without both, a `Stop` hook

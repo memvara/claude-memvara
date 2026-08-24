@@ -11,6 +11,9 @@ from __future__ import annotations
 import json
 import sys
 
+#: Every memory_* tool the server marks `readOnlyHint`. A read that prompts is a read the
+#: model learns to avoid, and the two graph tools were missing for no reason other than
+#: that they were added after this list.
 READ_ONLY = frozenset({
     "memory_recall",
     "memory_search",
@@ -18,6 +21,8 @@ READ_ONLY = frozenset({
     "memory_history",
     "memory_why",
     "memory_stats",
+    "memory_neighborhood",
+    "memory_paths",
 })
 
 

@@ -20,6 +20,19 @@ its watermark past *all* of it, so on a session with large tool outputs most of 
 transcript was skipped unread and could never be reconsidered. Measured on one session:
 630KB consumed, six extractions paid for, and only the tail of each batch ever seen.
 
+**It runs async, and therefore silently.** Extraction shells out to `claude -p` and takes
+12-14 seconds, and a synchronous `Stop` hook holds the turn open for all of it. Async hands
+the turn back immediately -- but the client discards an async hook's output, so the
+`systemMessage` this used to print could not survive the change and is gone rather than
+merely unread.
+
+That reverses a rule this repository states in CLAUDE.md, and the reason it was stated is
+still true: a hook nobody can see working is one nobody notices breaking. The compensating
+channel is `~/.memvara/.hooks/capture.log`, and the obligation moved there rather than
+disappearing -- every path that reaches a decision writes a line, including the ones that
+decide to do nothing. `recall.py` is unaffected: it is synchronous, it is the hook that
+gates the prompt, and it still reports itself in the terminal.
+
 Per-turn costs more and loses nothing. The two guards that remain:
 
 * **It writes.** A hosted install has no local store, so writes go over the MCP endpoint
@@ -31,12 +44,12 @@ Per-turn costs more and loses nothing. The two guards that remain:
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lib.extract import triples  # noqa: E402
-from lib.ipc import emit_json  # noqa: E402
+from lib.extract import project_subject, triples  # noqa: E402
 from lib.open import payload  # noqa: E402
 from lib.transcript import last_turn  # noqa: E402
 from lib.write import log, open_writer, store_facts  # noqa: E402
@@ -52,6 +65,54 @@ MAX_TURN_CHARS = 20_000
 #: Where the per-transcript sizes live. Beside the store, not in the plugin, which is
 #: replaced wholesale on update.
 STATE = Path.home() / ".memvara" / ".hooks" / "capture-state.json"
+
+
+#: Prompts that carry no fact and never will. A turn whose whole typed input is one of
+#: these is the user saying "carry on", and mining it costs a full headless run -- about
+#: 21k tokens of Claude Code's own preamble -- to be told there is nothing here.
+CONTINUATIONS = frozenset({
+    "y", "yes", "yep", "yeah", "ok", "okay", "k", "sure", "go", "go ahead", "do it",
+    "continue", "carry on", "proceed", "next", "please", "thanks", "thank you", "ty",
+    "try again", "again", "fix it", "run it", "same", "and", "more",
+})
+
+#: A prompt containing one of these is mined however short it is. The length rule below is
+#: a guess about whether a fact is present; these are evidence, and evidence wins.
+SIGNAL = (
+    "remember", "decision", "decide", "prefer", "always", "never", "instead",
+    "convention", "rule", "standard", "policy", "approach", "architecture", "design",
+    "tradeoff", "because", "bug", "broken", "root cause", "deprecat", "migrate",
+)
+
+#: Below this, with no signal word, a prompt is treated as a continuation. Deliberately
+#: small. A skipped turn is a fact lost with no trace, and the saving is one run; the
+#: asymmetry says to guess in favour of mining.
+MIN_PROMPT_CHARS = 12
+
+
+def _worth_mining(turn: str) -> "tuple[bool, str]":
+    """Whether this turn justifies a paid extraction, and why not when it does not.
+
+    The cost model is the whole argument. A headless run spends ~10 fresh input tokens on
+    the transcript it is handed and ~21k on Claude Code's own preamble regardless, so the
+    bill scales with the NUMBER of runs and not at all with their size. Cutting the runs
+    that cannot contain a fact is therefore the only lever that exists while capture stays
+    per-turn -- and per-turn is deliberate: batching was removed in 0.1.3 because it
+    advanced its watermark past text it never read.
+    """
+    typed = " ".join(
+        line[len("User: "):] for line in turn.splitlines() if line.startswith("User: ")
+    ).strip()
+    if not typed:
+        return False, "no typed prompt"
+    low = typed.lower()
+    if any(word in low for word in SIGNAL):
+        return True, ""
+    if low.strip(".!? ") in CONTINUATIONS:
+        return False, "continuation"
+    if len(typed) < MIN_PROMPT_CHARS:
+        return False, f"prompt too short ({len(typed)}c)"
+    return True, ""
 
 
 def _read_state() -> dict:
@@ -113,7 +174,7 @@ def main() -> int:
 
     turn = _turn(transcript)
     if not turn.strip():
-        emit_json({"systemMessage": "Memvara · nothing in this turn to record"})
+        log("no turn to mine")
         return 0
 
     # Recorded before extraction, not after: a run that dies mid-way must not leave the
@@ -121,32 +182,61 @@ def main() -> int:
     state[key] = size
     _write_state(state)
 
-    facts = triples(turn)
-    if not facts:
-        emit_json({"systemMessage": "Memvara · no durable facts in this turn"})
+    worth, why = _worth_mining(turn)
+    if not worth:
+        log(f"turn={len(turn)}c skipped={why}")
         return 0
 
     store, close = open_writer()
     if store is None:
-        log(f"turn={len(turn)}c facts={len(facts)} stored=0 failed=no store or login")
-        emit_json({"systemMessage": "Memvara · no store to write to — see capture.log"})
+        log(f"turn={len(turn)}c stored=0 failed=no store or login")
         return 0
 
     try:
-        stored, failed = store_facts(store, facts)
+        kept = _keep_turn(store, turn, str(data.get("cwd") or ""))
+        facts = triples(turn, str(data.get("cwd") or "") or None)
+        if not facts:
+            log(f"turn={len(turn)}c facts=0 episode={'yes' if kept else 'no'}")
+            return 0
+        stored, failed = store_facts(store, facts, turn, hosted=close is not None)
     finally:
         if close is not None:
             close()
 
-    log(f"turn={len(turn)}c facts={len(facts)} stored={stored}"
-        + (" failed=" + "; ".join(failed) if failed else ""))
+    log(f"turn={len(turn)}c facts={len(facts)} stored={stored} "
+        f"episode={'yes' if kept else 'no'}"
+        + ("; failed=" + "; ".join(failed) if failed else ""))
 
-    if failed:
-        emit_json({"systemMessage":
-                   f"Memvara · {stored} stored, {len(failed)} failed — see capture.log"})
-    else:
-        emit_json({"systemMessage": f"Memvara · {stored} fact(s) stored from this turn"})
     return 0
+
+
+def _keep_turn(store: object, turn: str, cwd: str) -> bool:
+    """Store the turn itself as an episode. True if it landed.
+
+    Triples are a lossy reading of a conversation, and the loss is the part a later session
+    most wants: the reasoning, the alternative that was rejected, the sentence the user
+    actually typed. This keeps the turn as well, so recall has something to return that is
+    narrative rather than a slot value.
+
+    It is free where it matters. On a `fast-path-only` server -- which is what the hosted
+    endpoint reports -- `add` commits the episode before the extraction gate is consulted
+    and then returns without calling a model, so this costs one round trip and no tokens.
+    Billing counts net-new claims rather than episodes, so unextracted prose bills zero.
+
+    Failure is not reported to the user. The claims are the load-bearing half; a missing
+    episode degrades recall rather than breaking it, and a second red line in the terminal
+    for it would train the eye to ignore the first.
+    """
+    add = getattr(store, "add", None)
+    if add is None:
+        return False
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    project = project_subject(cwd or None)
+    try:
+        add(f"[session turn · project {project} · {stamp}]\n{turn}", role="user")
+        return True
+    except Exception:
+        return False
 
 
 if __name__ == "__main__":

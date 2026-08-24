@@ -11,6 +11,12 @@ Order of preference, and what each costs when it fails:
 1. **Daemon.** ~38ms end to end, most of it this client's own interpreter startup. A
    missing or wedged one costs the connect attempt, which is sub-millisecond against a
    socket that is not there.
+
+   A daemon that answers is no longer automatically believed. It used to be: any reply,
+   including the empty string, ended the search. But the empty string was also what a
+   *failed* query returned, so one broken backend behind a live socket silently disabled
+   recall for an entire session while this exact fallback chain sat unused. The daemon now
+   says which of the two happened and only `ok: true` is authoritative.
 2. **In-process library.** ~148ms, the pre-daemon behaviour, always correct. Skipped
    entirely when the library is not installed, which is the normal hosted case.
 3. **Hosted over stdlib HTTP.** ~390ms cold. Needs no `pip install`, which is the point:
@@ -25,6 +31,7 @@ one and this prompt takes the slow path.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -61,10 +68,27 @@ def _spawn(root: str) -> None:
 
 
 def recall(query: str, *, k: int = 6, budget: int = 700, header: str | None = None,
-           spawn: bool = True) -> str:
-    """Recall text for `query`, by whatever route is available."""
+           include_episodes: bool = False, spawn: bool = True) -> "tuple[str, bool | None]":
+    """Recall text for `query`, by whatever route is available.
+
+    Returns `(text, ok)` with three states, because there are three things that can happen
+    and collapsing any two of them hides a real one:
+
+    * `True` -- a store was asked and answered. `text` may still be empty, and that is a
+      fact about the store rather than about the plumbing.
+    * `False` -- a store was there and could not be reached. This is the state that used to
+      be indistinguishable from the one above, and a hosted client with a stale session
+      exploited exactly that: "no matching memories", every prompt, for a whole session,
+      over a store that was full. Nobody investigates an empty store.
+    * `None` -- there is no store to ask. No database, no library, no credentials. Not a
+      failure, and reporting it as one sends someone who has simply not logged in to read a
+      log that will tell them nothing.
+
+    A plain tuple rather than a NamedTuple on purpose: `typing` is not imported anywhere on
+    this path, and this file runs on every prompt against a ~30ms budget.
+    """
     if not query.strip():
-        return ""
+        return "", True
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -77,11 +101,15 @@ def recall(query: str, *, k: int = 6, budget: int = 700, header: str | None = No
         request = {"q": query, "k": k, "budget": budget}
         if header:
             request["header"] = header
+        if include_episodes:
+            request["include_episodes"] = True
         answer = send(path, request)
-        if answer is not None:
-            # An empty string from a live daemon is a real answer — this store has nothing
-            # relevant — and must not trigger the slow path to ask the same question again.
-            return answer
+        served = _served(answer)
+        if served is not None:
+            # `""` from a healthy daemon is a real answer -- this store has nothing
+            # relevant -- and must not send the slow path off to ask again. A daemon
+            # reporting failure is the opposite and falls through.
+            return served, True
 
     from .open import open_store
 
@@ -92,27 +120,55 @@ def recall(query: str, *, k: int = 6, budget: int = 700, header: str | None = No
         from .hosted import open_hosted
 
         client = open_hosted()
-        if client is not None:
-            try:
-                text = client.recall(query, k=k, budget=budget, header=header)
-            except Exception:
-                text = None
-            finally:
-                client.close()
-            if text:
-                if spawn and path is not None:
-                    _spawn(root)
-                return text
-        return ""
+        if client is None:
+            # Nothing is configured at all -- no local database, no library to read one
+            # with, and no credentials file. Distinct from a store that would not answer.
+            return "", None
+        try:
+            text = client.recall(query, k=k, budget=budget, header=header,
+                                 include_episodes=include_episodes)
+        except Exception:
+            # Including HostedError. Nothing below this to fall through to -- but the
+            # caller still has a banner to print, and "could not ask" is not "nothing
+            # to say".
+            return "", False
+        finally:
+            client.close()
+        if spawn and path is not None:
+            _spawn(root)
+        return text, True
 
     try:
         kwargs = {"k": k, "budget": budget}
         if header:
             kwargs["header"] = header
+        if include_episodes:
+            kwargs["include_episodes"] = True
         text = str(store.recall(query, **kwargs) or "")
     except Exception:
-        text = ""
+        if spawn and path is not None:
+            _spawn(root)
+        return "", False
 
     if spawn and path is not None:
         _spawn(root)
-    return text
+    return text, True
+
+
+def _served(answer: "str | None") -> "str | None":
+    """The daemon's text if it answered successfully, else None meaning "fall through".
+
+    Three cases collapse to None and should: no daemon at all (`answer is None`), a daemon
+    reporting a failed query (`ok: false`), and a reply this client cannot parse -- which is
+    not expected, since the socket address digests the sources of both ends, but is the same
+    situation from here.
+    """
+    if answer is None:
+        return None
+    try:
+        reply = json.loads(answer)
+    except ValueError:
+        return None
+    if not isinstance(reply, dict) or not reply.get("ok"):
+        return None
+    return str(reply.get("text") or "")
