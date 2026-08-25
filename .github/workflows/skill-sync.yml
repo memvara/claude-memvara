@@ -28,6 +28,34 @@ jobs:
             echo "changed=false" >> "$GITHUB_ENV"
             exit 0
           fi
+          # CLAUDE.md is shared across every repo in plugin-repos.txt and nothing used to
+          # carry it, so it was hand-copied and drifted -- a section written in one of them
+          # reached none of the others. The canonical is `plugin-claude.md` in the library;
+          # everything between the `local:` markers belongs to THIS repository and survives,
+          # because two of its sections legitimately differ per repo (its runtime facts, and
+          # the hook rules that only this plugin needs).
+          python3 - "$src/../../plugin-claude.md" <<'COMPOSE'
+          import pathlib, sys
+          BEGIN = "<!-- local: begin — this repository's own facts; skill-sync preserves this block -->"
+          END = "<!-- local: end -->"
+          canonical = pathlib.Path(sys.argv[1])
+          if not canonical.is_file():
+              print("library has no plugin-claude.md yet; leaving CLAUDE.md alone")
+              raise SystemExit(0)
+          here = pathlib.Path("CLAUDE.md")
+          text = here.read_text(encoding="utf-8")
+          if BEGIN not in text or END not in text:
+              # Refuse rather than guess. Splicing without both markers would replace this
+              # repository's own sections with the canonical's placeholder and lose them.
+              print("CLAUDE.md has no local block; refusing to splice")
+              raise SystemExit(0)
+          local = text[text.index(BEGIN) + len(BEGIN):text.index(END)]
+          out = canonical.read_text(encoding="utf-8").replace(
+              "@@LOCAL@@\n", BEGIN + local + END + "\n", 1)
+          here.write_text(out, encoding="utf-8")
+          print("CLAUDE.md composed from the canonical, local block preserved")
+          COMPOSE
+
           rm -rf plugin/skills/memory
           mkdir -p plugin/skills
           cp -R "$src" plugin/skills/memory
@@ -56,7 +84,9 @@ jobs:
               'path=memvara/skills/memvara\\n'
           )
           "
-          if git diff --quiet -- plugin/skills/memory skill.lock; then
+          # CLAUDE.md is in the list, or a canonical-only change composes a new file and
+          # opens nothing -- the sync would run, succeed, and leave the edit unshipped.
+          if git diff --quiet -- plugin/skills/memory skill.lock CLAUDE.md; then
             echo "changed=false" >> "$GITHUB_ENV"
           else
             echo "changed=true" >> "$GITHUB_ENV"
@@ -86,8 +116,10 @@ jobs:
           title: "chore: sync skill from memvara/memvara@${{ env.sha }}"
           body: |
             Vendored skill drifted from [memvara/memvara](https://github.com/memvara/memvara) `${{ env.sha }}`.
-            This PR only copies `memvara/skills/memvara/` to `plugin/skills/memory/`
-            (renaming the skill so it reads `/memvara:memory`) and updates `skill.lock`.
+            This PR copies `memvara/skills/memvara/` to `plugin/skills/memory/` (renaming
+            the skill so it reads `/memvara:memory`), composes `CLAUDE.md` from the
+            library's `plugin-claude.md` while preserving this repository's own `local:`
+            block, and updates `skill.lock`.
             CI still has to pass before merge.
           branch: sync/skill-${{ env.sha }}
           delete-branch: true
