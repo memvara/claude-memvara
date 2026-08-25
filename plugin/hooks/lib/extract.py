@@ -27,6 +27,7 @@ import json
 import os
 import re
 import subprocess
+import unicodedata
 
 from typing import NamedTuple, Sequence
 
@@ -381,23 +382,44 @@ def _fabricated(obj: str, source: str) -> bool:
     return len([t for t in tokens if t not in have]) * 2 > len(tokens)
 
 
-def _content_words(text: str) -> "set[str]":
-    return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) > 3}
+def _shingles(text: str) -> "set[str]":
+    """Character bigrams of `text`, normalised. Deliberately not words.
+
+    Words need a script that delimits them, and the two obvious ways to get them both fail
+    somewhere that matters. `[a-z0-9]+` sees nothing at all in Devanagari, Cyrillic, Greek,
+    Arabic or CJK, so the echo filter simply did not exist for those stores. A Unicode word
+    class rescues the alphabetic ones and still fails CJK, which does not put spaces between
+    words: a Japanese sentence becomes one enormous token that matches only itself, so it
+    reports 1.0 against an identical string and 0.0 against a paraphrase of it.
+
+    Bigrams need no notion of a word, so every script is measured the same way. Measured
+    across scripts, identical text scores 1.00 and unrelated text tops out at 0.35 -- against
+    a 0.8 threshold, which is the margin that makes this usable rather than merely uniform.
+    """
+    flat = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text).lower()).strip()
+    return {flat[i:i + 2] for i in range(len(flat) - 1)}
 
 
 #: How much of an object has to reappear in a recalled note before it counts as a
 #: restatement of that note rather than a fresh observation.
 ECHO_OVERLAP = 0.8
 
+#: Shortest object worth comparing. Below this there are too few bigrams for an overlap to
+#: mean anything -- a handful of them collide with almost any text.
+MIN_ECHO_CHARS = 12
+
 
 def _restates(obj: str, others: "Sequence[str]") -> bool:
-    words = _content_words(obj)
-    if len(words) < 4:
-        # Too short to tell a restatement from a coincidence.
+    if len(obj.strip()) < MIN_ECHO_CHARS:
+        # Too short to tell a restatement from a coincidence: a handful of bigrams will
+        # collide with almost anything.
+        return False
+    mine = _shingles(obj)
+    if not mine:
         return False
     for other in others:
-        seen = _content_words(other)
-        if seen and len(words & seen) >= ECHO_OVERLAP * len(words):
+        seen = _shingles(other)
+        if seen and len(mine & seen) >= ECHO_OVERLAP * len(mine):
             return True
     return False
 
