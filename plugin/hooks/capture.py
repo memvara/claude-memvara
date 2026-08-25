@@ -90,6 +90,18 @@ SIGNAL = (
 MIN_PROMPT_CHARS = 12
 
 
+def _did_something(turn: str) -> bool:
+    """Whether the assistant changed anything in this turn.
+
+    Checked before the prompt is judged short or conversational, because those two rules
+    are guesses about whether a fact is present and this is evidence. `format_assistant`
+    writes one `Claude used <tool>` line per tool it allows through, and the tools it
+    allows through are the ones whose *use* is a durable event -- a file edited, a command
+    run. See `transcript.INCLUDE_TOOLS`.
+    """
+    return any(line.startswith("Claude used ") for line in turn.splitlines())
+
+
 def _worth_mining(turn: str) -> "tuple[bool, str]":
     """Whether this turn justifies a paid extraction, and why not when it does not.
 
@@ -99,6 +111,25 @@ def _worth_mining(turn: str) -> "tuple[bool, str]":
     that cannot contain a fact is therefore the only lever that exists while capture stays
     per-turn -- and per-turn is deliberate: batching was removed in 0.1.3 because it
     advanced its watermark past text it never read.
+
+    **The prompt alone is not that test, and the log said so.** `last_turn` mines both
+    halves because they carry different things -- a standing instruction is stated in the
+    prompt, and what was actually decided and where it landed is in the reply -- so a gate
+    reading only the prompt throws away the half its own module says the decisions are in.
+    Measured on one machine: `turn=6476c skipped=prompt too short (8c)`, six times over,
+    the largest a 6,476-character reply discarded because somebody typed eight characters.
+
+    Short imperatives are how work gets authorised: "merge #55", "deploy it", "ship it",
+    and the whole of `CONTINUATIONS` -- "do it", "go ahead", "run it". Those are exactly
+    the prompts that precede a reply worth keeping.
+
+    So a turn where the assistant *did* something is mined whatever the prompt looked like.
+    `Claude used Edit`, `Write`, `Bash` and `NotebookEdit` lines are already in the
+    formatted turn (`transcript.INCLUDE_TOOLS`), and they are evidence rather than a guess
+    about size: a file changed or a command ran. A long reply that only explains something
+    is still skipped, correctly -- under the attribution rules the extractor now follows,
+    the assistant's own prose is not evidence for a fact anyway, so paying for that run
+    buys nothing.
     """
     typed = " ".join(
         line[len("User: "):] for line in turn.splitlines() if line.startswith("User: ")
@@ -107,6 +138,8 @@ def _worth_mining(turn: str) -> "tuple[bool, str]":
         return False, "no typed prompt"
     low = typed.lower()
     if any(word in low for word in SIGNAL):
+        return True, ""
+    if _did_something(turn):
         return True, ""
     if low.strip(".!? ") in CONTINUATIONS:
         return False, "continuation"
