@@ -95,9 +95,18 @@ def _library_bytes(sha: str, path: str) -> bytes:
     """Bytes of a library file at `sha`. Git first (offline), then GitHub."""
     root = os.environ.get("MEMVARA_LIBRARY")
     if root:
-        return subprocess.check_output(
-            ["git", "-C", root, "show", f"{sha}:{path}"],
-        )
+        try:
+            return subprocess.check_output(
+                ["git", "-C", root, "show", f"{sha}:{path}"],
+                stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            # The checkout has the sha `skill.lock` names and nothing else: CI clones the
+            # library AT that sha, shallow, so the library's current HEAD is simply not an
+            # object here. Falling back to the network rather than failing is what lets
+            # `test_the_vendored_skill_is_not_behind_the_library` run on CI at all -- and
+            # it only matters when the lock is stale, which is exactly when that check has
+            # something to say.
+            pass
     return _fetch(f"https://raw.githubusercontent.com/memvara/memvara/{sha}/{path}")
 
 
@@ -139,10 +148,14 @@ def _library_skill_files(sha: str) -> "set[str]":
             out = subprocess.check_output(
                 ["git", "-C", root, "ls-tree", "-r", "--name-only", sha,
                  LIBRARY_SKILL_PATH], stderr=subprocess.DEVNULL).decode()
-        except subprocess.CalledProcessError as exc:
-            raise LibraryUnreachable(str(exc)) from exc
-        return {line[len(prefix):] for line in out.splitlines()
-                if line.startswith(prefix)}
+        except subprocess.CalledProcessError:
+            # Not an object in this checkout -- see `_library_bytes`. Ask GitHub instead of
+            # reporting the library unreachable, which would SKIP the check on the one run
+            # that needed it.
+            out = None
+        if out is not None:
+            return {line[len(prefix):] for line in out.splitlines()
+                    if line.startswith(prefix)}
     try:
         tree = json.loads(_fetch(
             f"https://api.github.com/repos/memvara/memvara/git/trees/{sha}?recursive=1"))
@@ -336,8 +349,7 @@ class SkillTree(unittest.TestCase):
         self.assertEqual(
             drifted, [],
             f"vendored skill is behind memvara/memvara@{head[:7]}: {drifted} — "
-            "sync it; skill-sync.yml cannot, the org forbids GITHUB_TOKEN from opening "
-            "a PR and no PLUGIN_SYNC_TOKEN is provisioned")
+            "sync it, or check why skill-sync.yml has not")
 
 
 class Hooks(unittest.TestCase):
