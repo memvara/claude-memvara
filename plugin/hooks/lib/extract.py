@@ -497,6 +497,53 @@ def _dropped_entities(obj: str, spoken: str) -> "list[str]":
     return sorted(name for name in wanted if name not in have)
 
 
+VERBATIM_JOIN = " \u2014 stated by the user as: "
+MIN_VERBATIM_CHARS = 40
+
+
+def _repaired(obj: str, spoken: str, lost: "Sequence[str]") -> "str | None":
+    """`obj` with the user's own sentences carrying `lost` appended, or None.
+
+    A lossy paraphrase is evidence a standing instruction EXISTS. Dropping it loses the
+    instruction outright, and that is not hypothetical: the user said to code-review every
+    PR with `/code-review` on the latest Sonnet before merging it on GitHub, the model's
+    summary kept neither name, and the whole preference was discarded. It was stated once,
+    dropped once, and no session ever saw it -- while `capture.log` recorded the drop
+    honestly in a file nobody reads.
+
+    So the guard's detection was right and its remedy was wrong. Keeping the paraphrase
+    alone loses the names; keeping the user's words alone can substitute an unrelated
+    sentence that merely mentions the name; keeping BOTH loses nothing either way. The
+    quoted half is the authoritative one when they disagree, which is why it is quoted
+    rather than summarised.
+
+    This is the same trade `docs/INTERNALS.md` already makes for cardinality -- "wrongly
+    retiring a true fact is worse than keeping two competing ones" -- applied at the point
+    a fact is written rather than at the point one supersedes another.
+    """
+    carrying = []
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", spoken):
+        stripped = sentence.strip()
+        if not stripped:
+            continue
+        names = {_name_key(word)
+                 for word in re.findall(r"[^\W\d_]+", stripped, re.UNICODE)}
+        if any(name in names for name in lost):
+            carrying.append(stripped)
+    if not carrying:
+        return None
+
+    room = MAX_OBJECT_CHARS - len(obj) - len(VERBATIM_JOIN)
+    if room < MIN_VERBATIM_CHARS:
+        # No room to quote them usefully. Saying so beats appending three words of the
+        # sentence and calling the instruction preserved.
+        return None
+    quoted = " ".join(carrying)
+    if len(quoted) > room:
+        quoted = quoted[:room].rstrip() + "..."
+    return obj + VERBATIM_JOIN + quoted
+
+
 class Fact(NamedTuple):
     subject: str
     predicate: str
@@ -533,6 +580,7 @@ def triples(text: str, cwd: "str | None" = None,
 
     out: "list[Fact]" = []
     dropped: "list[str]" = []
+    repairs: "list[str]" = []
     project = project_subject(cwd)
     spoken = user_lines(text)
 
@@ -564,13 +612,25 @@ def triples(text: str, cwd: "str | None" = None,
             # A standing instruction is the one kind of claim that outranks other claims,
             # so a garbled one does more than sit there being wrong. Scoped hard --
             # procedural only, the user's own lines only, names only -- because this is the
-            # one check here that can reject a TRUE memory, and the same preference will be
-            # stated again while a wrong one in the slot silently wins.
+            # one check here that can reject a TRUE memory.
+            #
+            # It used to `continue` here, on the reasoning that "the same preference will
+            # be stated again while a wrong one in the slot silently wins". The first half
+            # of that was wrong. The user stated the code-review rule once; the summary
+            # lost "Sonnet" and "GitHub"; it was dropped and never stated again. A caught
+            # paraphrase is evidence a standing instruction EXISTS -- it is the reason to
+            # go and get the user's wording, not the reason to discard the fact.
             lost = _dropped_entities(obj, spoken)
             if lost:
-                dropped.append(
-                    f"{predicate}: the user's words lost {', '.join(lost)} {obj!r}")
-                continue
+                repaired = _repaired(obj, spoken, lost)
+                if repaired is None:
+                    dropped.append(
+                        f"{predicate}: the user's words lost {', '.join(lost)} and no "
+                        f"sentence of theirs carries them {obj!r}")
+                    continue
+                repairs.append(f"{predicate}: kept the user's own wording for "
+                               f"{', '.join(lost)}")
+                obj = repaired
         if injected and _restates(obj, injected) and not _restates(obj, [spoken]):
             # A note this plugin put in front of the model, handed back as an observation.
             # Writing it re-records the store's own output, which is how one guess becomes
@@ -591,4 +651,8 @@ def triples(text: str, cwd: "str | None" = None,
 
     if dropped:
         log("dropped " + "; ".join(dropped))
+    if repairs:
+        # "repaired" and "dropped" must not look alike in the log. A drop loses a standing
+        # instruction and is the thing to go and read; a repair kept one and is not.
+        log("repaired " + "; ".join(repairs))
     return out

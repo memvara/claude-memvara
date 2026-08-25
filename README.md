@@ -219,19 +219,39 @@ several stored rows that agree with each other. And identifiers,
 versions and measurements have to appear somewhere in the turn; prose
 does not, because a memory worth keeping is composed rather than quoted.
 
-Two limits worth stating plainly. `sources` is still not among the hosted
-`memory_remember` arguments, so on a hosted install a captured fact has
-no attached source turn — the episode above is the compensating
-mechanism, searchable if not linked. `extractor` *is* sent now, so a
-captured fact reports itself as `claude-code-hook` instead of
-`Derived by user`, which is what let a mined inference read back as
-something you had stated; but only against a server new enough to accept
-the argument, and the client asks before sending, because argument
-validation there is closed and a wrong guess costs the whole write rather
-than the one field. And the engineering predicate pack
-is loaded server-side through `MEMVARA_PREDICATES`, which
-`app.memvara.dev` does not set, so project predicates land unregistered
-there however this plugin writes them.
+**A standing instruction keeps your own wording.** The extractor
+summarises, and a summary of an instruction can lose the part that made it
+an instruction. You once said not to put Claude's name in any commit,
+issue or PR; the summary came back as "no attribution of *user* name",
+which reverses it, and that version outranked the real one because "user
+name" matches "who is this user". So for standing instructions only, the
+names you used are compared against the summary — capitalised words, not
+acronyms, since you write "PR" where a correct memory writes "pull
+requests".
+
+When a name goes missing the fact is **not** discarded. It used to be, and
+that cost a real preference: you said to code-review every PR with
+`/code-review` on the latest Sonnet before merging on GitHub, the summary
+kept neither name, and the whole instruction was dropped — stated once,
+lost once, never seen by any session. A summary caught losing a name is
+evidence an instruction *exists*. Your own sentences carrying those names
+are now quoted alongside the summary, so neither half can go missing, and
+the quoted half is the one to believe when they disagree. A drop survives
+only when there is no room left to quote you; `capture.log` says
+`repaired` or `dropped` so the two never look alike.
+
+One limit worth stating plainly. The engineering predicate pack is loaded
+server-side through `MEMVARA_PREDICATES`, which `app.memvara.dev` does not
+set, so project predicates land unregistered there however this plugin
+writes them. Two things that *were* limits no longer are: `sources` is now
+accepted by hosted `memory_remember`, so a captured fact names the turn it
+came from and `memory_why` can show it — claims stored before that are not
+backfilled — and `extractor` is sent too, so a captured fact reports
+itself as `claude-code-hook` rather than `Derived by user`, which is what
+let a mined inference read back as something you had stated. Both are sent
+only against a server that accepts them, and the client asks first,
+because argument validation there is closed and a wrong guess costs the
+whole write rather than the one field.
 
 Capture is scoped to one turn and runs once per turn. The `Stop` hook
 mines the whole exchange — the prompt you typed and the reply it got —
