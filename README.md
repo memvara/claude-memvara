@@ -127,10 +127,17 @@ actually about.
 What recall spends is now written to `~/.memvara/.hooks/recall.log`, per
 prompt. What it spends is not the same question as whether it was
 worth spending: the log records that something was injected, never that it was
-used. Setting `MEMVARA_RECALL_SAMPLE=1` writes the prompt and the memories that
-answered it to `recall-sample.log`, so fifty lines can be read and judged by
-hand. It is off by default because it puts prompt text in a file, and it is a
-measurement rather than a feature — turn it on for a week, read it, turn it off.
+used. Creating the file `~/.memvara/.hooks/sample-recall` writes the prompt and the
+memories that answered it to `recall-sample.log` beside it, so fifty lines can be
+read and judged by hand; delete the file to stop. Its contents are never read.
+
+A file rather than an environment variable because a hook is spawned by the
+client, not by the shell you typed `export` into — an exported variable reaches a
+session started afterwards in a terminal that inherited it, and silently does
+nothing otherwise, so you would turn sampling on and read an empty log a week
+later. It also sits in plain sight next to the logs it produces, which is how you
+discover you left it on. Off by default: it puts prompt text in a file, and it is
+a measurement rather than a feature.
 There are no relevance scores in it because there are none to record: `recall()`
 returns rendered text, and reaching a score means a second round trip on the
 per-prompt path or a change to the server. The write path has had a token ledger since 0.1.2 and the read

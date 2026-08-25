@@ -287,13 +287,25 @@ def _split(block: str) -> "tuple[str, list[str]]":
     return header, bullets
 
 
-#: Set to record what was injected next to the prompt it was injected for, so somebody can
-#: read a sample and judge whether it earned its place.
+#: Create this file to record what was injected next to the prompt it was injected for, so
+#: somebody can read a sample and judge whether it earned its place. Its contents are never
+#: read; existing is the whole signal.
 #:
-#: Opt-in, and it has to be: this writes prompt text to a file, which is a surface nobody
-#: asked for and most installs will never want. It is a measurement, not a feature -- turn
-#: it on for a week, read fifty lines, turn it off.
-SAMPLE_ENV = "MEMVARA_RECALL_SAMPLE"
+#: A file rather than an environment variable, and the difference is not taste. A hook is
+#: spawned by the client, not by the shell somebody typed `export` into -- so an exported
+#: variable reaches a session started afterwards, in a terminal that inherited it, and
+#: silently does nothing otherwise. Somebody would turn sampling "on", see an empty log a
+#: week later, and conclude recall was never called. A path is the same answer from every
+#: process on the machine.
+#:
+#: It also sits in plain sight next to the logs it produces, which matters for a switch
+#: meant to be turned off again: `ls` is how somebody discovers they left it on.
+#:
+#: Opt-in either way: this writes prompt text to a file, which is a surface nobody asked
+#: for and most installs will never want. A measurement, not a feature -- turn it on for a
+#: week, read fifty lines, remove the file.
+SAMPLE_FLAG = os.path.join(
+    os.path.expanduser("~"), ".memvara", ".hooks", "sample-recall")
 
 #: How much of each string to keep. Enough to judge relevance by eye, short enough that a
 #: line stays one line.
@@ -316,7 +328,7 @@ def _sample(prompt: str, memories: "list[str]", *, anaphoric: bool) -> None:
     forward was searched with different words than the ones somebody typed, and a bad
     injection there is a different bug than a bad injection on a prompt that stood alone.
     """
-    if not os.environ.get(SAMPLE_ENV):
+    if not os.path.exists(SAMPLE_FLAG):
         return
     def flat(text: str, n: int) -> str:
         return " ".join(text.split())[:n]

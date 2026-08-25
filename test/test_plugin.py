@@ -1742,8 +1742,8 @@ class RecallSampling(unittest.TestCase):
 
     Not scores: there are none to record. `recall()` returns rendered text, `RecallResult`
     carries ids and a dropped count, and the hosted `memory_recall` does not ask even for
-    those. Reaching a score means a second round trip on the per-prompt path — doubling the
-    cost of the thing being measured — or a server change. The question is whether an
+    those. Reaching a score means a second round trip on the per-prompt path -- doubling
+    the cost of the thing being measured -- or a server change. The question is whether an
     injection earned its place, and a person reading fifty lines answers that.
     """
 
@@ -1756,38 +1756,55 @@ class RecallSampling(unittest.TestCase):
         finally:
             sys.path.pop(0)
 
-    def test_it_writes_nothing_unless_asked(self) -> None:
-        """Off by default, and it has to be: this puts prompt text in a file, which is a
-        surface nobody asked for. It is a measurement, not a feature."""
-        recall = self._recall()
+    @contextlib.contextmanager
+    def _sampling(self, recall, *, enabled: bool):
+        """`recall` wired to a temporary flag file and a capturing logger."""
+        written: list = []
+        log, flag = recall.log_line, recall.SAMPLE_FLAG
         with tempfile.TemporaryDirectory() as tmp:
-            written = []
-            original = recall.log_line
-            recall.log_line = lambda name, text: written.append(name)
-            os.environ.pop(recall.SAMPLE_ENV, None)
+            recall.log_line = lambda name, text: written.append((name, text))
+            recall.SAMPLE_FLAG = os.path.join(tmp, "sample-recall")
+            if enabled:
+                pathlib.Path(recall.SAMPLE_FLAG).write_text("", encoding="utf-8")
             try:
-                recall._sample("a prompt", ["- a memory"], anaphoric=False)
-                self.assertEqual(written, [])
+                yield written
             finally:
-                recall.log_line = original
+                recall.log_line, recall.SAMPLE_FLAG = log, flag
+
+    def test_it_writes_nothing_unless_the_flag_file_is_there(self) -> None:
+        """Off by default, and it has to be: this puts prompt text in a file, which is a
+        surface nobody asked for. It is a measurement, not a feature.
+
+        A file rather than an environment variable because a hook is spawned by the client,
+        not by the shell somebody typed `export` into. An exported variable reaches a
+        session started afterwards in a terminal that inherited it and silently does
+        nothing otherwise -- so somebody would turn sampling on, read an empty log a week
+        later, and conclude recall had never run.
+        """
+        recall = self._recall()
+        with self._sampling(recall, enabled=False) as written:
+            recall._sample("a prompt", ["- a memory"], anaphoric=False)
+            self.assertEqual(written, [], "no flag file: silent")
+
+    def test_the_flag_files_contents_are_never_read(self) -> None:
+        """Existing is the whole signal. A switch that also had to say something would be
+        a config format, and the next question would be what an invalid one means."""
+        recall = self._recall()
+        with self._sampling(recall, enabled=True) as written:
+            pathlib.Path(recall.SAMPLE_FLAG).write_text("no", encoding="utf-8")
+            recall._sample("a prompt", ["- a memory"], anaphoric=False)
+            self.assertEqual(len(written), 1)
 
     def test_it_records_the_prompt_beside_what_answered_it(self) -> None:
         recall = self._recall()
-        written = []
-        original = recall.log_line
-        recall.log_line = lambda name, text: written.append((name, text))
-        os.environ[recall.SAMPLE_ENV] = "1"
-        try:
+        with self._sampling(recall, enabled=True) as written:
             recall._sample("does the deploy need a migration?",
                            ["- memvara_cloud version 17", "- user prefers absolute paths"],
                            anaphoric=True)
-        finally:
-            recall.log_line = original
-            os.environ.pop(recall.SAMPLE_ENV, None)
-
         self.assertEqual(len(written), 1)
         name, line = written[0]
-        self.assertEqual(name, "recall-sample", "its own file, so recall.log stays parseable")
+        self.assertEqual(name, "recall-sample",
+                         "its own file, so recall.log stays parseable")
         self.assertIn("carried=y", line)
         self.assertIn("does the deploy need a migration?", line)
         self.assertIn("mem1=", line)
@@ -1796,17 +1813,10 @@ class RecallSampling(unittest.TestCase):
     def test_a_line_stays_one_line(self) -> None:
         """A memory is prose and can carry newlines; a log somebody greps cannot."""
         recall = self._recall()
-        written = []
-        original = recall.log_line
-        recall.log_line = lambda name, text: written.append(text)
-        os.environ[recall.SAMPLE_ENV] = "1"
-        try:
-            recall._sample("multi\nline\nprompt", ["- a memory\nwith a newline in it"],
+        with self._sampling(recall, enabled=True) as written:
+            recall._sample("multi\nline", ["- a memory\nwith a break"],
                            anaphoric=False)
-        finally:
-            recall.log_line = original
-            os.environ.pop(recall.SAMPLE_ENV, None)
-        self.assertNotIn("\n", written[0])
+        self.assertNotIn("\n", written[0][1])
 
 
 class Provenance(unittest.TestCase):
