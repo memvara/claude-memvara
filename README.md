@@ -74,7 +74,7 @@ event, and neither is visible to the person watching — so a hook that had
 silently stopped working looked exactly like one with nothing to say.
 
 Recall and session start are synchronous and print a one-line
-`systemMessage`: `Memvara · 4 memories recalled` before the turn (and
+`systemMessage`: `⋈ Memvara · 4 memories recalled` before the turn (and
 `1 memory`, singular, when there is one).
 
 Capture prints nothing, because it runs `async`. Extraction shells out to
@@ -86,8 +86,8 @@ that reaches a decision writes a line there, including the ones that
 decide to do nothing.
 
 Recall distinguishes three outcomes, and two of them used to read the
-same. `Memvara · no matching memories` means the store was asked and had
-nothing; `Memvara · recall failed — see capture.log` means it could not
+same. `⋈ Memvara · no matching memories` means the store was asked and had
+nothing; `⋈ Memvara · recall failed — see capture.log` means it could not
 be asked at all. Collapsing those into one message is how a hosted client
 whose session id had gone stale went on reporting an empty store for a
 whole session — from the terminal that is indistinguishable from a store
@@ -139,7 +139,7 @@ The carried topic is prepended rather than substituted, so "yes, add that
 fix to #7" still carries the `#7`, and it only advances when you say
 something with a topic in it.
 
-`Memvara · 3 memories recalled · 4 already in context` is the fourth
+`⋈ Memvara · 3 memories recalled · 4 already in context` is the fourth
 shape. A memory injected on turn 1 is still in the conversation on turn
 5, so re-injecting it spends budget a genuinely new memory could have
 had. Hashes of what has already gone in are kept per session under

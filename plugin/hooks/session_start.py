@@ -34,7 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lib.ipc import emit_json, plural  # noqa: E402
+from lib.ipc import emit_json, plural, status  # noqa: E402
 from lib.write import open_writer  # noqa: E402
 
 #: Wider than the per-prompt hook: this runs once per session, not once per turn.
@@ -120,7 +120,7 @@ def _binding_line(scope: str, visible: str) -> str:
 def main() -> int:
     store, close = open_writer()
     if store is None:
-        emit_json({"systemMessage": "Memvara · not configured"})
+        emit_json({"systemMessage": status("not configured")})
         return 0
 
     # `open_writer` is named for its first caller, but what it does is resolve whichever
@@ -154,13 +154,13 @@ def main() -> int:
             close()
 
     if not parts:
-        emit_json({"systemMessage": "Memvara · nothing stored yet"})
+        emit_json({"systemMessage": status("nothing stored yet")})
         return 0
 
     count = sum(1 for line in "\n\n".join(parts).splitlines() if line.startswith("- "))
     emit_json({
-        "systemMessage": (f"Memvara · session opened with {plural(count)}"
-                          if count else "Memvara · session opened"),
+        "systemMessage": (status(f"session opened with {plural(count)}")
+                          if count else status("session opened")),
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": "\n\n".join(parts),

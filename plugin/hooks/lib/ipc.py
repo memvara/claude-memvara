@@ -54,6 +54,31 @@ CLIENT_TIMEOUT_SEC = 2.0
 IDLE_TIMEOUT_SEC = 30 * 60
 
 
+#: The brand mark, as one character.
+#:
+#: `public/brand/mark-dark.svg` is two arcs on one axis meeting at a node -- valid time
+#: closed, transaction time still open, which is the product's whole idea. A
+#: `systemMessage` is a string the client renders into its own terminal UI, so there is no
+#: image channel to put that in: whatever stands in for it has to be one glyph.
+#:
+#: BOWTIE is the closest honest one. Two strokes meeting at a node is the mark's own
+#: geometry, and it is the relational-algebra join -- which is what a store of facts about
+#: one subject does. It is BMP rather than an emoji on purpose: a glyph a terminal font
+#: lacks renders as a tofu box, which is worse than no mark at all, and BMP maths symbols
+#: are carried nearly everywhere a monospace font is.
+MARK = "\u22c8"
+
+
+def status(text: str) -> str:
+    """The one line a person watching the terminal actually sees.
+
+    Composed here rather than at each call site because there were eight of them, every one
+    repeating both the mark and the word. A status line that says `Memvara` in seven places
+    and something else in the eighth is the kind of drift nobody notices until a screenshot.
+    """
+    return f"{MARK} Memvara \u00b7 {text}"
+
+
 def runtime_dir() -> str:
     os.makedirs(RUNTIME_DIR, exist_ok=True)
     try:
