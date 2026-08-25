@@ -926,6 +926,31 @@ class Extraction(unittest.TestCase):
         spoken = self._facts(extract, reply, turn="User: " + note, injected=[note])
         self.assertEqual(len(spoken), 1, "the user restating it is a real observation")
 
+    def test_a_note_the_user_restates_over_several_lines_still_counts_as_theirs(self) -> None:
+        """The sibling above passes on a one-line prompt and passed while this was broken.
+
+        `format_user` writes one `User: ` for a whole message, so a prompt typed across
+        three lines is one prefixed line and two bare ones. `user_lines` filtered on the
+        prefix, kept the first line, and dropped the rest — so the support check that
+        rescues a user's own restatement from the echo filter saw a third of what they
+        wrote and let it be dropped as an echo of the note they had been shown.
+
+        Which is the exact behaviour the echo filter was written not to have. A filter that
+        drops what the user repeats stops recording anything they emphasise.
+        """
+        extract = self._extract()
+        note = ("always cite files by full absolute path, never a relative one, because "
+                "work spans three sibling repositories plus worktrees under each")
+        reply = json.dumps({"facts": [
+            {"subject": "user", "predicate": "prefers", "object": note}]})
+
+        typed = ("always cite files by full absolute path, never a relative one,\n"
+                 "because work spans three sibling repositories\n"
+                 "plus worktrees under each")
+        kept = self._facts(extract, reply, turn=f"User: {typed}", injected=[note])
+        self.assertEqual(len(kept), 1,
+                         "a multi-line restatement is still the user speaking")
+
     def test_values_that_appear_nowhere_in_the_turn_are_dropped(self) -> None:
         """Numbers and identifiers have to come from the exchange, prose does not.
 
@@ -1440,6 +1465,49 @@ class Hosted(unittest.TestCase):
             self.assertIsNone(hosted.open_hosted())
         finally:
             hosted.CREDENTIALS = original
+
+
+class SpeakerBlocks(unittest.TestCase):
+    """Who said which line, when a message spans several of them."""
+
+    def _transcript(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("lib.transcript")
+        finally:
+            sys.path.pop(0)
+
+    def test_a_prefix_starts_a_block_rather_than_marking_every_line(self) -> None:
+        """The formatter writes one prefix per message; the reader has to know that.
+
+        Both halves are asserted because either alone is a defect. Losing the continuation
+        lines drops what the user said; keeping lines after a `Claude: ` prefix would
+        attribute the assistant's words to them, which is the failure the whole speaker
+        split exists to prevent.
+        """
+        transcript = self._transcript()
+        turn = "\n".join(
+            transcript.format_user({"content": "one\ntwo\nthree"})
+            + transcript.format_assistant({"content": "claude one\nclaude two"})
+            + transcript.format_user({"content": "four"})
+        )
+        spoken = transcript.user_lines(turn)
+        self.assertEqual(spoken.splitlines(), ["one", "two", "three", "four"])
+        self.assertNotIn("claude", spoken)
+
+    def test_a_tool_result_ends_a_user_block(self) -> None:
+        """Tool results are `type == user` entries, so they arrive inside the user's own
+        run of the transcript. A block that did not end at one would hand the extractor a
+        command's output as something the person typed."""
+        transcript = self._transcript()
+        turn = "\n".join([
+            "User: run the migration",
+            "Tool result (Bash, ok): ALTER TABLE",
+            "Claude: done",
+        ])
+        self.assertEqual(transcript.user_lines(turn), "run the migration")
 
 
 class Provenance(unittest.TestCase):
