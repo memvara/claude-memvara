@@ -73,6 +73,7 @@ class Note(NamedTuple):
     confidence: "float | None"
     recorded: str
     ident: str
+    subject: str = ""
 
 
 def _flatten(text: str) -> str:
@@ -92,6 +93,31 @@ def _flatten(text: str) -> str:
     flat = "".join(" " if ch in "\r\n\t" or ord(ch) < 32 else ch for ch in flat)
     flat = flat.replace("[", "（").replace("]", "）")
     return re.sub(r"\s+", " ", flat).strip()
+
+
+def _mine(subject: str, cwd: str) -> bool:
+    """Whether a standing note is addressed to this user, working here.
+
+    The block is headed "how this user wants work done", and a claim about a repository's
+    deploy traps is not that however operationally useful it is. Measured on a real store:
+    nine of thirty-two procedural claims had a container as their subject -- 3,606
+    characters, a quarter of what every session opened with, carried on every turn.
+
+    Filing them differently would be the tidier fix and the tool surface does not offer it.
+    `memory_remember` with the same triple and a new `memory_type` is recognised as the
+    same fact and reinforced, not reclassified -- the receipt says `already-known` and the
+    type never moves. The only route left is retire-then-recreate, which is irreversible
+    and inverts the safe order, so the selection is fixed here instead of the data.
+
+    `project:<cwd>` is kept because a preference scoped to the checkout you are standing in
+    is still a preference about how to work -- "use this skill only here, do not
+    auto-activate that one" is an instruction, and dropping it because its subject is not
+    the literal string `user` would lose a real one. A project note from a DIFFERENT
+    checkout is someone else's instruction today and is left out.
+    """
+    if subject == "user":
+        return True
+    return bool(cwd) and subject == f"project:{cwd}"
 
 
 def _from_local(store: Any) -> "list[Note] | None":
@@ -123,6 +149,7 @@ def _from_local(store: Any) -> "list[Note] | None":
             confidence=float(getattr(claim, "confidence", 1.0)),
             recorded=recorded.isoformat() if hasattr(recorded, "isoformat") else "",
             ident=str(getattr(claim, "id", "")),
+            subject=str(getattr(claim, "subject", "")),
         ))
     return out
 
@@ -142,7 +169,13 @@ def _rows(text: str) -> "list[Note]":
             continue
         body = _flatten(body)
         if body:
-            out.append(Note(text=body, confidence=None, recorded="", ident=ident))
+            # Rendered rows read "<subject> <predicate in words> <object>", so the subject
+            # is the first token. Recovering the PREDICATE this way would not be safe --
+            # the store folds synonyms, and `depends_on` and `depends_on_a` both resolve to
+            # the same claim, so the boundary between predicate and object is not
+            # decidable from the rendering. The subject needs no boundary.
+            out.append(Note(text=body, confidence=None, recorded="", ident=ident,
+                            subject=body.split(" ", 1)[0]))
     return out
 
 
@@ -225,7 +258,7 @@ def render(notes: "list[Note]", header: str, budget: int) -> str:
 
 
 def standing_block(store: Any, *, hosted: bool, budget: int, header: str,
-                   fallback: "Callable[[], str]") -> str:
+                   fallback: "Callable[[], str]", cwd: str = "") -> str:
     """Every standing preference this store holds, as a block ready to inject.
 
     `fallback` is the caller's old query-shaped call, used only when every queryless route
@@ -239,7 +272,9 @@ def standing_block(store: Any, *, hosted: bool, budget: int, header: str,
         except Exception:
             continue
         if notes:
-            return render(_order(notes), header, budget)
+            mine = [n for n in notes if _mine(n.subject, cwd)]
+            if mine:
+                return render(_order(mine), header, budget)
     try:
         return str(fallback() or "")
     except Exception:
