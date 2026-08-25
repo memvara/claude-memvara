@@ -2133,6 +2133,85 @@ class ReadmeAndLicense(unittest.TestCase):
         self.assertIn("Version 2.0", text)
 
 
+#: What `app.memvara.dev/mcp` advertises, which is what the README's sentence is about.
+#: NOT the core's tool count, and the two are routinely different: the core is on thirteen
+#: since `memory_standing`, and the hosted endpoint served twelve on 2026-08-25 because
+#: production runs an older core. Stating the core's number here would be a true sentence
+#: about the wrong thing — a reader follows this line to a server, not to a repository.
+#:
+#: One place to change when a deploy moves it, and `memory_standing` is the name to add.
+HOSTED_TOOLS = (
+    "memory_recall", "memory_search", "memory_neighborhood", "memory_paths",
+    "memory_since", "memory_add", "memory_remember", "memory_forget", "memory_end",
+    "memory_history", "memory_why", "memory_stats",
+)
+
+#: Spelled out because that is how the sentence is written, and indexed by the count so
+#: the word cannot drift from the list. Two representations of one number disagreeing is
+#: the whole failure this guards.
+NUMBER_WORDS = (
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+)
+
+
+class ToolCount(unittest.TestCase):
+    """The README states the tool surface. Nothing checked either half of it.
+
+    It said "Ten tools" and then listed ten names — wrong before `memory_standing`
+    existed, because `memory_neighborhood` and `memory_paths` had never been counted. The
+    number and the list agreed with each other perfectly, which is exactly why neither
+    looked wrong.
+    """
+
+    def test_the_readme_states_the_hosted_count(self) -> None:
+        """Stated positively: the CORRECT phrase must be present.
+
+        "Does not say ten tools" would pass on a README that has stopped saying anything
+        at all — a rewritten sentence, a deleted paragraph, a digit instead of a word — and
+        a guard a deletion satisfies has quietly stopped guarding.
+        """
+        word = NUMBER_WORDS[len(HOSTED_TOOLS)].capitalize()
+        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"{word} tools", text,
+                      f"the README must state the hosted count as '{word} tools'")
+
+    def test_the_readme_names_every_hosted_tool_in_order(self) -> None:
+        """The count alone is not enough, and the reason is the original incident.
+
+        A list one short of its own stated count agrees with itself, so comparing numbers
+        would not have caught two missing names. Order is asserted too: the same names in a
+        different order are a second list a reader has to reconcile against the server's.
+        """
+        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        listed = re.findall(r"`(memory_[a-z_]+)`", text)
+        seen, ordered = set(), []
+        for name in listed:
+            if name not in seen:
+                seen.add(name)
+                ordered.append(name)
+        self.assertEqual(ordered, list(HOSTED_TOOLS),
+                         "the README must name every hosted tool, once, in order")
+
+    def test_no_other_count_is_stated_anywhere(self) -> None:
+        """One number, one place.
+
+        `plugin/skills/` is excluded because it is not ours: it is a byte copy of the
+        library's tree and `test_matches_library_at_lock_sha` requires it to stay one. The
+        skill states the LIBRARY's count, which is legitimately different from the hosted
+        one, and correcting it here is the edit the drift test forbids.
+        """
+        word = NUMBER_WORDS[len(HOSTED_TOOLS)]
+        pattern = re.compile(
+            r"\b(" + "|".join(w for w in NUMBER_WORDS if w != word) + r")\s+tools\b",
+            re.IGNORECASE)
+        for path in ROOT.rglob("*.md"):
+            if {"node_modules", "_library", "skills"} & set(path.parts):
+                continue
+            found = pattern.findall(path.read_text(encoding="utf-8"))
+            self.assertEqual(found, [], f"{path} states a different tool count: {found}")
+
+
 class Hygiene(unittest.TestCase):
     def test_the_suite_never_writes_to_the_real_hooks_directory(self) -> None:
         """The loggers must be pointed somewhere disposable while the tests run.
