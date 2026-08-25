@@ -34,7 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lib.ipc import emit_json, plural, status  # noqa: E402
+from lib.ipc import emit_json, payload, plural, status  # noqa: E402
 from lib.standing import standing_block  # noqa: E402
 from lib.write import open_writer  # noqa: E402
 
@@ -137,6 +137,11 @@ def _binding_line(scope: str, visible: str) -> str:
 
 
 def main() -> int:
+    # Read before opening the store: the standing block is filtered to this user and this
+    # checkout, and `cwd` is how the second half is known. An unreadable payload gives "",
+    # which `_mine` treats as "user notes only" -- the safe direction, since the failure it
+    # avoids is carrying another project's instructions into this one.
+    cwd = str(payload().get("cwd") or "")
     store, close = open_writer()
     if store is None:
         emit_json({"systemMessage": status("not configured")})
@@ -160,7 +165,8 @@ def main() -> int:
 
         try:
             standing = standing_block(store, hosted=hosted, budget=STANDING_BUDGET,
-                                      header=STANDING_HEADER, fallback=_legacy_standing)
+                                      header=STANDING_HEADER, fallback=_legacy_standing,
+                                      cwd=cwd)
         except Exception:
             standing = ""
         if standing.strip():

@@ -2336,8 +2336,15 @@ class _Claim:
     """A local-library claim, with only what `lib.standing` reads off one."""
 
     def __init__(self, text, *, confidence=1.0, recorded="2026-01-01T00:00:00",
-                 ident="cl_0", kind="procedural", live=True):
-        self.text, self.confidence, self.id = text, confidence, ident
+                 ident="cl_0", kind="procedural", live=True, subject="user"):
+        # A real claim's `text` opens with its subject -- "user prefers ...",
+        # "memvara_cloud deploy_gotcha ..." -- and the hosted route recovers the subject by
+        # reading the first token of exactly that string. A fixture whose text does not
+        # carry one is not a claim this code will ever meet, so it is composed here rather
+        # than spelled at nineteen call sites.
+        self.subject = subject
+        self.text = text if text.startswith(f"{subject} ") else f"{subject} {text}"
+        self.confidence, self.id = confidence, ident
         self.memory_type, self._live = kind, live
         self.recorded_at = datetime.datetime.fromisoformat(recorded)
 
@@ -2459,6 +2466,85 @@ class StandingSelection(unittest.TestCase):
         block = s.standing_block(_Local(noise + [target]), hosted=False, budget=1_000_000,
                                  header=HEAD, fallback=lambda: "")
         self.assertIn("never add Claude attribution", block)
+
+
+class StandingSubject(unittest.TestCase):
+    """Group J — the block is for this user, working here.
+
+    It is headed "how this user wants work done", and a claim about a repository's deploy
+    traps is not that however operationally useful it is. Measured on a real store: nine of
+    thirty-two procedural claims had a container as their subject — 3,606 characters, a
+    quarter of what every session opened with, carried on every turn from then on.
+
+    Filing them differently would be the tidier fix and the tool surface does not offer it:
+    `memory_remember` with the same triple and a new `memory_type` is recognised as the
+    same fact and *reinforced*, not reclassified — the receipt reads `already-known` and the
+    type never moves. Verified against the real store, which also bumped that claim's
+    confidence from 0.95 to 1.00 as a side effect. The only route left is
+    retire-then-recreate, which is irreversible and inverts the safe order, so the selection
+    is fixed here and the data is left alone.
+    """
+
+    HERE = "/Applications/workstation/claude-memvara"
+
+    def test_a_project_fact_filed_as_procedural_is_not_a_standing_instruction(self) -> None:
+        s = _standing()
+        claims = [_Claim("never add AI attribution to a commit", subject="user"),
+                  _Claim("deploy_gotcha polar-drain and polar-send share a profile",
+                         subject="memvara_cloud")]
+        block = s.standing_block(_Local(claims), hosted=False, budget=4000, header=HEAD,
+                                 fallback=lambda: "", cwd=self.HERE)
+        self.assertIn("AI attribution", block)
+        self.assertNotIn("polar-drain", block,
+                         "a fact about a container is not an instruction from a person")
+
+    def test_a_preference_scoped_to_this_checkout_is_kept(self) -> None:
+        """Dropping it because its subject is not the literal string `user` would lose a
+        real instruction — "use this skill only here, do not auto-activate that one" is one.
+        """
+        s = _standing()
+        claim = _Claim("preferred skill sentinel-task only; do not auto-activate terminus",
+                       subject=f"project:{self.HERE}")
+        block = s.standing_block(_Local([claim]), hosted=False, budget=4000, header=HEAD,
+                                 fallback=lambda: "", cwd=self.HERE)
+        self.assertIn("sentinel-task", block)
+
+    def test_a_preference_scoped_to_a_different_checkout_is_not(self) -> None:
+        """Someone else's instruction today. It returns when you stand in that directory."""
+        s = _standing()
+        claim = _Claim("preferred skill sentinel-task only", subject="project:/elsewhere")
+        block = s.standing_block(_Local([claim]), hosted=False, budget=4000, header=HEAD,
+                                 fallback=lambda: "", cwd=self.HERE)
+        self.assertEqual(block, "")
+
+    def test_an_unknown_cwd_keeps_only_the_user_notes(self) -> None:
+        """The safe direction. An unreadable payload gives no cwd, and the failure worth
+        avoiding is carrying another project's instructions into this one — not missing one.
+        """
+        s = _standing()
+        claims = [_Claim("always work in a worktree", subject="user"),
+                  _Claim("preferred skill only here", subject="project:/somewhere")]
+        block = s.standing_block(_Local(claims), hosted=False, budget=4000, header=HEAD,
+                                 fallback=lambda: "", cwd="")
+        self.assertIn("worktree", block)
+        self.assertNotIn("only here", block)
+
+    def test_the_hosted_route_filters_on_the_same_subject(self) -> None:
+        """It recovers the subject from the first token of the rendered row, which is where
+        a real row carries it. Recovering the PREDICATE that way would not be safe — the
+        store folds synonyms, so `depends_on` and `depends_on_a` both resolve to one claim
+        and the predicate/object boundary is not decidable from the rendering. The subject
+        needs no boundary.
+        """
+        s = _standing()
+        claims = [_Claim("never add AI attribution", subject="user"),
+                  _Claim("deploy_gotcha a trap", subject="memvara_cloud")]
+        local = s.standing_block(_Local(claims), hosted=False, budget=4000, header=HEAD,
+                                 fallback=lambda: "", cwd=self.HERE)
+        hosted = s.standing_block(_Hosted(claims), hosted=True, budget=4000, header=HEAD,
+                                  fallback=lambda: "", cwd=self.HERE)
+        self.assertEqual(local, hosted, "both routes must select the same set")
+        self.assertNotIn("a trap", hosted)
 
 
 class StandingOrder(unittest.TestCase):
@@ -2605,7 +2691,7 @@ class StandingClipping(unittest.TestCase):
         block = s.standing_block(_Local([_Claim("the only rule", ident="cl_1")]),
                                  hosted=False, budget=4000, header=HEAD,
                                  fallback=lambda: "")
-        self.assertEqual(block, f"{HEAD}\n- the only rule")
+        self.assertEqual(block, f"{HEAD}\n- user the only rule")
 
     def test_an_ended_claim_is_never_injected(self) -> None:
         """`is_live()`, not `invalidated_at is None`.

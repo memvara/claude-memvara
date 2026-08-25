@@ -416,7 +416,7 @@ def _sample(prompt: str, memories: "list[str]", *, anaphoric: bool) -> None:
 STANDING_REFRESH_SECONDS = 30 * 60
 
 
-def _standing_refresh(session: str, now: float) -> "tuple[str, tuple[str, float] | None]":
+def _standing_refresh(session: str, now: float, cwd: str = "") -> "tuple[str, tuple[str, float] | None]":
     """`(block to inject, state to persist)` -- both empty when there is nothing to say.
 
     Three ways to say nothing, and they are deliberately not the same code path:
@@ -447,7 +447,7 @@ def _standing_refresh(session: str, now: float) -> "tuple[str, tuple[str, float]
         try:
             block = standing_block(store, hosted=close is not None,
                                    budget=STANDING_BUDGET, header=STANDING_HEADER,
-                                   fallback=lambda: "")
+                                   fallback=lambda: "", cwd=cwd)
         finally:
             if close is not None:
                 close()
@@ -471,7 +471,8 @@ def main() -> int:
         return 0
 
     seen, carried = _read_state(session)
-    standing, standing_state = _standing_refresh(session, time.time())
+    standing, standing_state = _standing_refresh(
+        session, time.time(), str(data.get("cwd") or ""))
     anaphoric = _anaphoric(prompt)
 
     # An anaphoric prompt is searched together with the last substantive one, not instead
