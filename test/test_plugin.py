@@ -2028,6 +2028,151 @@ class RecallSampling(unittest.TestCase):
         self.assertNotIn("\n", written[0][1])
 
 
+class TurnCitation(unittest.TestCase):
+    """A hosted fact can name the turn it came from — once the server renders the id.
+
+    `memory_why` answered "No source turns are retained" for every claim any hosted client
+    had ever written, and two missing halves each made the other useless: the tool did not
+    declare `sources`, and `WriteReceipt.episode_ids` existed but the receipt never
+    rendered it, so a caller could not learn the id it needed to cite. memvara/memvara#76
+    closed both. This is the client half.
+    """
+
+    def _write(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import write
+        finally:
+            sys.path.pop(0)
+        return write
+
+    REAL = ("added 1, ended 0, retired 0, already-known 0, no-fact 0\n"
+            "turn id(s): ep_a1b2c3d4e5f6, ep_ff00aa11bb22 — pass these to "
+            "memory_remember.sources to make a fact you write from this turn explainable.")
+
+    def test_the_ids_are_read_out_of_the_receipt(self) -> None:
+        self.assertEqual(self._write().turn_ids(self.REAL),
+                         ["ep_a1b2c3d4e5f6", "ep_ff00aa11bb22"])
+
+    def test_a_receipt_without_the_line_yields_nothing(self) -> None:
+        """Today's ordinary answer: #76 is what renders the line, and it is unreleased.
+
+        Nothing may break on its absence — a fact written without sources is a fact
+        written, just not explainable, which is exactly the behaviour before this change.
+        """
+        self.assertEqual(
+            self._write().turn_ids("added 0, ended 0, retired 0, already-known 0"), [])
+
+    def test_a_receipt_that_is_not_text_yields_nothing(self) -> None:
+        """The local route returns a `WriteReceipt`, not a string, and passes a real
+        `Episode` instead. Parsing must not be attempted on it.
+        """
+        self.assertEqual(self._write().turn_ids(object()), [])
+
+    def test_the_shape_is_matched_rather_than_the_sentence(self) -> None:
+        """The ids are pulled out by their `ep_` prefix, not by the English around them.
+
+        A reworded receipt is a receipt this still reads. Anchoring on "turn id(s):" would
+        turn a harmless upstream edit into silent provenance loss — and silent is the
+        failure mode this whole change exists to end.
+        """
+        self.assertEqual(
+            self._write().turn_ids("the turn we kept is ep_deadbeef00 (cite it)"),
+            ["ep_deadbeef00"])
+        self.assertEqual(self._write().turn_ids("claim cl_a1b2c3d4e5 was added"), [],
+                         "a claim id is not a turn id")
+
+    def test_the_client_sends_sources_only_when_the_schema_has_it(self) -> None:
+        """Drives the real `HostedRecall.remember`, not a stub of it.
+
+        The first version of these tests stubbed `remember` and so proved nothing about the
+        client: deleting the probe entirely left them all green. Argument validation on the
+        server is closed, so sending `sources` to a server without memvara/memvara#76 loses
+        the whole fact rather than one field — trading a recorded fact for a provenance
+        line, which is the wrong way round.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import hosted
+        finally:
+            sys.path.pop(0)
+        sent: dict = {}
+
+        def client(schema):
+            c = hosted.HostedRecall.__new__(hosted.HostedRecall)
+            c._schemas = {"memory_remember": schema}
+            c._call = lambda tool, args: sent.update(args) or "ok"
+            return c
+
+        base = {"subject", "predicate", "object", "confidence"}
+        client(base | {"sources"}).remember(
+            "user", "prefers", "worktrees", sources=["ep_a1b2c3d4e5f6"])
+        self.assertEqual(sent.get("sources"), ["ep_a1b2c3d4e5f6"])
+
+        sent.clear()
+        client(base).remember(
+            "user", "prefers", "worktrees", sources=["ep_a1b2c3d4e5f6"])
+        self.assertNotIn("sources", sent,
+                         "a server without #76 must still get the fact, without sources")
+        self.assertEqual(sent.get("object"), "worktrees", "and the fact must still go")
+
+    def test_the_hosted_write_carries_the_ids_when_the_server_takes_them(self) -> None:
+        seen = {}
+
+        class Server:
+            def accepts(self, tool, argument):
+                return argument in ("extractor", "sources")
+
+            def remember(self, subject, predicate, obj, **kw):
+                seen.update(kw)
+                return "ok"
+
+        self._write().store_facts(
+            Server(), [("user", "prefers", "worktrees", "procedural")], "the turn",
+            hosted=True, sources=["ep_a1b2c3d4e5f6"])
+        self.assertEqual(seen.get("sources"), ["ep_a1b2c3d4e5f6"])
+
+    def test_no_ids_means_the_write_still_happens(self) -> None:
+        """On today's endpoint there are no ids, and a fact must still be stored."""
+        seen = {}
+
+        class Server:
+            def accepts(self, tool, argument):
+                return False
+
+            def remember(self, subject, predicate, obj, **kw):
+                seen.update(kw); seen["called"] = True
+                return "ok"
+
+        stored, failed = self._write().store_facts(
+            Server(), [("user", "prefers", "worktrees", "procedural")], "the turn",
+            hosted=True, sources=[])
+        self.assertEqual((stored, failed), (1, []))
+        self.assertNotIn("sources", seen)
+
+    def test_the_local_route_still_passes_an_episode_not_an_id(self) -> None:
+        """Two routes, two shapes, and the local one was never broken.
+
+        `_cite` STORES what it is handed and only LINKS a string, so the hosted side must
+        send ids or it stores a second copy of the turn the hook just wrote. The local side
+        hands over the `Episode` object itself.
+        """
+        seen = {}
+
+        class Local:
+            def remember(self, subject, predicate, obj, **kw):
+                seen.update(kw)
+                return "ok"
+
+        self._write().store_facts(
+            Local(), [("user", "prefers", "worktrees", "procedural")], "the turn",
+            hosted=False, sources=["ep_should_be_ignored"])
+        got = seen.get("sources")
+        if got:  # only when the library is importable in this environment
+            self.assertNotIsInstance(got[0], str,
+                                     "the local route hands over an Episode, not an id")
+
+
 class Provenance(unittest.TestCase):
     """Who derived a fact, and whether a reader can tell.
 

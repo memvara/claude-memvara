@@ -13,9 +13,10 @@ than returning nothing, which is what lets `store_facts` tell a refusal from a q
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from .open import open_store
 
@@ -59,8 +60,31 @@ def open_writer() -> "tuple[Any, Any] | tuple[None, None]":
     return hosted, hosted.close
 
 
+#: An episode id as the server renders it. `_new_id("ep")` on the other side, and the
+#: prefix is what makes this safe to pull out of prose: the receipt line is English around
+#: the ids ("turn id(s): ep_… — pass these to memory_remember.sources …"), and matching the
+#: shape rather than the sentence means a reworded receipt does not silently yield nothing.
+_TURN_ID = re.compile(r"\bep_[0-9a-f]{6,}\b")
+
+
+def turn_ids(receipt: object) -> "list[str]":
+    """The episode ids in a `memory_add` receipt, or `[]`.
+
+    Only the hosted route needs this. `Memvara.add` returns a `WriteReceipt` and the local
+    branch below already passes an `Episode` object, so there is nothing to parse there;
+    the hosted client returns the server's rendered text and the ids are the only route
+    from a stored turn back to a claim that came out of it.
+
+    Empty is the ordinary answer on today's endpoint. memvara/memvara#76 is what renders
+    the line at all and is unreleased, so until it ships this finds nothing and every
+    caller carries on writing facts without sources -- which is exactly what happens now.
+    """
+    return _TURN_ID.findall(receipt) if isinstance(receipt, str) else []
+
+
 def store_facts(store: Any, facts: Iterable[Any], turn: str = "",
-                hosted: bool = False) -> "tuple[int, list[str]]":
+                hosted: bool = False,
+                sources: "Sequence[str]" = ()) -> "tuple[int, list[str]]":
     """Write each fact. Returns how many landed and why the rest did not.
 
     Three arguments here were being left at their defaults, and each omission is silent.
@@ -117,6 +141,17 @@ def store_facts(store: Any, facts: Iterable[Any], turn: str = "",
             episode = _episode(turn)
             if episode is not None:
                 kwargs["sources"] = [episode]
+        elif sources:
+            # The hosted half of the same thing, and it took two changes on the other side
+            # to become possible: the tool had to declare `sources`, and the receipt had to
+            # render the episode ids, or a caller could not learn the id it needed to cite.
+            # Each made the other useless, which is why `memory_why` answered "No source
+            # turns are retained" for every fact any hosted client had ever written.
+            #
+            # IDs, not the turn. `_cite` stores what it is handed and links a string, so
+            # passing the text would store a second copy of the turn `_keep_turn` just
+            # wrote. The client drops this again if the server has not got #76.
+            kwargs["sources"] = list(sources)
         try:
             store.remember(subject, predicate, obj, **kwargs)
             stored += 1
