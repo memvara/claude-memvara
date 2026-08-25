@@ -2652,6 +2652,270 @@ class Version(unittest.TestCase):
             "the single place the suite states the release")
 
 
+class ParaphraseRepair(unittest.TestCase):
+    """Group F2 — a paraphrase that lost a name is repaired, never discarded.
+
+    Measured, not imagined. On 2026-08-25 the user said to code-review every PR with
+    `/code-review` on the latest Sonnet before merging it on GitHub. The model's summary
+    kept neither name, `_dropped_entities` correctly caught that, and the whole preference
+    was thrown away: stated once, dropped once, never seen by any session. `capture.log`
+    recorded it honestly, in a file nobody reads, which is this repository's signature
+    failure rather than a new one.
+
+    The detection was right. The remedy was the defect. A caught paraphrase is evidence a
+    standing instruction EXISTS -- a reason to go and get the user's own wording, not a
+    reason to discard the fact. `docs/INTERNALS.md` already makes this exact trade for
+    cardinality: "wrongly retiring a true fact is worse than keeping two competing ones".
+    """
+
+    SPOKEN = (
+        "Create a rule in for all three repos (save it in Claude.md or any other file "
+        "that you use) that whenever a PR is created by Claude, always do the code review "
+        "using /code-review using latest Sonnet model and fix all issues that it has "
+        "find. This has to done before merge of that PR in Github and not before.")
+    PARAPHRASE = (
+        "Code review all pull requests created by Claude before merging them. After "
+        "opening a PR, run `/code-review` against it, fix all findings, commit those "
+        "fixes, and then merge. This ensures an automated quality gate is in place "
+        "before code lands.")
+
+    def _extract(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            from lib import extract
+
+            return importlib.reload(extract)
+        finally:
+            sys.path.pop(0)
+
+    def test_the_instruction_that_was_lost_is_now_kept(self) -> None:
+        """The exact pair, from `capture.log` and the fork session's transcript."""
+        e = self._extract()
+        lost = e._dropped_entities(self.PARAPHRASE, self.SPOKEN)
+        self.assertEqual(lost, ["github", "sonnet"], "the historical drop reason")
+        repaired = e._repaired(self.PARAPHRASE, self.SPOKEN, lost)
+        self.assertIsNotNone(repaired, "this is the fact that must stop being discarded")
+
+    def test_the_repair_carries_every_name_the_paraphrase_lost(self) -> None:
+        """Otherwise the repair is a gesture: still lossy, but now stored.
+
+        Checked by re-running the guard on the result rather than by eyeballing the text,
+        so the assertion cannot pass on a repair that merely looks longer.
+        """
+        e = self._extract()
+        lost = e._dropped_entities(self.PARAPHRASE, self.SPOKEN)
+        repaired = e._repaired(self.PARAPHRASE, self.SPOKEN, lost)
+        self.assertEqual(e._dropped_entities(repaired, self.SPOKEN), [])
+
+    def test_the_users_own_wording_survives_verbatim(self) -> None:
+        """Which model reviews is half the instruction, and a summary keeps dropping it.
+
+        The quoted half is the authoritative one when the two disagree, so it has to be
+        the user's sentence rather than a second paraphrase of it.
+        """
+        e = self._extract()
+        lost = e._dropped_entities(self.PARAPHRASE, self.SPOKEN)
+        repaired = e._repaired(self.PARAPHRASE, self.SPOKEN, lost)
+        self.assertIn("latest Sonnet model", repaired)
+        self.assertIn("before merge of that PR in Github", repaired)
+
+    def test_the_paraphrase_is_kept_too(self) -> None:
+        """Replacing it outright was considered and is worse.
+
+        A sentence can carry the lost name while being nothing to do with the preference
+        -- "GitHub is down. Also always use pytest." -- and replacing would then store the
+        wrong half. Appending cannot lose either one.
+        """
+        e = self._extract()
+        lost = e._dropped_entities(self.PARAPHRASE, self.SPOKEN)
+        repaired = e._repaired(self.PARAPHRASE, self.SPOKEN, lost)
+        self.assertTrue(repaired.startswith(self.PARAPHRASE))
+
+    def test_a_faithful_paraphrase_is_left_exactly_alone(self) -> None:
+        """The repair must be invisible when nothing was lost.
+
+        The load-bearing half again: a change that improves the bad case by touching the
+        good one has not improved anything.
+        """
+        e = self._extract()
+        good = ("never add Claude's name or any reference to Claude in GitHub commits "
+                "(including Co-Authored-By trailers), issues, or pull requests.")
+        spoken = ("remember this always do not add Claude name in any of the commits, "
+                  "issues and PR in Github ever. No matter whatsoever.")
+        self.assertEqual(e._dropped_entities(good, spoken), [],
+                         "nothing lost, so the repair path is never entered")
+
+    def test_a_name_no_sentence_carries_is_still_a_drop(self) -> None:
+        """There has to be something to quote.
+
+        This branch is defensive, and saying so is the point of the test. `lost` is drawn
+        from `_proper_nouns(spoken)`, so in the pipeline every lost name is by
+        construction somewhere in the user's own text and some sentence carries it. What
+        this covers is the two functions splitting sentences differently and disagreeing
+        -- `_proper_nouns` splits on `[.!?\n]+`, this splits on punctuation followed by
+        space -- which is a silent wrong answer rather than a crash if it ever happens.
+        """
+        e = self._extract()
+        self.assertIsNone(e._repaired("always use pytest", "Always use pytest.", ["kafka"]))
+
+    def test_a_quote_with_no_room_left_is_a_drop_rather_than_a_stub(self) -> None:
+        """`MAX_OBJECT_CHARS` is a real ceiling and the quote is what would be cut."""
+        e = self._extract()
+        brimming = "x" * (e.MAX_OBJECT_CHARS - 10)
+        self.assertIsNone(
+            e._repaired(brimming, "Deploy to Fastly on Tuesday.", ["fastly"]))
+
+    def test_a_long_quote_is_clipped_rather_than_dropped(self) -> None:
+        """Between "fits" and "no room at all" the fact is still worth keeping."""
+        e = self._extract()
+        spoken = "Always deploy through Fastly. " + ("detail " * 400)
+        repaired = e._repaired("always deploy carefully", spoken, ["fastly"])
+        self.assertIsNotNone(repaired)
+        self.assertLessEqual(len(repaired), e.MAX_OBJECT_CHARS)
+        self.assertIn("Fastly", repaired)
+
+    def test_the_historical_reversal_keeps_the_users_words_beside_it(self) -> None:
+        """The claim that started all of this now arrives with its own correction.
+
+        "no attribution of user name" reversed the meaning of "do not add Claude name".
+        Storing it alone was the original defect; dropping it was the over-correction.
+        Stored with the user's sentence attached, a session reading it sees the real
+        instruction in the user's words, which is the only version that was ever right.
+        """
+        e = self._extract()
+        spoken = ("remember this always do not add Claude name in any of the commits, "
+                  "issues and PR in Github ever. No matter whatsoever.")
+        garbled = "no attribution of user name on any GitHub work in memvara repositories"
+        lost = e._dropped_entities(garbled, spoken)
+        self.assertEqual(lost, ["claude"])
+        repaired = e._repaired(garbled, spoken, lost)
+        self.assertIn("do not add Claude name", repaired)
+
+    def test_a_repair_and_a_drop_do_not_look_alike_in_the_log(self) -> None:
+        """A drop loses a standing instruction and is the thing to go and read. A repair
+        kept one. Reading `capture.log` and seeing "dropped" is how today's defect was
+        found, so the two must stay tellable apart at a glance.
+        """
+        source = (HOOKS / "lib" / "extract.py").read_text(encoding="utf-8")
+        self.assertIn('log("repaired " + "; ".join(repairs))', source)
+        self.assertIn('log("dropped " + "; ".join(dropped))', source)
+
+
+    # ---- through the real decision, not around it -------------------------------------
+    #
+    # Everything above calls `_repaired` directly, and that is not enough: reverting the
+    # remedy at the CALL SITE -- `repaired = None`, restoring the old drop exactly -- left
+    # all eleven of them green. A test that exercises the helper proves the helper works
+    # and says nothing about whether anything calls it. This repository has been caught by
+    # that shape before, when a suite for the `sources` probe stubbed the method under
+    # test and deleting the probe entirely kept every test passing.
+    #
+    # So these stub `_payload`, the model call, and let `triples()` run whole.
+
+    def _through_triples(self, extract, obj, spoken=None):
+        turn = f"User: {spoken or self.SPOKEN}\nClaude: understood."
+        reply = json.dumps({"facts": [
+            {"subject": "user", "predicate": "prefers", "object": obj}]})
+        original = extract._payload
+        extract._payload = lambda text, prompt: (reply, {})
+        try:
+            return extract.triples(turn)
+        finally:
+            extract._payload = original
+
+    def test_the_instruction_survives_the_whole_pipeline(self) -> None:
+        """The regression test proper: revert the remedy and this goes red.
+
+        `triples()` is what `capture.py` calls, so this is the path that lost the
+        code-review rule. Nothing here reaches into the guard.
+        """
+        e = self._extract()
+        facts = self._through_triples(e, self.PARAPHRASE)
+        self.assertEqual(len(facts), 1, "the instruction must reach the store at all")
+        self.assertIn("Sonnet", facts[0].object)
+        self.assertIn("Github", facts[0].object)
+
+    def test_a_faithful_paraphrase_passes_through_untouched(self) -> None:
+        """No marker, no quote, byte-identical to what the model returned."""
+        e = self._extract()
+        spoken = ("remember this always do not add Claude name in any of the commits, "
+                  "issues and PR in Github ever. No matter whatsoever.")
+        good = ("never add Claude's name or any reference to Claude in GitHub commits, "
+                "issues, or pull requests, no matter the context.")
+        facts = self._through_triples(e, good, spoken=spoken)
+        self.assertEqual(len(facts), 1)
+        self.assertEqual(facts[0].object, good)
+        self.assertNotIn(e.VERBATIM_JOIN, facts[0].object)
+
+    def test_a_semantic_fact_never_enters_the_repair_path(self) -> None:
+        """The guard is procedural-only and the repair inherits that scope.
+
+        A `working_on` value is not a standing instruction, so a name the summary left out
+        is ordinary summarising rather than a fidelity failure.
+        """
+        e = self._extract()
+        turn = "User: I am working on the Fastly migration this week.\nClaude: ok."
+        reply = json.dumps({"facts": [
+            {"subject": "user", "predicate": "working_on", "object": "the migration"}]})
+        original = e._payload
+        e._payload = lambda text, prompt: (reply, {})
+        try:
+            facts = e.triples(turn)
+        finally:
+            e._payload = original
+        self.assertEqual([f.object for f in facts], ["the migration"])
+
+    def test_the_other_drops_still_drop(self) -> None:
+        """The fix must not degrade into "store everything".
+
+        Written after the first version of this test passed for the wrong reason: its
+        object was 59 characters against a 60-character floor, so it was dropped for
+        thinness and never reached the name check at all. It would have gone on passing
+        with the repair deleted. The length is now stated outright rather than being an
+        accident of the sentence someone typed.
+        """
+        e = self._extract()
+        self.assertLess(len("too thin to be a preference"), e.MIN_RICH_OBJECT_CHARS)
+        self.assertEqual(self._through_triples(e, "too thin to be a preference"), [],
+                         "the thinness drop is a separate reason and still applies")
+
+    def test_an_unrelated_sentence_carrying_the_name_is_appended_anyway(self) -> None:
+        """A known trade, asserted so it stays known.
+
+        `lost` is drawn from the whole of what the user typed, so a turn that mentions
+        Fastly in passing and states a preference about linting will quote the Fastly
+        sentence beside the linting one. That is noise.
+
+        It is accepted rather than fixed because the alternatives are worse: replacing the
+        paraphrase would store ONLY the irrelevant sentence, and narrowing the guard to
+        "names in the sentence the paraphrase came from" needs an alignment this has no
+        way to compute. Appending keeps the true preference whole and adds a sentence the
+        user really did type in the same breath. The failure mode is a longer memory, not
+        a wrong one.
+        """
+        e = self._extract()
+        facts = self._through_triples(
+            e, "always run the project linter before pushing anything to a branch",
+            spoken="Always run the linter first. I use Fastly for the CDN.")
+        self.assertEqual(len(facts), 1, "the real preference survives, which is the point")
+        self.assertIn("always run the project linter", facts[0].object)
+        self.assertIn("Fastly", facts[0].object, "and the unrelated sentence rides along")
+
+    def test_the_disproven_reasoning_is_not_still_written_down(self) -> None:
+        """It said the preference would simply be stated again. It was not.
+
+        Left in place it reads as a live justification for the behaviour it argued for,
+        and the next person to touch this weighs a claim the evidence already killed.
+        """
+        source = (HOOKS / "lib" / "extract.py").read_text(encoding="utf-8")
+        self.assertIn("It used to `continue` here", source,
+                      "the old behaviour must read as former, not as current")
+        self.assertIn("A lossy paraphrase is evidence a standing instruction EXISTS",
+                      source)
+
+
 if __name__ == "__main__":
     unittest.main()
 
