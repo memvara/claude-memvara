@@ -76,10 +76,20 @@ Each of these was measured, not reasoned about, and each fails silently.
 - **python.org's macOS build ignores the system trust store.** `CERTIFICATE_VERIFY_FAILED`
   on a certificate `curl` accepts. Use `certifi` when present, `ssl.create_default_context()`
   otherwise. "Standard library only" is not the same as "no dependencies" on macOS.
-- **`claude -p` costs ~21k tokens of Claude Code's own preamble per run**, regardless of
-  input size — measured at 16.3k cache-read plus 4.9k cache-creation on a two-sentence
-  input. Batch the work; the overhead is per-run, not per-token. `--bare` is not a cost
-  lever: it skips auth loading and returns "Not logged in".
+- **`claude -p` costs 30–34k tokens of Claude Code's own preamble per run**, regardless of
+  input size — a two-word prompt bills 30,381 in from `/tmp` and 33,928 from a repo
+  worktree, against 17 tokens of actual content. The split is stable and the two halves
+  behave differently: cache-read sits at exactly 18,946 every run and is the preamble
+  proper, while cache-creation moves with the `CLAUDE.md` stack at the cwd — 11.4k from a
+  bare directory, 15.0k from inside this repo. So a hook that shells out costs more in a
+  project with a long `CLAUDE.md` than the same hook in `/tmp`, which is not obvious and is
+  the repo's own file doing it.
+  Batch the work; the overhead is per-run, not per-token. `--bare` is not a cost lever: it
+  skips auth loading and returns "Not logged in".
+  The earlier figure here was ~21k (16.3k cache-read, 4.9k cache-creation). It was measured
+  the same way and was right when written; the preamble grew. Re-measure before reasoning
+  about cost from it, and take more than one sample — one stray reading of 67k did not
+  reproduce across four later runs and would have been written down as fact.
 - **Use `http.client`, not `urllib`, for anything repeated.** `urlopen` cannot reuse a
   connection. On the hosted endpoint the same call is 609ms cold and 177ms warm.
 
