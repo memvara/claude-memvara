@@ -72,10 +72,42 @@ BUDGET = 300
 #: 222-claim store: median injected memory 48 tokens, p90 237, max 503, and **four lines
 #: over 150 tokens accounted for 39% of every token injected**. Clipping alone, changing
 #: nothing else, removes 51% of the block.
-MAX_INJECTED_CHARS = 160
+#:
+#: It was 160, and 160 was cutting the half that carries the meaning. Two measurements
+#: moved it, and the second is the one that decides.
+#:
+#: **The clip is not what bounds the block.** `budget` is, and it does it by dropping whole
+#: notes -- "the largest prefix that fits" -- before this ever runs. So a block is already
+#: under 300 tokens when it arrives here, and clipping does not lower a ceiling, it deletes
+#: text from inside one. Cost belongs in the parameter that drops notes; this one only
+#: decides whether the notes that survive are still readable.
+#:
+#: **And nothing goes and reads the rest.** Across 434 clipped injections in this machine's
+#: transcripts, 4 were followed by a `memory_search` -- 0.9%, against 0.2% after an
+#: unclipped one. Of 122 searches in the corpus, 118 had nothing to do with a clipped
+#: recall. `MORE` is read as a disclosure, not acted on as a pointer, so a clipped tail is
+#: not deferred: it is discarded.
+#:
+#: What that tail holds is not filler. The extraction rules ask an object to state the
+#: instruction, then why it matters, then the detail that makes it applicable -- so the
+#: operative clause is *by construction* last, and a head truncation takes exactly it.
+#: Measured on the real store: "serves 12 tools while main documents 13 -- memory_standing
+#: is not de|ployed", losing the half that says what to do about it.
+#:
+#: 320 is where the two bounds meet. At `K = 4` it puts the clip's own ceiling (~1,280c)
+#: past `BUDGET`'s (~1,200c), so the budget becomes the binding constraint again, which is
+#: the one designed to bind. Against a 376-claim store it takes whole delivery from 36% to
+#: 57%, and a third of everything currently truncated arrives intact. Episodes stay
+#: pointers -- a 1,853-character median episode is still cut to a fraction of itself.
+MAX_INJECTED_CHARS = 320
 
-#: Said once, when anything was actually shortened. Roughly twelve tokens, and it is what
-#: turns a truncated push into a pointer: the model can go and read the rest.
+#: Said once, when anything was actually shortened. Roughly twelve tokens.
+#:
+#: It was written as a pointer -- "the model can go and read the rest" -- and measurement
+#: does not support that reading. Across 434 clipped injections, 4 were followed by a
+#: `memory_search`. It is kept anyway, for the job it does do: telling a reader that text
+#: was elided, so a truncated claim is not mistaken for a complete one. That is worth
+#: twelve tokens; being a pointer is not something it has been observed to be.
 MORE = "(excerpts — memory_search returns any of these in full)"
 
 #: Below this many fresh memories, ask again for the raw turns as well. A prompt the

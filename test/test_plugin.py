@@ -506,6 +506,33 @@ class Hooks(unittest.TestCase):
         for fragment in ("no turn to mine", "skipped=", "no store or login", "facts=0"):
             self.assertIn(fragment, decisions, f"{fragment!r} must be logged")
 
+    def test_the_clip_is_not_what_bounds_the_block(self) -> None:
+        """`budget` bounds cost. The clip decides whether what survives is readable.
+
+        These are different jobs and the clip was doing both, badly. `Memvara.recall`
+        applies `budget` by dropping whole notes — "the largest prefix that fits" — and it
+        does so *before* anything here runs, so a block is already under `BUDGET` tokens
+        when `_clip` sees it. Clipping therefore lowers no ceiling; it deletes text from
+        inside one that already held.
+
+        What it deleted was the operative half. The extraction rules ask an object to state
+        the instruction, then why it matters, then the applicable detail, so the qualifying
+        clause is last by construction and a head truncation takes exactly it. And nothing
+        recovers it: across 434 clipped injections in real transcripts, 4 were followed by
+        a `memory_search`.
+
+        So the clip must sit *above* the budget's own ceiling, where the budget is what
+        binds. Drop it back below and the two swap roles silently — the block gets no
+        smaller, because `budget` was already holding it, and every note gets shorter.
+        """
+        recall = self._recall()
+        budget_chars = recall.BUDGET * 4  # `_approx_tokens` is a chars/4 heuristic
+        self.assertGreaterEqual(
+            recall.MAX_INJECTED_CHARS * recall.K, budget_chars,
+            "the clip must not be the binding constraint: at K notes it has to be able to "
+            "carry a full BUDGET-sized block, or it is silently doing the budget's job by "
+            "truncating meaning instead of dropping notes")
+
     def test_nothing_injected_exceeds_the_clip(self) -> None:
         """Storage stays rich; injection does not. They are different jobs.
 
@@ -561,8 +588,9 @@ class Hooks(unittest.TestCase):
 
         What bounds the cost is the clip, not the candidate cap. So the selection pass is
         allowed to be wider than the claims pass, and every line it returns still goes
-        through `_clip` — a 1,853-character median episode arrives as a 160-character
-        pointer.
+        through `_clip` — a 1,853-character median episode still arrives as a fraction of
+        itself, which is the property this relies on and the reason the clip could be
+        raised for claims without unbounding episodes.
         """
         recall = self._recall()
         self.assertGreaterEqual(recall.EPISODE_K, recall.K,
