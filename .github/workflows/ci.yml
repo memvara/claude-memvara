@@ -31,6 +31,18 @@ jobs:
           ref: ${{ steps.lock.outputs.sha }}
           path: _library
 
+      # `test_the_vendored_skill_is_not_behind_the_library` needs the library's CURRENT
+      # default branch, and the checkout above is pinned to skill.lock's sha -- so without
+      # this the test cannot resolve `origin/main` locally and falls through to the GitHub
+      # API. Unauthenticated calls are capped at 60/hour and Actions runners share IPs, so
+      # that call answers 403 and the test SKIPS. It said so in the log -- "drift NOT
+      # checked: HTTP Error 403: rate limit exceeded" -- and the job stayed green, so the
+      # one guard against a frozen vendored skill had never once run here.
+      #
+      # One shallow ref, no token, no API. `--depth 1` because only the tip's tree is read.
+      - name: Fetch the library's default branch, so the drift check can run
+        run: git -C _library fetch --depth 1 origin main:refs/remotes/origin/main
+
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
