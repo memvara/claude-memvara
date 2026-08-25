@@ -314,7 +314,8 @@ class HostedRecall:
                  confidence: float = 1.0,
                  memory_type: "str | None" = None,
                  true_since: "str | None" = None,
-                 extractor: "str | None" = None) -> str:
+                 extractor: "str | None" = None,
+                 sources: "list[str] | None" = None) -> str:
         """Write one triple, or raise. Returns the server's receipt line.
 
         Reads and writes both raise now, but for different reasons, and the write's is the
@@ -343,6 +344,17 @@ class HostedRecall:
             # itself as "Derived by user", which is what let a hook's own inference be
             # read back in a later session as something the user had stated.
             args["extractor"] = extractor
+        if sources and self.accepts("memory_remember", "sources"):
+            # Episode IDS, never the turn text. `_cite` on the other side STORES anything
+            # handed to it as an Episode and merely LINKS a string, so sending the turn
+            # would store a second copy of the one `_keep_turn` has just written.
+            #
+            # Probed rather than assumed, for the same reason as `extractor`: argument
+            # validation there is closed, so an argument an older server has not heard of
+            # loses the whole write rather than one field. memvara/memvara#76 added this
+            # and is unreleased as of 2026-08-25, so on today's endpoint the probe answers
+            # False and a fact is written exactly as before -- unexplainable, but written.
+            args["sources"] = list(sources)
         return self._call("memory_remember", args)
 
 

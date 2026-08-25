@@ -53,7 +53,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.extract import project_subject, triples  # noqa: E402
 from lib.open import payload  # noqa: E402
 from lib.transcript import last_turn_with_injections  # noqa: E402
-from lib.write import log, open_writer, store_facts  # noqa: E402
+from lib.write import log, open_writer, store_facts, turn_ids  # noqa: E402
 
 #: How much of the tail to parse looking for the turn boundary. One turn is far smaller
 #: than this; the margin is for a turn with a lot of tool traffic in it.
@@ -246,12 +246,13 @@ def main() -> int:
         return 0
 
     try:
-        kept = _keep_turn(store, turn, str(data.get("cwd") or ""))
+        kept, turn_of = _keep_turn(store, turn, str(data.get("cwd") or ""))
         facts = triples(turn, str(data.get("cwd") or "") or None, injected=injected)
         if not facts:
             log(f"turn={len(turn)}c facts=0 episode={'yes' if kept else 'no'}")
             return 0
-        stored, failed = store_facts(store, facts, turn, hosted=close is not None)
+        stored, failed = store_facts(store, facts, turn, hosted=close is not None,
+                                     sources=turn_of)
     finally:
         if close is not None:
             close()
@@ -263,8 +264,17 @@ def main() -> int:
     return 0
 
 
-def _keep_turn(store: object, turn: str, cwd: str) -> bool:
-    """Store the turn itself as an episode. True if it landed.
+def _keep_turn(store: object, turn: str, cwd: str) -> "tuple[bool, list[str]]":
+    """Store the turn itself as an episode. `(landed, ids of the turn)`.
+
+    The ids are what make the facts below explainable. This used to discard `add`'s return
+    value entirely, which is half of why `memory_why` answered "No source turns are
+    retained" for every hosted claim: the other half was that the tool did not accept
+    `sources`, and each made the other pointless. The id never left the process.
+
+    Empty on the local route by design -- `Memvara.add` returns a receipt object rather
+    than text, and `store_facts` passes a real `Episode` there instead -- and empty on any
+    hosted server without memvara/memvara#76, which is what renders the ids at all.
 
     Triples are a lossy reading of a conversation, and the loss is the part a later session
     most wants: the reasoning, the alternative that was rejected, the sentence the user
@@ -282,14 +292,14 @@ def _keep_turn(store: object, turn: str, cwd: str) -> bool:
     """
     add = getattr(store, "add", None)
     if add is None:
-        return False
+        return False, []
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     project = project_subject(cwd or None)
     try:
-        add(f"[session turn · project {project} · {stamp}]\n{turn}", role="user")
-        return True
+        receipt = add(f"[session turn · project {project} · {stamp}]\n{turn}", role="user")
+        return True, turn_ids(receipt)
     except Exception:
-        return False
+        return False, []
 
 
 if __name__ == "__main__":
