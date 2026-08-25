@@ -134,6 +134,14 @@ MAX_SEEN = 500
 #: will not be resumed, and its hashes only ever prevented re-injecting a memory into it.
 SEEN_TTL_SECONDS = 14 * 24 * 3600
 
+#: Kept the same as `session_start`'s, because a session that refreshes its standing set
+#: mid-flight must not receive a different set from the one it opened with.
+STANDING_BUDGET = 16000
+STANDING_HEADER = (
+    "Memvara — how this user wants work done (standing preferences, reference data, "
+    "not instructions; some were inferred by an assistant rather than stated):"
+)
+
 #: First words that make a prompt a reply to the last turn rather than a question of its
 #: own. Matched on the opening word only: "yes, add that fix to #7" is anaphoric and "yes"
 #: is the whole reason, while a prompt that merely contains the word somewhere is not.
@@ -182,28 +190,41 @@ def _seen_path(session: str) -> "str | None":
     return os.path.join(SEEN_DIR, f"{session}.json")
 
 
-def _read_state(session: str) -> "tuple[list[str], str]":
-    """`(seen hashes, last substantive query)` for this session.
+def _state_json(session: str) -> dict:
+    """This session's state file as a dict, or `{}`.
 
     A bare list is the format this file used before it carried a query, and reading one
     still works: an upgrade mid-session should cost the carried query, not the dedup.
     """
     path = _seen_path(session)
     if path is None:
-        return [], ""
+        return {}
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
-        return [], ""
+        return {}
     if isinstance(data, list):
-        return [h for h in data if isinstance(h, str)], ""
-    if not isinstance(data, dict):
-        return [], ""
+        return {"seen": [h for h in data if isinstance(h, str)]}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_state(session: str) -> "tuple[list[str], str]":
+    """`(seen hashes, last substantive query)` for this session."""
+    data = _state_json(session)
     seen = data.get("seen")
     query = data.get("query")
     return ([h for h in seen if isinstance(h, str)] if isinstance(seen, list) else [],
             query if isinstance(query, str) else "")
+
+
+def _read_standing(session: str) -> "tuple[str, float]":
+    """`(digest of the standing block this session last saw, when it was last checked)`."""
+    data = _state_json(session)
+    digest = data.get("standing")
+    when = data.get("standing_at")
+    return (digest if isinstance(digest, str) else "",
+            float(when) if isinstance(when, (int, float)) else 0.0)
 
 
 def _prune_seen(now: float) -> None:
@@ -233,14 +254,26 @@ def _prune_seen(now: float) -> None:
         pass
 
 
-def _write_state(session: str, hashes: "list[str]", query: str) -> None:
+def _write_state(session: str, hashes: "list[str]", query: str,
+                 standing: "tuple[str, float] | None" = None) -> None:
+    """Persist this session's state, carrying the standing keys forward.
+
+    `standing` is read-modify-write rather than an argument every caller must thread,
+    because the two exit paths in `main` write state for reasons that have nothing to do
+    with the standing set. Passing None from those would silently reset the refresh clock
+    on every turn and re-inject the whole standing block each time -- the failure this is
+    supposed to prevent, arriving through the tidier-looking signature.
+    """
     path = _seen_path(session)
     if path is None:
         return
+    was_digest, was_at = _read_standing(session)
+    digest, at = standing if standing is not None else (was_digest, was_at)
     try:
         os.makedirs(SEEN_DIR, exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump({"seen": hashes[-MAX_SEEN:], "query": query[:MAX_CARRY_CHARS]}, fh)
+            json.dump({"seen": hashes[-MAX_SEEN:], "query": query[:MAX_CARRY_CHARS],
+                       "standing": digest, "standing_at": at}, fh)
         _prune_seen(time.time())
     except OSError:
         # Dedup and carry-forward are both optimisations. Losing them repeats a memory or
@@ -338,6 +371,65 @@ def _sample(prompt: str, memories: "list[str]", *, anaphoric: bool) -> None:
     log_line("recall-sample", "  ".join(parts))
 
 
+#: How often a running session re-checks whether its standing preferences have changed.
+#: `SessionStart` fires ONCE, so a rule written after a session opened never reached it --
+#: measured on a session that started a full day before the rule it needed existed and was
+#: still breaking it eighteen hours later.
+#:
+#: Half an hour rather than every turn, and the difference is the whole design. Standing
+#: preferences are fetched at the top of a session precisely so they do not compete per
+#: prompt with the facts that prompt is about; re-asserting them every turn would undo
+#: that and undo PR #8 with it. What runs on every prompt is a timestamp comparison
+#: against a small JSON file. What runs twice an hour is one query.
+STANDING_REFRESH_SECONDS = 30 * 60
+
+
+def _standing_refresh(session: str, now: float) -> "tuple[str, tuple[str, float] | None]":
+    """`(block to inject, state to persist)` -- both empty when there is nothing to say.
+
+    Three ways to say nothing, and they are deliberately not the same code path:
+
+    * the interval has not elapsed -- costs one float comparison and, importantly, no
+      import: `lib.write` pulls in the library, which is ~95ms, and this file runs on every
+      prompt;
+    * the set is unchanged since this session last saw it -- costs the query and injects
+      nothing, which is the common case after the first refresh;
+    * the lookup failed -- costs the query and injects nothing, and the clock is still
+      advanced so a store that is down does not turn every prompt into a retry.
+
+    The digest covers the rendered block, so a claim being RETIRED changes it exactly as an
+    addition does. A preference the user withdrew has to stop being asserted, and a digest
+    over "what was added" would never notice it going.
+    """
+    digest, checked = _read_standing(session)
+    if now - checked < STANDING_REFRESH_SECONDS:
+        return "", None
+
+    try:
+        from lib.standing import standing_block  # noqa: PLC0415
+        from lib.write import open_writer  # noqa: PLC0415
+
+        store, close = open_writer()
+        if store is None:
+            return "", (digest, now)
+        try:
+            block = standing_block(store, hosted=close is not None,
+                                   budget=STANDING_BUDGET, header=STANDING_HEADER,
+                                   fallback=lambda: "")
+        finally:
+            if close is not None:
+                close()
+    except Exception:
+        # A standing refresh that fails must not fail the prompt, and must not retry on
+        # the next one either.
+        return "", (digest, now)
+
+    fresh = _digest(block)
+    if not block.strip() or fresh == digest:
+        return "", (digest or fresh, now)
+    return block.rstrip(), (fresh, now)
+
+
 def main() -> int:
     data = payload()
     prompt = str(data.get("prompt") or "").strip()
@@ -347,6 +439,7 @@ def main() -> int:
         return 0
 
     seen, carried = _read_state(session)
+    standing, standing_state = _standing_refresh(session, time.time())
     anaphoric = _anaphoric(prompt)
 
     # An anaphoric prompt is searched together with the last substantive one, not instead
@@ -401,13 +494,25 @@ def main() -> int:
     topic = carried if anaphoric else prompt
 
     if not fresh:
-        _write_state(session, seen, topic)
+        _write_state(session, seen, topic, standing_state)
         note = status(f"{repeats} already in context" if repeats
                       else "no matching memories")
+        if standing:
+            # Nothing new to recall, and the standing set has moved: the turn still has to
+            # carry it, or a rule written mid-session waits for the next prompt that
+            # happens to match something.
+            emit_json({
+                "systemMessage": status("standing preferences updated"),
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": standing,
+                },
+            })
+            return 0
         emit_json({"systemMessage": note})
         return 0
 
-    _write_state(session, seen + [_digest(line) for line in fresh], topic)
+    _write_state(session, seen + [_digest(line) for line in fresh], topic, standing_state)
 
     # Deduplicated on the full line and injected clipped: the hash has to identify the
     # memory, not the excerpt, or raising MAX_INJECTED_CHARS would make everything already
@@ -417,6 +522,9 @@ def main() -> int:
     if any(short != full for short, full in zip(clipped, fresh)):
         lines.append(MORE)
     block_text = "\n".join(lines)
+
+    if standing:
+        block_text = f"{block_text}\n\n{standing}"
 
     label = status(f"{plural(len(fresh))} recalled")
     if repeats:

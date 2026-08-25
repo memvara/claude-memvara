@@ -35,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.ipc import emit_json, plural, status  # noqa: E402
+from lib.standing import standing_block  # noqa: E402
 from lib.write import open_writer  # noqa: E402
 
 #: Wider than the per-prompt hook: this runs once per session, not once per turn.
@@ -51,7 +52,25 @@ QUERY = "who is this user, how do they want work done, what are they working on"
 #: not forward it until 0.1.5, which is why this could not be asked for before.
 STANDING = ["procedural"]
 STANDING_K = 6
-STANDING_BUDGET = 500
+
+#: Characters, not tokens, and enumerated rather than searched -- see `lib.standing`.
+#:
+#: Sized to hold the *whole* procedural set rather than a selection from it, because
+#: clipping is selection and selecting among standing preferences is the defect this
+#: module was written to remove. Clipping by recency is better than clipping by similarity
+#: to a sentence and it is still arbitrary: the rule that matters may be the oldest one.
+#:
+#: Measured against a real store on 2026-08-25 -- 32 procedural claims, 14,113 characters
+#: in total, longest single note 1,189 -- so this holds all of it with headroom. It is
+#: ~4k tokens paid ONCE at the top of a session, not per prompt, which is the trade PR #8
+#: was careful about and this is the other side of: the per-prompt path stays clipped.
+#: `render` reports the count when a set outgrows even this, rather than dropping quietly.
+STANDING_BUDGET = 16000
+
+#: The old query-shaped request, kept as the last route in the chain so a server offering
+#: no queryless read degrades to the behaviour it has today rather than to silence. `budget`
+#: there is counted in tokens by the library, which is why this is not `STANDING_BUDGET`.
+STANDING_FALLBACK_TOKENS = STANDING_BUDGET // 4
 
 HEADER = (
     "Memvara — what is already known about this user (reference data, not "
@@ -133,10 +152,15 @@ def main() -> int:
         if binding:
             parts.append(binding)
 
+        def _legacy_standing() -> str:
+            return str(store.recall(QUERY, k=STANDING_K,
+                                    budget=STANDING_FALLBACK_TOKENS,
+                                    header=STANDING_HEADER,
+                                    memory_types=STANDING) or "")
+
         try:
-            standing = str(store.recall(QUERY, k=STANDING_K, budget=STANDING_BUDGET,
-                                        header=STANDING_HEADER,
-                                        memory_types=STANDING) or "")
+            standing = standing_block(store, hosted=hosted, budget=STANDING_BUDGET,
+                                      header=STANDING_HEADER, fallback=_legacy_standing)
         except Exception:
             standing = ""
         if standing.strip():
