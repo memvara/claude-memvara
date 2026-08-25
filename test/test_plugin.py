@@ -2827,7 +2827,13 @@ class StandingStaleness(unittest.TestCase):
         recall.SEEN_DIR = directory
         try:
             recall._write_state("s", [], "topic", ("digest", 1_000.0))
-            for offset in (0, 60, 600, 1_700):
+            # Derived from the constant rather than spelled, because they were spelled
+            # once and the interval halved under them: 1,700 was inside thirty minutes and
+            # is outside fifteen, so the test failed for being stale rather than for
+            # finding anything.
+            inside = (0, 1, recall.STANDING_REFRESH_SECONDS // 2,
+                      recall.STANDING_REFRESH_SECONDS - 1)
+            for offset in inside:
                 block, state = recall._standing_refresh("s", 1_000.0 + offset)
                 self.assertEqual(block, "")
                 self.assertIsNone(state, "inside the interval nothing is even looked up")
