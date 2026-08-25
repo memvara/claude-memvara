@@ -1698,6 +1698,45 @@ class StateGrowth(unittest.TestCase):
                 server.close()
 
 
+class Mark(unittest.TestCase):
+    """The one glyph standing in for the brand mark, and the rule that keeps it one."""
+
+    def _ipc(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("lib.ipc")
+        finally:
+            sys.path.pop(0)
+
+    def test_the_mark_is_a_bmp_glyph_rather_than_an_emoji(self) -> None:
+        """A glyph the terminal's font lacks renders as a tofu box, which is worse than no
+        mark at all. BMP maths symbols travel almost everywhere a monospace font does;
+        astral-plane emoji do not, and this line is read over SSH and in minimal terminals
+        as often as in a rich one."""
+        ipc = self._ipc()
+        self.assertEqual(len(ipc.MARK), 1, "one character, so it cannot wrap or misalign")
+        self.assertLess(ord(ipc.MARK), 0x10000, "BMP: no astral-plane emoji")
+
+    def test_every_status_line_is_composed_in_one_place(self) -> None:
+        """There were eight literals, each repeating the mark and the word.
+
+        A status line that says one thing in seven places and something else in the eighth
+        is the drift nobody notices until a screenshot — and this change found exactly that
+        straggler in `session_start`'s own `else` branch while being written.
+        """
+        for name in ("recall.py", "session_start.py"):
+            source = (HOOKS / name).read_text(encoding="utf-8")
+            self.assertNotIn('"Memvara \u00b7', source,
+                             f"{name} builds a status line by hand instead of status()")
+
+    def test_status_reads_as_the_person_sees_it(self) -> None:
+        ipc = self._ipc()
+        self.assertEqual(ipc.status("3 memories recalled"),
+                         "\u22c8 Memvara \u00b7 3 memories recalled")
+
+
 class Provenance(unittest.TestCase):
     """Who derived a fact, and whether a reader can tell.
 

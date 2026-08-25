@@ -52,7 +52,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.fast import recall as fast_recall  # noqa: E402
-from lib.ipc import emit_json, log_line, payload, plural  # noqa: E402
+from lib.ipc import emit_json, log_line, payload, plural, status  # noqa: E402
 
 #: Enough memories to be useful, few enough to stay out of the way. Recall drops whole
 #: notes weakest-first to fit, so this is a ceiling and not a target.
@@ -314,10 +314,10 @@ def main() -> int:
         # indistinguishable from a hook that has stopped working -- which is the failure
         # this file exists to stop repeating -- but reported as what it is rather than as a
         # breakage someone would go looking for.
-        emit_json({"systemMessage": "Memvara · not configured"})
+        emit_json({"systemMessage": status("not configured")})
         return 0
     if not ok:
-        emit_json({"systemMessage": "Memvara · recall failed — see capture.log"})
+        emit_json({"systemMessage": status("recall failed — see capture.log")})
         return 0
 
     header, bullets = _split(block)
@@ -351,8 +351,8 @@ def main() -> int:
 
     if not fresh:
         _write_state(session, seen, topic)
-        note = (f"Memvara · {repeats} already in context" if repeats
-                else "Memvara · no matching memories")
+        note = status(f"{repeats} already in context" if repeats
+                      else "no matching memories")
         emit_json({"systemMessage": note})
         return 0
 
@@ -367,7 +367,7 @@ def main() -> int:
         lines.append(MORE)
     block_text = "\n".join(lines)
 
-    label = f"Memvara · {plural(len(fresh))} recalled"
+    label = status(f"{plural(len(fresh))} recalled")
     if repeats:
         label += f" · {repeats} already in context"
     log_line("recall", f"recalled={len(fresh)} repeats={repeats} injected={len(block_text)}c "
