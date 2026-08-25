@@ -3,5 +3,5 @@
 # frontmatter name, which becomes 'memory' so the skill reads /memvara:memory.
 # skill-sync.yml updates this file when it opens a PR.
 repo=memvara/memvara
-sha=7912a914faa029caa9191d8e9301fc119b0f1c70
+sha=e0ed959998509ffc24d3f2cbc0010588b37a5597
 path=memvara/skills/memvara
