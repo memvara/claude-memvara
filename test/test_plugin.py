@@ -951,6 +951,41 @@ class Extraction(unittest.TestCase):
         self.assertEqual(len(kept), 1,
                          "a multi-line restatement is still the user speaking")
 
+    def test_the_echo_filter_works_in_any_script(self) -> None:
+        """It did not exist for most of the world's writing systems.
+
+        `_content_words` was `[a-z0-9]+`, which sees nothing at all in Devanagari, CJK,
+        Cyrillic, Greek, Arabic, Hebrew or Thai — so `_restates` returned False for every
+        object in those scripts, including one identical to the note it came from. The
+        guard was not weak for those stores; it was absent, and silently, because a filter
+        that never fires and a filter with nothing to catch look identical from outside.
+
+        Measured against a Unicode word class before choosing bigrams: it rescues the
+        alphabetic scripts and still fails CJK, which puts no spaces between words — a
+        Japanese sentence becomes one token that matches only itself.
+        """
+        extract = self._extract()
+        pairs = [
+            ("Devanagari", "मुझे हमेशा पूर्ण पथ पसंद है क्योंकि वर्कट्री नाम दोहराते हैं",
+             "उत्पादन सर्वर पर बैकअप हर रात चलता है"),
+            ("Japanese", "私は常に絶対パスを使用することを好みます",
+             "バックアップは毎晩実行されます"),
+            ("Russian", "Я всегда предпочитаю абсолютные пути в этом проекте",
+             "резервное копирование выполняется каждую ночь"),
+        ]
+        for script, note, unrelated in pairs:
+            with self.subTest(script=script):
+                self.assertTrue(extract._restates(note, [note]),
+                                "a note repeated verbatim is an echo in any script")
+                self.assertFalse(extract._restates(note, [unrelated]),
+                                 "and unrelated text in the same script is not")
+
+    def test_a_short_object_is_never_called_an_echo(self) -> None:
+        """Below `MIN_ECHO_CHARS` there are too few bigrams for an overlap to mean
+        anything — a version string shares most of its bigrams with any other."""
+        extract = self._extract()
+        self.assertFalse(extract._restates("0.1.6", ["0.1.6"]))
+
     def test_values_that_appear_nowhere_in_the_turn_are_dropped(self) -> None:
         """Numbers and identifiers have to come from the exchange, prose does not.
 
