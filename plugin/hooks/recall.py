@@ -408,12 +408,19 @@ def _sample(prompt: str, memories: "list[str]", *, anaphoric: bool) -> None:
 #: measured on a session that started a full day before the rule it needed existed and was
 #: still breaking it eighteen hours later.
 #:
-#: Half an hour rather than every turn, and the difference is the whole design. Standing
+#: A quarter hour rather than every turn, and the difference is the whole design. Standing
 #: preferences are fetched at the top of a session precisely so they do not compete per
 #: prompt with the facts that prompt is about; re-asserting them every turn would undo
 #: that and undo PR #8 with it. What runs on every prompt is a timestamp comparison
-#: against a small JSON file. What runs twice an hour is one query.
-STANDING_REFRESH_SECONDS = 30 * 60
+#: against a small JSON file. What runs four times an hour is one query.
+#:
+#: It was thirty minutes because the query cost 1,345 ms: `memory_standing` was not
+#: deployed, so the block came through `memory_since` from an early instant, which
+#: downloads the whole store -- 160 KB and 371 claims -- to select 32 procedural ones.
+#: `app.memvara.dev` now serves it, the plugin picked it up through `accepts()` with no
+#: change here, and the same block costs **222 ms**. Four of those an hour is less wall
+#: clock than two of the old ones, so the interval halves and the cost still falls.
+STANDING_REFRESH_SECONDS = 15 * 60
 
 
 def _standing_refresh(session: str, now: float, cwd: str = "") -> "tuple[str, tuple[str, float] | None]":
