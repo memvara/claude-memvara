@@ -89,15 +89,36 @@ def _entry_injected(entry: dict) -> list[str]:
     return out
 
 
-def user_lines(turn: str) -> str:
-    """Only the halves of `turn` the person actually typed.
+#: How a formatted line announces who is speaking. `format_user` and `format_assistant`
+#: above write exactly these, and `user_lines` is the only reader — so the two have to be
+#: changed together, and this tuple is where that is visible.
+SPEAKERS = ("User: ", "Claude: ", "Claude used ", "Tool result (")
 
-    The speaker prefixes are written by `format_user`/`format_assistant` above, so this is
-    the one place that has to know they exist. Callers use it to ask whether a fact is
-    supported by what the user said, as distinct from what the assistant concluded.
+
+def user_lines(turn: str) -> str:
+    """Only the parts of `turn` the person actually typed.
+
+    **A prefix marks the start of a block, not every line of one.** `format_user` writes one
+    `User: ` for a whole message, so a prompt somebody typed across three lines arrives as
+    one prefixed line and two bare ones. Filtering on the prefix therefore recovered the
+    first line and silently dropped the rest, and the caller that matters — the check asking
+    whether a fact is supported by what the user said — then failed for every multi-line
+    prompt and dropped the user's own words as an echo of a note they had been shown.
+
+    So a block runs from its prefix to the next one. Anything before the first prefix is not
+    attributable to anyone and is left out.
     """
-    return "\n".join(line[6:] for line in turn.splitlines()
-                     if line.startswith("User: "))
+    out: list[str] = []
+    keeping = False
+    for line in turn.splitlines():
+        start = next((p for p in SPEAKERS if line.startswith(p)), None)
+        if start is not None:
+            keeping = start == "User: "
+            if keeping:
+                out.append(line[len("User: "):])
+        elif keeping:
+            out.append(line)
+    return "\n".join(out)
 
 
 def _clean(text: str) -> str:
