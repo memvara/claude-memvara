@@ -287,6 +287,45 @@ def _split(block: str) -> "tuple[str, list[str]]":
     return header, bullets
 
 
+#: Set to record what was injected next to the prompt it was injected for, so somebody can
+#: read a sample and judge whether it earned its place.
+#:
+#: Opt-in, and it has to be: this writes prompt text to a file, which is a surface nobody
+#: asked for and most installs will never want. It is a measurement, not a feature -- turn
+#: it on for a week, read fifty lines, turn it off.
+SAMPLE_ENV = "MEMVARA_RECALL_SAMPLE"
+
+#: How much of each string to keep. Enough to judge relevance by eye, short enough that a
+#: line stays one line.
+SAMPLE_PROMPT_CHARS = 90
+SAMPLE_MEMORY_CHARS = 70
+
+
+def _sample(prompt: str, memories: "list[str]", *, anaphoric: bool) -> None:
+    """Record the prompt and what recall answered it with.
+
+    **Not relevance scores, because there are none to record.** `recall()` returns rendered
+    text; `RecallResult` carries ids and a dropped count and no score, and the hosted
+    `memory_recall` does not even ask for the ids. Reaching a score means a second
+    round trip to `memory_search` on the per-prompt path -- doubling the cost of the thing
+    being measured -- or a change to the server. Neither is worth it to answer a question a
+    person can answer by reading.
+
+    So this logs the two strings that matter and lets a human be the judge. `anaphoric`
+    comes along because it is the obvious confounder: a prompt that carried its topic
+    forward was searched with different words than the ones somebody typed, and a bad
+    injection there is a different bug than a bad injection on a prompt that stood alone.
+    """
+    if not os.environ.get(SAMPLE_ENV):
+        return
+    def flat(text: str, n: int) -> str:
+        return " ".join(text.split())[:n]
+    parts = [f"carried={'y' if anaphoric else 'n'}",
+             f"prompt={flat(prompt, SAMPLE_PROMPT_CHARS)!r}"]
+    parts += [f"mem{i}={flat(m, SAMPLE_MEMORY_CHARS)!r}" for i, m in enumerate(memories, 1)]
+    log_line("recall-sample", "  ".join(parts))
+
+
 def main() -> int:
     data = payload()
     prompt = str(data.get("prompt") or "").strip()
@@ -372,6 +411,7 @@ def main() -> int:
         label += f" · {repeats} already in context"
     log_line("recall", f"recalled={len(fresh)} repeats={repeats} injected={len(block_text)}c "
         f"clipped={sum(1 for s_, f_ in zip(clipped, fresh) if s_ != f_)}")
+    _sample(prompt, fresh, anaphoric=anaphoric and bool(carried))
     emit_json({
         "systemMessage": label,
         "hookSpecificOutput": {

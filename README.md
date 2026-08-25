@@ -125,7 +125,15 @@ prompt, where they also crowded out the incidental facts that prompt was
 actually about.
 
 What recall spends is now written to `~/.memvara/.hooks/recall.log`, per
-prompt. The write path has had a token ledger since 0.1.2 and the read
+prompt. What it spends is not the same question as whether it was
+worth spending: the log records that something was injected, never that it was
+used. Setting `MEMVARA_RECALL_SAMPLE=1` writes the prompt and the memories that
+answered it to `recall-sample.log`, so fifty lines can be read and judged by
+hand. It is off by default because it puts prompt text in a file, and it is a
+measurement rather than a feature — turn it on for a week, read it, turn it off.
+There are no relevance scores in it because there are none to record: `recall()`
+returns rendered text, and reaching a score means a second round trip on the
+per-prompt path or a change to the server. The write path has had a token ledger since 0.1.2 and the read
 path had none, which is how the hook that spends context on every single
 prompt became the one nobody could measure.
 
