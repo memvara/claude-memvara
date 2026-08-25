@@ -124,6 +124,98 @@ Today that is `claude-memvara` only. The rules are general.
   starts, and editing a hook mid-flight found two real bugs that unit tests did not —
   including one where the fallback quietly held while the optimisation was entirely broken.
 
+## Guards, and how they fail quietly
+
+Almost every defect found here on 2026-08-25 was one shape, and none of them raised. A
+claim and the guard that checks it, **frozen together, agreeing with each other while both
+were wrong** — and reporting it honestly to a channel nobody reads. Four in a day:
+
+- `skill.lock` and the vendored copy stayed consistent *with each other* for five commits
+  while the library moved. `test_matches_library_at_lock_sha` compares the copy against the
+  sha the copy itself names, so the pair agreed forever.
+- `memvara-web`'s tool count and `test/tool-count.test.ts`: the test pinned **the site's own
+  claim**, green while the site said ten and the endpoint served twelve, with
+  `memory_neighborhood` and `memory_paths` never counted at all.
+- `skill-sync.yml` failed every night for four days. The failure was in a scheduled run's
+  log.
+- The drift check printed `drift NOT checked: HTTP Error 403` and the job went green.
+
+None was silent. All four were unheard, which in practice is the same thing and is harder
+to notice, because the honesty makes it look handled.
+
+### A guard compares a claim against its referent, never against a copy of itself
+
+The referent is the server, the library's default branch, the endpoint — the thing the
+claim is *about*. A test that reads the value out of the same repository that states it
+proves the file is self-consistent and nothing else.
+
+Where reading the referent is genuinely wrong, say why in the guard. `memvara-web`
+deliberately does not reach into the core, because a test that reads a sibling working tree
+fails on a stale checkout — and the cost of that choice is a comment, not silence.
+
+### State it positively: the correct value must be PRESENT
+
+A guard spelled "the page does not state the *wrong* count" passes on a page that has
+stopped stating anything at all — a
+rewritten sentence, a deleted paragraph, a digit instead of a word. **A guard a deletion
+satisfies has quietly stopped guarding.** Requiring the right phrase means a page that no
+longer tells the reader the truth fails exactly as loudly as one that tells them something
+false.
+
+(That rule is stated without quoting a wrong count, deliberately: `test_no_other_count_is_stated_anywhere`
+scans every markdown file in this repository, and an illustrative "N tools" in prose is
+indistinguishable from a claim. It caught this very section while it was being written,
+which is the guard behaving exactly as intended.)
+
+### Prove the guard can fail, before believing it passes
+
+Break the thing it watches and watch it go red. Every guard added that day was sabotaged
+first, and three were found broken *by that step alone*:
+
+- the drift check **skipped on CI** — the only place it runs — because the library checkout
+  is pinned to `skill.lock`'s sha and could not resolve `origin/main`;
+- its skip path was firing on `CERTIFICATE_VERIFY_FAILED`, so on any Mac it reported the
+  library unreachable while the library was fine;
+- a test suite for the `sources` probe **stubbed the method under test**, so deleting the
+  probe entirely left every test green.
+
+A passing run does not distinguish "the code works" from "the check never ran". Only a
+failing run does.
+
+### A hand-maintained list of what is covered is itself unguarded
+
+`AgentSetup.tsx` stated the tool count three times and was absent from the guard's `PROSE`
+list, so it was free to say any number. Removing it from that list produced *fifteen
+passing tests and no failure* — the guard did not weaken, it stopped covering a file, and
+from outside those look identical. Check the list against the tree.
+
+### A skip is not a pass, and neither is a truncated tail
+
+`OK (skipped=1)` is not `OK`. Read the verdict line, and read all of it: `tail -3 | head -2`
+swallowed a `FAILED` twice in one day, and once nearly shipped six red PRs on the strength
+of a `Ran 15 tests` line with the result cut off.
+
+### Measure twice before writing a number down
+
+A single reading of the `claude -p` preamble said 67k and did not reproduce across four
+later runs — writing it down would have replaced one stale number with a worse one. One
+observed CI skip became "all six repos are inert", which the data flatly contradicted:
+23 of 23 runs had the check running.
+
+### Read shared state from the tool, not from a checkout
+
+Several sessions work these repos at once. A sibling checkout six commits behind would have
+produced a sync that pinned the new sha while shipping the old bytes — the lock and the copy
+agreeing, again. `git log origin/main -- <path>` and `gh pr list` cost one call and answer
+what someone told you.
+
+### Verify the deliverable, not the repository
+
+Merged is not shipped. Twenty-one commits sat on `main` behind an unchanged version string
+while `/plugin update` answered "already at the latest version", and the only check that
+would have caught it was opening a session and reading the status line. Whatever the change
+is *for* is the thing to look at.
+
 ## Before proposing new machinery
 
 1. `grep` the constructor or signature for the parameter you want to add.
