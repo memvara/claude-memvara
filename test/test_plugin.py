@@ -232,7 +232,6 @@ class Marketplace(unittest.TestCase):
         body = _json(PLUGIN / ".claude-plugin" / "plugin.json")
         assert isinstance(body, dict)
         self.assertEqual(body["name"], "memvara")
-        self.assertEqual(body["version"], "0.2.1")
         self.assertEqual(body["license"], "Apache-2.0")
         self.assertEqual(body["homepage"], "https://memvara.dev/docs/agents")
         self.assertEqual(body["repository"], f"https://github.com/{REPO_NAME}")
@@ -2540,6 +2539,117 @@ class Hygiene(unittest.TestCase):
         if env:
             self.assertTrue(env.startswith("memvara/"), env)
             self.assertEqual(env, REPO_NAME)
+
+
+class Version(unittest.TestCase):
+    """Every version this repository states must be the released one, and none may hide.
+
+    This repository is where the failure was measured. Twenty-one commits sat on main
+    behind an unchanged `0.1.8` -- the standing-block rewrite among them -- while
+    `/plugin update` answered "already at the latest version" to everyone who asked, and
+    the only check that would have caught it was opening a session and reading the status
+    line. The version string is the whole of what a client compares.
+
+    Only one manifest states a version today, so the value check below duplicates what
+    `test_plugin_manifest` used to assert. The second check is the one that earns its
+    place: it pins the *set* of files that declare a version, in both directions. A
+    manifest that starts stating one -- a marketplace entry, a `package.json`, anything a
+    future host wants -- is then a version nobody is checking, and this fails until it is
+    added to `DECLARED` deliberately. `.claude-plugin/marketplace.json` deliberately holds
+    none: Claude Code reads it from the plugin manifest, and a second copy would be a
+    second thing to forget.
+
+    Ported from the six sibling plugin repositories, where four defects were found in it
+    by sabotage rather than by reading, none of them visible from a passing run:
+
+    - ignoring directories by absolute path excluded the whole repository whenever the
+      checkout was a worktree, since those live under `.claude/worktrees/`;
+    - the coverage check was a bare set comparison, so it passed on that broken walk with
+      both sides empty;
+    - the value check alone stays green when one manifest of several drops its version,
+      because the others still say the right thing;
+    - sweeping the filesystem dragged in foreign manifests from the library checkout CI
+      places at `_library/`.
+
+    Hence `git ls-files`: the question is which files this repository owns, and git is the
+    thing that knows. There is no fallback when git cannot answer, because a fallback here
+    would silently cover less than the caller believes.
+    """
+
+    VERSION = "0.2.1"
+    DECLARED = {"plugin/.claude-plugin/plugin.json"}
+
+    @classmethod
+    def _walk(cls, node: object, where: str = ""):
+        """Every `version` string at any depth, with the pointer that reached it."""
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "version" and isinstance(value, str):
+                    yield f"{where}.{key}", value
+                else:
+                    yield from cls._walk(value, f"{where}.{key}")
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                yield from cls._walk(value, f"{where}[{index}]")
+
+    @classmethod
+    def _candidates(cls) -> list:
+        """Every JSON file this repository tracks."""
+        listed = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "-z", "*.json"],
+            check=True, capture_output=True, text=True).stdout
+        return [
+            ROOT / name for name in listed.split("\0")
+            if name and pathlib.PurePath(name).name != "package-lock.json"
+        ]
+
+    def _stated(self) -> list:
+        found = []
+        for path in self._candidates():
+            try:
+                body = json.loads(path.read_text(encoding="utf-8"))
+            except ValueError:
+                continue
+            found.extend((path, where, value) for where, value in self._walk(body))
+        return found
+
+    def test_every_version_this_repo_states_is_the_released_one(self) -> None:
+        stated = self._stated()
+        self.assertTrue(
+            stated, "no file states a version at all -- this guard has stopped guarding")
+        for path, where, value in stated:
+            self.assertEqual(
+                value, self.VERSION,
+                f"{path.relative_to(ROOT)}{where} says {value!r}; a partial bump is how a "
+                "client gets told it is current while the contents moved underneath it")
+
+    def test_exactly_the_manifests_that_must_declare_a_version_do(self) -> None:
+        """Both directions, because each catches a mistake the other cannot see.
+
+        A file the walk misses is a version nobody checks. A file that has stopped
+        declaring one ships unversioned, which the value check above cannot see at all: it
+        goes green as soon as any other file still says the right thing.
+        """
+        reached = {str(path.relative_to(ROOT)) for path, _where, _value in self._stated()}
+        by_text = {
+            str(path.relative_to(ROOT)) for path in self._candidates()
+            if '"version"' in path.read_text(encoding="utf-8")
+        }
+        self.assertEqual(by_text, self.DECLARED, "a manifest gained or lost its version")
+        self.assertEqual(reached, self.DECLARED, "the JSON walk missed a stated version")
+
+    def test_the_release_number_is_written_down_exactly_once_in_this_suite(self) -> None:
+        """`VERSION` above is the only place the tests name it.
+
+        `test_plugin_manifest` asserted it too until this class arrived. Three places to
+        edit at release time is the mechanism a partial bump needs, and the repository's
+        own account of a release -- the manifest and this file -- says two.
+        """
+        source = pathlib.Path(__file__).read_text(encoding="utf-8")
+        self.assertEqual(
+            source.count(f'"{self.VERSION}"'), 1,
+            f"{self.VERSION} appears more than once in this file; VERSION is meant to be "
+            "the single place the suite states the release")
 
 
 if __name__ == "__main__":
