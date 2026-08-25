@@ -34,21 +34,31 @@ jobs:
           # everything between the `local:` markers belongs to THIS repository and survives,
           # because two of its sections legitimately differ per repo (its runtime facts, and
           # the hook rules that only this plugin needs).
-          python3 - "$src/../../plugin-claude.md" <<'COMPOSE'
+          # Addressed from the clone root, not by walking up from $src. The first version
+          # counted one `..` short, resolved to a path that does not exist, and took the
+          # not-found branch below on every run since it shipped.
+          python3 - /tmp/memvara/plugin-claude.md <<'COMPOSE'
           import pathlib, sys
           BEGIN = "<!-- local: begin — this repository's own facts; skill-sync preserves this block -->"
           END = "<!-- local: end -->"
           canonical = pathlib.Path(sys.argv[1])
           if not canonical.is_file():
-              print("library has no plugin-claude.md yet; leaving CLAUDE.md alone")
-              raise SystemExit(0)
+              # Loud. This exact branch ran on every sync from the day it shipped, printed
+              # its honest line into a log nobody reads, and let the job go green while
+              # CLAUDE.md was never composed at all. The canonical exists; not finding it
+              # can only mean the clone or the path is wrong, and neither is a reason to
+              # report success.
+              raise SystemExit(f"canonical not found at {canonical} -- "
+                               "the library clone or this path is wrong")
           here = pathlib.Path("CLAUDE.md")
           text = here.read_text(encoding="utf-8")
           if BEGIN not in text or END not in text:
               # Refuse rather than guess. Splicing without both markers would replace this
               # repository's own sections with the canonical's placeholder and lose them.
-              print("CLAUDE.md has no local block; refusing to splice")
-              raise SystemExit(0)
+              # Also loud, for the same reason. Every one of these repositories has the
+              # markers and a test that requires exactly one pair, so their absence is a
+              # broken checkout rather than a repository that opted out.
+              raise SystemExit("CLAUDE.md has no local block; refusing to splice")
           local = text[text.index(BEGIN) + len(BEGIN):text.index(END)]
           out = canonical.read_text(encoding="utf-8").replace(
               "@@LOCAL@@\n", BEGIN + local + END + "\n", 1)
