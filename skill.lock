@@ -1,7 +1,6 @@
 # The library commit whose memvara/skills/memvara/ tree this plugin vendors.
-# CI diffs plugin/skills/memory against that SHA, allowing exactly one edit: the
-# frontmatter name, which becomes 'memory' so the skill reads /memvara:memory.
-# skill-sync.yml updates this file when it opens a PR.
+# CI diffs plugin/skills/memvara against that SHA. skill-sync.yml updates this
+# file when it opens a PR.
 repo=memvara/memvara
 sha=e0ed959998509ffc24d3f2cbc0010588b37a5597
 path=memvara/skills/memvara
