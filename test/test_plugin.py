@@ -102,7 +102,7 @@ class Marketplace(unittest.TestCase):
         body = _json(PLUGIN / ".claude-plugin" / "plugin.json")
         assert isinstance(body, dict)
         self.assertEqual(body["name"], "memvara")
-        self.assertEqual(body["version"], "0.1.7")
+        self.assertEqual(body["version"], "0.1.8")
         self.assertEqual(body["license"], "Apache-2.0")
         self.assertEqual(body["homepage"], "https://memvara.dev/docs/agents")
         self.assertEqual(body["repository"], f"https://github.com/{REPO_NAME}")
