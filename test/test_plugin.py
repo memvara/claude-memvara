@@ -1510,6 +1510,66 @@ class SpeakerBlocks(unittest.TestCase):
         self.assertEqual(transcript.user_lines(turn), "run the migration")
 
 
+class WorthMining(unittest.TestCase):
+    """Which turns justify a paid extraction.
+
+    A headless run costs ~21k tokens of Claude Code's own preamble whatever it is handed,
+    so the bill scales with the number of runs and not their size. Cutting runs is the only
+    lever, and the question is which ones can be cut without losing a fact.
+    """
+
+    def _capture(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("capture")
+        finally:
+            sys.path.pop(0)
+
+    def test_a_short_prompt_no_longer_discards_a_turn_that_did_something(self) -> None:
+        """The prompts that authorise work are the short ones.
+
+        "merge #55", "deploy it", "ship it" — and the whole of CONTINUATIONS: "do it",
+        "go ahead", "run it". Judged on the prompt alone, every one of them is skipped, and
+        the reply that merged, deployed or shipped goes with it. Measured on a real machine
+        before this: `turn=6476c skipped=prompt too short (8c)`, six times over.
+        """
+        capture = self._capture()
+        worth, why = capture._worth_mining(
+            "User: merge #55\nClaude used Bash command=gh pr merge 55")
+        self.assertTrue(worth, f"a turn that ran a command is worth mining, got {why!r}")
+
+        worth, why = capture._worth_mining(
+            "User: do it\nClaude used Edit file_path=/a/b.py")
+        self.assertTrue(worth, f"evidence outranks the continuation rule, got {why!r}")
+
+    def test_a_turn_where_nothing_happened_is_still_skipped(self) -> None:
+        """The cost argument is unchanged, and this is the half that keeps it true.
+
+        A reply that only explains something buys nothing under the attribution rules the
+        extractor follows — the assistant's own prose is not evidence for a fact — so
+        paying ~21k tokens to mine it is the run this gate exists to cut.
+        """
+        capture = self._capture()
+        worth, why = capture._worth_mining(
+            "User: merge #55\nClaude: I would merge it like this.")
+        self.assertFalse(worth)
+        self.assertIn("too short", why)
+
+        worth, why = capture._worth_mining("User: yes\nClaude: here is why that works.")
+        self.assertFalse(worth)
+        self.assertEqual(why, "continuation")
+
+    def test_a_long_prompt_is_mined_whether_or_not_anything_happened(self) -> None:
+        """Unchanged behaviour, asserted so the new rule cannot quietly become the only
+        one — a turn where somebody wrote a paragraph is worth reading either way."""
+        capture = self._capture()
+        worth, _ = capture._worth_mining(
+            "User: explain the tradeoff between these two designs\nClaude: sure.")
+        self.assertTrue(worth)
+
+
 class Provenance(unittest.TestCase):
     """Who derived a fact, and whether a reader can tell.
 
