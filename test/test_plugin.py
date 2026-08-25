@@ -2170,8 +2170,8 @@ class ReadmeAndLicense(unittest.TestCase):
 #: One place to change when a deploy moves it, and `memory_standing` is the name to add.
 HOSTED_TOOLS = (
     "memory_recall", "memory_search", "memory_neighborhood", "memory_paths",
-    "memory_since", "memory_add", "memory_remember", "memory_forget", "memory_end",
-    "memory_history", "memory_why", "memory_stats",
+    "memory_since", "memory_standing", "memory_add", "memory_remember",
+    "memory_forget", "memory_end", "memory_history", "memory_why", "memory_stats",
 )
 
 #: Spelled out because that is how the sentence is written, and indexed by the count so

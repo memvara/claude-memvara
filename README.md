@@ -19,10 +19,10 @@ MCP server plus the skill.
 
 ## What you get
 
-Twelve tools on `https://app.memvara.dev/mcp`: `memory_recall`,
+Thirteen tools on `https://app.memvara.dev/mcp`: `memory_recall`,
 `memory_search`, `memory_neighborhood`, `memory_paths`, `memory_since`,
-`memory_add`, `memory_remember`, `memory_forget`, `memory_end`,
-`memory_history`, `memory_why`, `memory_stats`.
+`memory_standing`, `memory_add`, `memory_remember`, `memory_forget`,
+`memory_end`, `memory_history`, `memory_why`, `memory_stats`.
 
 The `memory` skill is the judgment a single tool description cannot
 carry: which surface to use, the sequence when a stored fact is
