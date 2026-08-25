@@ -64,6 +64,24 @@ MAX_REQUEST_BYTES = 64 * 1024
 MAX_CONSECUTIVE_FAILURES = 3
 
 
+def _listening(path: str) -> bool:
+    """Whether anything is accepting connections on `path`.
+
+    Connect and drop it. A daemon mid-answer still completes the accept, so this says
+    "alive" for a busy one where waiting for a reply would say "dead" -- which is the
+    difference between tidying a dead address and unlinking a live one.
+    """
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.5)
+    try:
+        probe.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
 class Daemon:
     def __init__(self, path: str, store: object) -> None:
         self.path = path
@@ -143,6 +161,45 @@ class Daemon:
                 # Client vanished mid-exchange, or sent nonsense. Neither is fatal.
                 return
 
+    def _sweep_stale(self) -> None:
+        """Unlink sockets in this directory that nobody is listening on.
+
+        The address digests the hook sources, which is what stops an edited hook being
+        served by a daemon running the old code -- the daemon is stranded rather than
+        reused, and it exits. What it does not do is remove the *file*, so a day of hook
+        edits leaves a directory of dead addresses: five sockets, one live daemon, on the
+        machine this was found on.
+
+        Litter rather than a leak, and worth a dozen lines anyway, because `ls run/` is how
+        somebody debugging recall asks whether a daemon is up, and it should not answer
+        with four ghosts and one truth.
+
+        The probe is a bare `connect`, and it has to be: asking for an *answer* would call
+        a live daemon dead whenever it happened to be busy, and unlinking a live address
+        leaves that daemon running and unreachable while the next client spawns a duplicate
+        beside it. A listening socket accepts immediately; a stranded one refuses with
+        ECONNREFUSED. That is the whole distinction, and it needs no reply.
+
+        Our own address is skipped because we are listening on it in a moment, and every
+        failure is ignored -- a socket that cannot be swept is exactly as harmless as it
+        was before.
+        """
+        run_dir = os.path.dirname(self.path)
+        try:
+            names = os.listdir(run_dir)
+        except OSError:
+            return
+        for name in names:
+            path = os.path.join(run_dir, name)
+            if path == self.path or not name.startswith("recall-"):
+                continue
+            if _listening(path):
+                continue  # a live daemon for some other digest; leave it alone
+            try:
+                os.unlink(path)
+            except OSError:
+                continue
+
     def run(self) -> int:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -164,6 +221,7 @@ class Daemon:
             os.chmod(self.path, 0o600)
         except OSError:
             pass
+        self._sweep_stale()
 
         server.listen(16)
         server.settimeout(30.0)

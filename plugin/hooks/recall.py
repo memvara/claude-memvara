@@ -44,6 +44,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os.path
+import time
 import sys
 
 # `os.path`, not `pathlib`: importing pathlib costs 10.5ms and this file runs on every
@@ -129,6 +130,10 @@ SEEN_DIR = os.path.join(os.path.expanduser("~"), ".memvara", ".hooks", "recalled
 #: Enough to cover a long session without the file becoming something that needs managing.
 MAX_SEEN = 500
 
+#: How long a session's dedup state is kept. A session nobody has touched in a fortnight
+#: will not be resumed, and its hashes only ever prevented re-injecting a memory into it.
+SEEN_TTL_SECONDS = 14 * 24 * 3600
+
 #: First words that make a prompt a reply to the last turn rather than a question of its
 #: own. Matched on the opening word only: "yes, add that fix to #7" is anaphoric and "yes"
 #: is the whole reason, while a prompt that merely contains the word somewhere is not.
@@ -201,6 +206,33 @@ def _read_state(session: str) -> "tuple[list[str], str]":
             query if isinstance(query, str) else "")
 
 
+def _prune_seen(now: float) -> None:
+    """Drop state for sessions nobody will resume.
+
+    One file is written per Claude Code session and nothing ever removed one, so the
+    directory grew by every session this machine had ever run -- 119 files after two days
+    on the machine this was found on. `MAX_SEEN` bounds the hashes *inside* a file and
+    nothing bounded the number of files.
+
+    Done here rather than on a schedule for `capture.log`'s reason: a cleanup that needs
+    its own scheduling is the thing that never runs. This is a handful of `stat` calls on
+    the one event that already writes to this directory, and a failure is ignored, because
+    a tidy directory is worth strictly less than an answered prompt.
+    """
+    try:
+        for name in os.listdir(SEEN_DIR):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(SEEN_DIR, name)
+            try:
+                if now - os.path.getmtime(path) > SEEN_TTL_SECONDS:
+                    os.unlink(path)
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
 def _write_state(session: str, hashes: "list[str]", query: str) -> None:
     path = _seen_path(session)
     if path is None:
@@ -209,6 +241,7 @@ def _write_state(session: str, hashes: "list[str]", query: str) -> None:
         os.makedirs(SEEN_DIR, exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump({"seen": hashes[-MAX_SEEN:], "query": query[:MAX_CARRY_CHARS]}, fh)
+        _prune_seen(time.time())
     except OSError:
         # Dedup and carry-forward are both optimisations. Losing them repeats a memory or
         # weakens one query; failing the prompt over it would be the larger bug.
