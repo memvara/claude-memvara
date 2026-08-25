@@ -14,6 +14,8 @@ import pathlib
 import re
 import shutil
 import tempfile
+import socket
+import time
 import subprocess
 import sys
 import unittest
@@ -1603,6 +1605,97 @@ class WorthMining(unittest.TestCase):
         worth, _ = capture._worth_mining(
             "User: explain the tradeoff between these two designs\nClaude: sure.")
         self.assertTrue(worth)
+
+
+class StateGrowth(unittest.TestCase):
+    """What the hooks leave behind, and what removes it.
+
+    `capture.log` truncates itself, with a comment arguing that a log needing its own
+    maintenance is worse than no log. The other three pieces of state the hooks keep had no
+    such rule, and grew on the same trigger as ordinary use: one file per session, one key
+    per transcript, one socket per hook edit. Measured on a machine two days in — 119 files,
+    169 keys, 5 sockets behind 1 live daemon.
+
+    Each cleanup runs on a path that already exists, deliberately: a sweep that needs its
+    own scheduling is the one that never runs.
+    """
+
+    def _module(self, name: str):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module(name)
+        finally:
+            sys.path.pop(0)
+
+    def test_a_session_nobody_will_resume_stops_costing_a_file(self) -> None:
+        recall = self._module("recall")
+        with tempfile.TemporaryDirectory() as tmp:
+            original, recall.SEEN_DIR = recall.SEEN_DIR, tmp
+            try:
+                now = time.time()
+                for name, age_days in (("old.json", 30), ("recent.json", 1)):
+                    path = os.path.join(tmp, name)
+                    pathlib.Path(path).write_text("{}", encoding="utf-8")
+                    os.utime(path, (now - age_days * 86400, now - age_days * 86400))
+                recall._prune_seen(now)
+                self.assertEqual(sorted(os.listdir(tmp)), ["recent.json"])
+            finally:
+                recall.SEEN_DIR = original
+
+    def test_a_watermark_for_a_transcript_that_is_gone_is_dropped(self) -> None:
+        """It can never be read again — the transcript it describes cannot be mined.
+
+        Worth doing at write time rather than never, because this file is parsed and
+        rewritten on every `Stop`, so it sits on the per-turn path.
+        """
+        capture = self._module("capture")
+        with tempfile.TemporaryDirectory() as tmp:
+            alive = os.path.join(tmp, "alive.jsonl")
+            pathlib.Path(alive).write_text("{}", encoding="utf-8")
+            state_file = pathlib.Path(tmp) / "state.json"
+            original, capture.STATE = capture.STATE, state_file
+            try:
+                capture._write_state({alive: 10, os.path.join(tmp, "gone.jsonl"): 20})
+                kept = json.loads(state_file.read_text(encoding="utf-8"))
+                self.assertEqual(list(kept), [alive])
+            finally:
+                capture.STATE = original
+
+    def test_a_socket_nobody_is_listening_on_is_swept(self) -> None:
+        """A hook edit changes the address, which strands the old daemon by design — it
+        exits, and that half works. What it leaves is the file, so `ls run/` answers a
+        question about whether a daemon is up with several ghosts and one truth."""
+        daemon = self._module("daemon")
+        with tempfile.TemporaryDirectory() as tmp:
+            dead = os.path.join(tmp, "recall-deadbeef.sock")
+            bound = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            bound.bind(dead)          # bound, never listening: exactly a stranded address
+            try:
+                instance = daemon.Daemon.__new__(daemon.Daemon)
+                instance.path = os.path.join(tmp, "recall-mine.sock")
+                instance._sweep_stale()
+                self.assertEqual(os.listdir(tmp), [])
+            finally:
+                bound.close()
+
+    def test_the_sweep_leaves_a_live_daemon_alone(self) -> None:
+        """The failure that would matter: unlinking the address another session is serving
+        on. The probe is a connect, and a listening socket answers it."""
+        daemon = self._module("daemon")
+        with tempfile.TemporaryDirectory() as tmp:
+            live = os.path.join(tmp, "recall-live.sock")
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(live)
+            server.listen(1)
+            try:
+                instance = daemon.Daemon.__new__(daemon.Daemon)
+                instance.path = os.path.join(tmp, "recall-mine.sock")
+                instance._sweep_stale()
+                self.assertEqual(os.listdir(tmp), ["recall-live.sock"])
+            finally:
+                server.close()
 
 
 class Provenance(unittest.TestCase):

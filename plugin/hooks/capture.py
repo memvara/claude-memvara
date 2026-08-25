@@ -43,6 +43,7 @@ Per-turn costs more and loses nothing. The two guards that remain:
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -159,9 +160,22 @@ def _read_state() -> dict:
 
 
 def _write_state(state: dict) -> None:
+    """Persist the per-transcript watermarks, minus the ones that describe nothing.
+
+    A key is added for every transcript this machine has ever mined and none was ever
+    removed, so the file grew monotonically -- 169 entries after two days, one of them
+    already naming a transcript that no longer existed. It is parsed and rewritten on every
+    `Stop`, so it is on the per-turn path, which is what makes unbounded growth worth a
+    line rather than a shrug.
+
+    A transcript that is gone cannot be mined again, so its watermark can never be read.
+    Dropping it here costs one `exists` per key at write time and removes the entry exactly
+    when it stops meaning anything.
+    """
     import json
 
     try:
+        state = {key: size for key, size in state.items() if os.path.exists(key)}
         STATE.parent.mkdir(parents=True, exist_ok=True)
         STATE.write_text(json.dumps(state), encoding="utf-8")
     except OSError:
