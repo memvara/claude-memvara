@@ -352,6 +352,75 @@ class SkillTree(unittest.TestCase):
             "sync it, or check why skill-sync.yml has not")
 
 
+class SharedInstructions(unittest.TestCase):
+    """CLAUDE.md is shared across every plugin repo, and nothing used to carry it.
+
+    It was hand-copied and it drifted: eleven of fourteen sections were byte-identical
+    across all seven repositories, and a section written in one of them reached none of
+    the others. The canonical is `plugin-claude.md` in the library; `skill-sync.yml`
+    composes this file from it and preserves the `local:` block, because two sections
+    legitimately differ per repo — a repository's own runtime facts, and the hook rules
+    only this plugin needs.
+
+    Without a guard this would be a tidier way to drift rather than an end to it, which is
+    the objection the section it carries makes about hand-maintained copies.
+    """
+
+    BEGIN = "<!-- local: begin"
+    END = "<!-- local: end -->"
+
+    def _text(self) -> str:
+        return (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+
+    def test_the_local_block_is_delimited_exactly_once(self) -> None:
+        """The splice depends on both markers, once each.
+
+        Two of either and it takes the wrong span; none and the composer refuses rather
+        than replacing this repository's sections with the canonical's placeholder — which
+        is the failure worth refusing over, since it loses text no sync can put back.
+        """
+        text = self._text()
+        self.assertEqual(text.count(self.BEGIN), 1)
+        self.assertEqual(text.count(self.END), 1)
+        self.assertLess(text.index(self.BEGIN), text.index(self.END))
+
+    def test_the_shared_half_matches_the_library(self) -> None:
+        """Everything outside the local block must equal the canonical at the lock's sha.
+
+        Compared against the LIBRARY, not against a copy of itself — a check that read this
+        file's own halves would prove it is internally consistent and nothing else, which is
+        precisely how the vendored skill sat five commits behind while its own drift test
+        passed.
+        """
+        lock = _lock()
+        try:
+            canonical = _library_bytes(lock["sha"], "plugin-claude.md").decode("utf-8")
+        except Exception as exc:  # noqa: BLE001
+            raise unittest.SkipTest(
+                f"library has no plugin-claude.md at {lock['sha'][:7]}: {exc}") from exc
+
+        text = self._text()
+        head, rest = text.split(self.BEGIN, 1)
+        _, tail = rest.split(self.END, 1)
+        want_head, want_tail = canonical.split("@@LOCAL@@\n", 1)
+        self.assertEqual(head, want_head,
+                         "text above the local block drifted from plugin-claude.md — edit "
+                         "the canonical in memvara/memvara, not the copy here")
+        self.assertEqual(tail.lstrip("\n"), want_tail.lstrip("\n"),
+                         "text below the local block drifted from plugin-claude.md")
+
+    def test_the_local_block_holds_what_only_this_repo_knows(self) -> None:
+        """The block is not decorative: it carries the two sections that differ per repo.
+
+        If a sync ever flattened it, the loss would be silent — the file would still read
+        as a complete CLAUDE.md, just one belonging to a different repository.
+        """
+        text = self._text()
+        local = text.split(self.BEGIN, 1)[1].split(self.END, 1)[0]
+        self.assertIn("Runtime facts that cost hours to find", local)
+        self.assertIn("If this repo ships hooks", local)
+
+
 class Hooks(unittest.TestCase):
     """The hooks run unattended on every prompt, so the bar is behavioural.
 

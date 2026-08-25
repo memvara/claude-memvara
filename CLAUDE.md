@@ -1,5 +1,11 @@
 # Working in a memvara plugin repository
 
+<!-- Canonical. This file is `plugin-claude.md` in memvara/memvara and is copied into every
+     repository in `plugin-repos.txt` as their `CLAUDE.md`. Edit it HERE; a sync overwrites
+     the copy. Everything between the `local: begin` and `local: end` markers below belongs
+     to the repository it lands in and is preserved across syncs -- that is where a repo's
+     own runtime facts and its hook rules live, because only one plugin ships hooks. -->
+
 These repos are thin. Each one is an install surface — a manifest, a vendored skill, some
 tests — wrapped around a library that lives somewhere else. Almost every mistake made here
 comes from forgetting that, so this file is about the habits that follow from it rather
@@ -56,6 +62,7 @@ line and no other — every remaining byte still has to match.
 CLAUDE.md, and it means the README here too: a README that oversells the install is how
 someone finds a background process they were told would not exist.
 
+<!-- local: begin — this repository's own facts; skill-sync preserves this block -->
 ## Runtime facts that cost hours to find
 
 Each of these was measured, not reasoned about, and each fails silently.
@@ -124,6 +131,7 @@ Today that is `claude-memvara` only. The rules are general.
   starts, and editing a hook mid-flight found two real bugs that unit tests did not —
   including one where the fallback quietly held while the optimisation was entirely broken.
 
+<!-- local: end -->
 ## Guards, and how they fail quietly
 
 Almost every defect found here on 2026-08-25 was one shape, and none of them raised. A
