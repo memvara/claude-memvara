@@ -88,6 +88,48 @@ def _lock() -> dict[str, str]:
     return out
 
 
+#: Hooks log to `~/.memvara/.hooks/`, and the tests that drive their entry points append
+#: to the developer's own telemetry unless something stops them. It is worth stating how
+#: this was found, because none of it raised: 31% of a real `recall.log` on the machine
+#: this was written on turned out to be fixture rows, which drags every median computed
+#: from that file downwards -- 305c measured, 372c once the synthetic rows were dropped.
+#:
+#: `_sample` made it worse by consulting a flag *file*, so whether the suite wrote at all
+#: depended on which machine ran it: green and clean on CI, green and polluting at a desk
+#: where the flag happened to exist. Redirect the home the loggers read, once, for the
+#: whole suite; `test_the_suite_never_writes_to_the_real_hooks_directory` fails if this
+#: fixture is ever removed. `RUNTIME_DIR` is bound at import and deliberately left alone,
+#: so the daemon tests keep addressing the socket directory they mean to.
+#:
+#: Three constants, not one, because the two logs are written by two different loggers --
+#: `ipc.log_line` builds its path per call from `_HOME`, while `write.LOG` is a `Path`
+#: fixed at import. Redirecting only the first leaves `capture.log` still leaking, which
+#: is exactly what the first attempt at this fixture did.
+_REDIRECTED: "list[tuple]" = []
+
+
+def setUpModule() -> None:
+    sys.path.insert(0, str(HOOKS))
+    try:
+        import recall
+        from lib import ipc, write
+    finally:
+        sys.path.pop(0)
+    home = tempfile.mkdtemp(prefix="memvara-test-home-")
+    hooks = os.path.join(home, ".memvara", ".hooks")
+    _REDIRECTED.append(
+        (home, ipc, ipc._HOME, recall, recall.SAMPLE_FLAG, write, write.LOG))
+    ipc._HOME = home
+    recall.SAMPLE_FLAG = os.path.join(hooks, "sample-recall")
+    write.LOG = pathlib.Path(hooks) / "capture.log"
+
+
+def tearDownModule() -> None:
+    home, ipc, was_home, recall, was_flag, write, was_log = _REDIRECTED.pop()
+    ipc._HOME, recall.SAMPLE_FLAG, write.LOG = was_home, was_flag, was_log
+    shutil.rmtree(home, ignore_errors=True)
+
+
 class Marketplace(unittest.TestCase):
     def test_marketplace_lists_one_plugin_at_dot_plugin(self) -> None:
         body = _json(ROOT / ".claude-plugin" / "marketplace.json")
@@ -1953,6 +1995,34 @@ class ReadmeAndLicense(unittest.TestCase):
 
 
 class Hygiene(unittest.TestCase):
+    def test_the_suite_never_writes_to_the_real_hooks_directory(self) -> None:
+        """The loggers must be pointed somewhere disposable while the tests run.
+
+        Asserted rather than trusted because the leak it guards produced no failure and
+        no error -- just fixture rows accumulating in a file the developer later reads as
+        measurement. A test that pollutes the data used to judge the thing under test is
+        worse than one that simply fails.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import recall
+            from lib import ipc, write
+        finally:
+            sys.path.pop(0)
+        real = os.path.join(os.path.expanduser("~"), ".memvara", ".hooks")
+        self.assertFalse(
+            str(write.LOG).startswith(real),
+            "setUpModule must redirect write.LOG: capture.log is written through a Path "
+            "constant, not through ipc._HOME")
+        self.assertNotEqual(
+            os.path.join(ipc._HOME, ".memvara", ".hooks"), real,
+            "setUpModule must redirect ipc._HOME: log_line() writes recall.log and "
+            "capture.log under it")
+        self.assertFalse(
+            recall.SAMPLE_FLAG.startswith(real),
+            "setUpModule must redirect recall.SAMPLE_FLAG: a flag file that exists on "
+            "the developer's machine turns every main()-driving test into a writer")
+
     def test_no_npx_in_json(self) -> None:
         for path in ROOT.rglob("*.json"):
             if "node_modules" in path.parts:
