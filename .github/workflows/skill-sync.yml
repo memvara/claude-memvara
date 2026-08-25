@@ -66,6 +66,21 @@ jobs:
         if: env.changed == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
+          # A PAT when the org has provisioned one, GITHUB_TOKEN otherwise.
+          #
+          # The default is GITHUB_TOKEN, and on this org GITHUB_TOKEN cannot open a pull
+          # request: the organization pins every repository to read-only workflow
+          # permissions with "Allow GitHub Actions to create and approve pull requests"
+          # off, which is why that box is greyed out in the repository settings rather
+          # than merely unticked. Every scheduled run from 2026-08-21 to 2026-08-25
+          # fetched the skill correctly and then died on the last step with "GitHub
+          # Actions is not permitted to create or approve pull requests".
+          #
+          # A PAT is not GITHUB_TOKEN, so it is not subject to that ceiling, and this
+          # fixes the sync without loosening the policy for every workflow in four
+          # repositories. Falls back so the workflow keeps working unchanged wherever
+          # the policy does allow it.
+          token: ${{ secrets.PLUGIN_SYNC_TOKEN || github.token }}
           commit-message: "chore: sync skill from memvara/memvara@${{ env.sha }}"
           title: "chore: sync skill from memvara/memvara@${{ env.sha }}"
           body: |
