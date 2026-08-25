@@ -424,6 +424,79 @@ def _restates(obj: str, others: "Sequence[str]") -> bool:
     return False
 
 
+#: Capitalised words that carry no identity, so a claim dropping one is not dropping a name.
+#: Deliberately short: every entry is a word this check would otherwise treat as a proper
+#: noun, and a long list is how a guard stops guarding.
+_NOT_NAMES = frozenset((
+    "i", "ok", "no", "yes", "never", "always", "and", "or", "but", "the", "a", "an",
+    "if", "when", "do", "don", "not", "this", "that", "it", "we", "you",
+))
+
+
+def _proper_nouns(text: str) -> "set[str]":
+    """Names the speaker used: capitalised, not sentence-initial, not a common word.
+
+    Sentence-initial words are skipped because English capitalises them regardless, so
+    counting them would make "Always" a name and reject half of every real instruction.
+
+    Returns nothing at all for a script with no case distinction -- Devanagari, CJK, Arabic
+    -- and that is a real answer rather than a pass. `_dropped_entities` treats an empty set
+    as "nothing to compare" and lets the fact through, which is the same conclusion but for
+    a stated reason. This repo has been caught once by a check that silently did nothing and
+    looked like a 55% speedup, so the distinction is written down here and asserted in
+    `test_a_script_without_capitals_is_not_silently_waved_through`.
+    """
+    out = set()
+    for sentence in re.split(r"[.!?\n]+", text):
+        words = re.findall(r"[^\W\d_]+", sentence, re.UNICODE)
+        for position, word in enumerate(words):
+            if position == 0 or len(word) < 2:
+                continue
+            if word.isupper():
+                # An acronym, and an acronym has an expansion. The user wrote "PR" and a
+                # correct memory wrote "pull requests" -- caught by this check in testing
+                # before it could reject a true claim in the wild. A capitalised NAME is
+                # the thing itself and does not get expanded away, which is the difference
+                # this branch turns on. Emphasis capitals ("do NOT") fall out here too.
+                continue
+            if word[:1].isupper() and _name_key(word) not in _NOT_NAMES:
+                out.add(_name_key(word))
+    return out
+
+
+def _name_key(word: str) -> str:
+    """Lowercased and de-pluralised, so `PR` and `PRs` are the same name.
+
+    Without this the guard rejects a *correct* memory: the user writes "PR" and the model
+    writes "PRs", which is ordinary English and would read as a lost name.
+    """
+    lowered = word.lower()
+    return lowered[:-1] if len(lowered) > 2 and lowered.endswith("s") else lowered
+
+
+def _dropped_entities(obj: str, spoken: str) -> "list[str]":
+    """Names the user used that this object does not carry.
+
+    Only for standing instructions, and only against the user's own lines, because that is
+    where the failure was: the user said "do not add **Claude** name in any of the commits,
+    issues and PR in Github ever", the model returned "no attribution of **user** name", and
+    the store kept the second one at confidence 0.70. Nothing caught it. `_fabricated`
+    cannot -- it looks for values in the object that are absent from the turn, and this is
+    the reverse, a name in the turn absent from the object -- and `_value_tokens` would not
+    see "Claude" in any case, since it keeps only tokens carrying a digit or an underscore
+    or written in capitals.
+
+    The reversal is what made it dangerous rather than merely wrong: "user name" matches
+    "who is this **user**", so the paraphrase outranked the sentence it garbled and was the
+    version that reached every session.
+    """
+    wanted = _proper_nouns(spoken)
+    if not wanted:
+        return []
+    have = {_name_key(w) for w in re.findall(r"[^\W\d_]+", obj, re.UNICODE)}
+    return sorted(name for name in wanted if name not in have)
+
+
 class Fact(NamedTuple):
     subject: str
     predicate: str
@@ -487,6 +560,17 @@ def triples(text: str, cwd: "str | None" = None,
         if _fabricated(obj, text):
             dropped.append(f"{predicate}: values absent from the turn {obj!r}")
             continue
+        if memory_type == "procedural":
+            # A standing instruction is the one kind of claim that outranks other claims,
+            # so a garbled one does more than sit there being wrong. Scoped hard --
+            # procedural only, the user's own lines only, names only -- because this is the
+            # one check here that can reject a TRUE memory, and the same preference will be
+            # stated again while a wrong one in the slot silently wins.
+            lost = _dropped_entities(obj, spoken)
+            if lost:
+                dropped.append(
+                    f"{predicate}: the user's words lost {', '.join(lost)} {obj!r}")
+                continue
         if injected and _restates(obj, injected) and not _restates(obj, [spoken]):
             # A note this plugin put in front of the model, handed back as an observation.
             # Writing it re-records the store's own output, which is how one guess becomes
