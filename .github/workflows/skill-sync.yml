@@ -48,8 +48,9 @@ jobs:
           from pathlib import Path
           Path('skill.lock').write_text(
               '# The library commit whose memvara/skills/memvara/ tree this plugin vendors.\\n'
-              '# CI diffs plugin/skills/memvara against that SHA. skill-sync.yml updates this\\n'
-              '# file when it opens a PR.\\n'
+              '# CI diffs plugin/skills/memory against that SHA, allowing exactly one edit: the\\n'
+              '# frontmatter name, which becomes \'memory\' so the skill reads /memvara:memory.\\n'
+              '# skill-sync.yml updates this file when it opens a PR.\\n'
               'repo=memvara/memvara\\n'
               f'sha=$sha\\n'
               'path=memvara/skills/memvara\\n'
