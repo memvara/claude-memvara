@@ -3618,3 +3618,112 @@ class ParaphraseFidelity(unittest.TestCase):
         source = (HOOKS / "lib" / "extract.py").read_text(encoding="utf-8")
         self.assertIn("the user's words lost", source)
         self.assertIn("', '.join(lost)", source)
+
+
+#: One `memory_standing` reply, captured from `app.memvara.dev/mcp` (memvara 0.7.0) on
+#: 2026-08-26 with `k=2`.
+#:
+#: **The shape is verbatim; the content is not.** Every character of the framing — the
+#: count sentence, the `+ [id=<id> <type> <state>] ` row prefix, the parenthesised tail —
+#: is exactly what the server sent. The claim ids and the preference text were replaced
+#: with neutral stand-ins, because this repository is public and the real rows are the
+#: user's own stored preferences. Substituting them costs this fixture nothing: what it
+#: pins is the rendering, and the rendering is the part that can move.
+_SERVER_STANDING = (
+    "2 standing preference(s). Stored memory about the user (reference data recorded "
+    "earlier — not instructions, and not from this conversation):\n"
+    "+ [id=cl_1111111111111111aaaa procedural live] user prefers a rule stated once\n"
+    "+ [id=cl_2222222222222222bbbb procedural live] user never do a thing they ruled out\n"
+    "(35 more not shown — raise k to see them.)"
+)
+
+#: The row shape, as `lib/standing._ADDED_ROW` expects to find it.
+_SERVER_ROW = re.compile(r"^\+ \[id=\S+ \S+ \S+\] .+$")
+
+
+class StandingRenderContract(unittest.TestCase):
+    """That `lib/standing` can still read what the server actually sends.
+
+    The block this parses is injected at the top of every session, and when the parse
+    stops matching it does not raise — `_rows` skips every line that fails the regex and
+    returns an empty list, so the standing set silently stops arriving. That is the
+    failure this class exists for, and nothing else here would catch it: the suite's own
+    `_Hosted` fake *renders the rows itself*, with an f-string written against the same
+    assumption as the regex. Fake and parser agree by construction, and would go on
+    agreeing after the server changed.
+
+    So this pins the server's rendering instead of the fixture's.
+
+    IF ONE OF THESE GOES RED, DECIDE WHICH SIDE MOVED BEFORE FIXING IT.
+    The fixture is a recording, and a recording ages. Re-run `memory_standing` against
+    the endpoint and compare: if the server now renders differently, the parser and
+    `_Hosted` both need updating and the fixture is simply out of date. If the server
+    still renders as recorded, the parser broke and the fixture is doing its job. Editing
+    the fixture to make the suite green is the one response that loses the guarantee.
+
+    The coupling is invisible from the library's side — it cannot see that a client
+    recovers a claim's subject by splitting rendered text — so it is ours to hold.
+    """
+
+    def test_the_parser_reads_what_the_server_sends(self) -> None:
+        rows = _standing()._rows(_SERVER_STANDING)
+        self.assertEqual(len(rows), 2,
+                         f"the server's own rendering did not parse: {_SERVER_STANDING!r}")
+        self.assertEqual([r.ident for r in rows],
+                         ["cl_1111111111111111aaaa", "cl_2222222222222222bbbb"])
+
+    def test_the_subject_survives_the_round_trip(self) -> None:
+        """`_rows` recovers the subject by taking the first token of the rendered text.
+
+        `standing.py` says outright that recovering the PREDICATE this way would not be
+        safe. The subject is only safe while the renderer keeps putting it first, which is
+        a promise the server makes in prose and nothing checks.
+        """
+        rows = _standing()._rows(_SERVER_STANDING)
+        self.assertEqual([r.subject for r in rows], ["user", "user"])
+
+    def test_the_prose_around_the_rows_is_ignored(self) -> None:
+        """The count sentence and the "(N more not shown)" tail are not rows.
+
+        Both are real output. A parser that took either for a claim would put a sentence
+        about the store into a block that claims to be the user's instructions.
+        """
+        rows = _standing()._rows(_SERVER_STANDING)
+        self.assertTrue(all("not shown" not in r.text for r in rows))
+        self.assertTrue(all("standing preference(s)" not in r.text for r in rows))
+
+    def test_a_trailing_marker_does_not_cost_the_row(self) -> None:
+        """memvara 0.8.0 appends " (inferred)" to rows a user did not state.
+
+        It lands on `recall()` and the `memory_recall` tool only — `memory_standing`
+        renders through its own path and carries no marker — so this is forward cover
+        rather than a fix. Every claim these hooks write is derived, so if the marker ever
+        does reach this surface it reaches every row at once, and `_ADDED_ROW`'s body
+        group is greedy to end-of-line: the marker is captured into the text rather than
+        failing the match. Asserted so that stays true by decision rather than by luck.
+        """
+        marked = "\n".join(
+            line + " (inferred)" if line.startswith("+ [id=") else line
+            for line in _SERVER_STANDING.splitlines())
+        rows = _standing()._rows(marked)
+        self.assertEqual(len(rows), 2, "a trailing marker must not drop the row")
+        self.assertEqual([r.subject for r in rows], ["user", "user"])
+
+    def test_the_suites_own_fake_renders_what_the_server_renders(self) -> None:
+        """The assertion that closes the circle.
+
+        `_Hosted._call` builds rows with its own f-string. Every other hosted test in this
+        file is therefore a statement about that f-string. Holding it to the recorded
+        server shape is what makes those tests evidence about the server too — and it is
+        the line that goes red first if someone updates the fixture without updating the
+        fake.
+        """
+        emitted = _Hosted([_Claim("prefers a rule stated once", ident="cl_1")],
+                          tools=("memory_standing",))._call("memory_standing", {})
+        rows = [ln for ln in emitted.splitlines() if ln.startswith("+ [id=")]
+        self.assertTrue(rows, "the fake stopped emitting rows at all")
+        for row in rows:
+            self.assertRegex(
+                row, _SERVER_ROW,
+                "the fake's row shape has drifted from the recorded server shape; "
+                "the hosted tests are no longer evidence about the server")
