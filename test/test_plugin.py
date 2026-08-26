@@ -2423,7 +2423,13 @@ def _tracked(pattern: str) -> "list[pathlib.Path]":
     listed = subprocess.run(
         ["git", "-C", str(ROOT), "ls-files", "-z", pattern],
         check=True, capture_output=True, text=True).stdout
-    return [ROOT / name for name in listed.split("\0") if name]
+    # `ls-files` reports the INDEX, so a file deleted with `rm` rather than `git rm` is
+    # still listed and every caller here reads it immediately. `rglob` could only ever
+    # yield files that exist, so dropping the check would turn an unstaged deletion into
+    # a FileNotFoundError naming a path the developer has already deleted -- which reads
+    # as a stale cache rather than as the unstaged deletion it is.
+    return [path for path in (ROOT / name for name in listed.split("\0") if name)
+            if path.is_file()]
 
 
 class ToolCount(unittest.TestCase):
@@ -2473,13 +2479,18 @@ class ToolCount(unittest.TestCase):
         it passes, which is the whole change.
         """
         intruder = ROOT / "_scan_probe_not_ours.md"
+        self.assertFalse(intruder.exists(), "a previous run left its probe behind")
         intruder.write_text("Ten tools, and this file is not tracked.", encoding="utf-8")
         try:
             self.assertNotIn(intruder, _tracked("*.md"),
                              "an untracked file is not this repository's to answer for")
             ToolCount().test_no_other_count_is_stated_anywhere()
         finally:
-            intruder.unlink()
+            # The probe has to sit under ROOT to reproduce the defect at all, so it is
+            # written into the tree deliberately and removed unconditionally. The
+            # assertion above is the other half: an interrupted run leaves it behind, and
+            # the next run says so instead of quietly overwriting the evidence.
+            intruder.unlink(missing_ok=True)
 
     def test_the_scan_is_not_empty(self) -> None:
         """The load-bearing half, and the one the obvious fix would have broken.
@@ -2493,11 +2504,17 @@ class ToolCount(unittest.TestCase):
         self.assertTrue(_tracked("*.json"), "no json tracked -- the scan covers nothing")
 
     def test_the_scan_holds_no_worktree_paths(self) -> None:
-        """Stated positively about the thing that actually went wrong.
+        """Named because `worktrees` is the word someone greps for when this recurs.
 
-        Named rather than left implied by the two above, because `worktrees` is the
-        specific word that was in the failing path and is what someone greps for when this
-        recurs.
+        **This one cannot catch the defect and says so rather than implying otherwise.**
+        Run from a worktree -- which is everywhere development happens, and CI -- there
+        are no worktrees below `ROOT`, so even a plain `rglob` returns no worktree paths
+        and this passes under the exact bug it names. Confirmed by mutating `_tracked`
+        back to `rglob`: only `test_the_scan_never_reads_a_file_this_repository_does_not_track`
+        went red.
+
+        It earns its place from the main checkout and as a name in the file. The test that
+        does the work everywhere is the intruder one above.
         """
         for pattern in ("*.md", "*.json"):
             for path in _tracked(pattern):
