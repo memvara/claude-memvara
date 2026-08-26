@@ -83,6 +83,16 @@ STANDING_HEADER = (
 )
 
 
+def _why(exc: "BaseException") -> str:
+    """Why a section is absent, in words, or `""` when there is nothing worth saying.
+
+    Duck-typed on `code` for the same reason `lib.fast` is: this hook must not import
+    `lib.hosted` merely to name a failure, and an exception that carries no code answers
+    with nothing rather than with a guess.
+    """
+    return "notes unavailable (quota)" if getattr(exc, "code", "") == "quota_exhausted" else ""
+
+
 def _local_binding(store: object) -> str:
     """The binding line from a library handle, or '' if it cannot be read.
 
@@ -151,6 +161,9 @@ def main() -> int:
     # backend answers -- local library first, hosted second -- which is exactly what this
     # hook needs and what it used to be missing.
     hosted = close is not None
+    #: What a section could not be fetched for, in words. Set before the `try` so that
+    #: every path to the banner below has it, including the ones that leave early.
+    missing = ""
     try:
         parts = []
         binding = _hosted_binding(store) if hosted else _local_binding(store)
@@ -175,8 +188,14 @@ def main() -> int:
         try:
             notes = str(store.recall(QUERY, k=K, budget=BUDGET, header=HEADER,
                                      include_episodes=True) or "")
-        except Exception:
-            notes = ""
+        except Exception as exc:
+            # "Empty" and "could not ask" are not the same block, and collapsing them here
+            # was worse than the same bug in `recall.py`: that one at least said it had
+            # failed. This one dropped a whole section and still announced a count, so the
+            # banner read as a full session over a block that was short a category of
+            # memory. Measured on a spent quota: three sections and 15,324 characters
+            # became two and 13,541, with the banner unchanged.
+            notes, missing = "", _why(exc)
         if notes.strip():
             parts.append(notes.rstrip())
     finally:
@@ -184,13 +203,19 @@ def main() -> int:
             close()
 
     if not parts:
-        emit_json({"systemMessage": status("nothing stored yet")})
+        # "Nothing stored yet" is a claim about the store's contents. Only make it when
+        # every section came back empty rather than unavailable -- otherwise a store that
+        # is merely unreachable is reported as one that is empty, and nobody investigates
+        # an empty store.
+        emit_json({"systemMessage": status(missing or "nothing stored yet")})
         return 0
 
     count = sum(1 for line in "\n\n".join(parts).splitlines() if line.startswith("- "))
+    opened = (f"session opened with {plural(count)}" if count else "session opened")
+    # A count is a claim about what arrived. Saying it while a section is missing is the
+    # failure this hook had; naming what is absent is the whole fix.
     emit_json({
-        "systemMessage": (status(f"session opened with {plural(count)}")
-                          if count else status("session opened")),
+        "systemMessage": status(f"{opened} · {missing}" if missing else opened),
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": "\n\n".join(parts),

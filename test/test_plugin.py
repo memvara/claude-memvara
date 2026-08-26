@@ -807,7 +807,8 @@ class Hooks(unittest.TestCase):
             # episode escalation, which makes a second call per turn and puts turn 0's
             # retry where the test expects turn 1's query.
             asked.append(query)
-            return f"{recall.HEADER}\n- memory {len(asked)}a\n- memory {len(asked)}b", True
+            # Three slots since the reason rides along: (text, ok, why).
+            return f"{recall.HEADER}\n- memory {len(asked)}a\n- memory {len(asked)}b", True, ""
 
         recall.fast_recall = fake_recall
         try:
@@ -891,7 +892,7 @@ class Hooks(unittest.TestCase):
         ranking and has no other symptom.
         """
         source = (HOOKS / "recall.py").read_text(encoding="utf-8")
-        first = source.index("block, ok = fast_recall(")
+        first = source.index("block, ok, why = fast_recall(")
         escalation = source.index("include_episodes=True")
         self.assertLess(first, escalation, "the plain call must come first")
         self.assertIn("if len(fresh) < THIN:", source,
@@ -3439,6 +3440,252 @@ class StandingDelta(unittest.TestCase):
         block = s.standing_block(Garbage(), hosted=True, budget=4000, header=HEAD,
                                  fallback=lambda: "FALLBACK:\n- something")
         self.assertIn("something", block, "an unreadable reply falls through, never raises")
+
+
+class QuotaRefusal(unittest.TestCase):
+    """Group I — a refusal the server explained is not a failure to reach it.
+
+    Measured, not imagined. `memory_recall` began answering HTTP 402 with the metric, the
+    limit, how much was used and the instant it resets, and the person at the terminal was
+    told `recall failed — see capture.log`. Every word the server sent was discarded across
+    three frames, and the log it named has never been written by this hook.
+
+    `test_recall_distinguishes_nothing_found_from_could_not_ask` states the rule these
+    tests extend: three outcomes, three messages, "the words have to differ or the failure
+    stays invisible". A spent allowance is a fifth outcome. It is not "could not ask" —
+    the store answered, promptly, with a reason — and retrying is exactly what will not
+    help, which is what the old wording invited.
+    """
+
+    REFUSAL = json.dumps({"error": {
+        "code": "quota_exhausted",
+        "message": "the 'retrieval.query' allowance for this project is spent",
+        "detail": {"metric": "retrieval.query", "limit": 2000, "used": 2000,
+                   "resets_at": "2026-09-01T00:00:00+00:00",
+                   "reason": "over_plan_allowance"}}}).encode()
+
+    def _hosted(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import hosted
+            return hosted
+        finally:
+            sys.path.pop(0)
+
+    def _recall(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+            return importlib.import_module("recall")
+        finally:
+            sys.path.pop(0)
+
+    def _drive(self, recall, fake):
+        """Run `main()` with recall stubbed, and return the emitted reply.
+
+        Drives the real `main()` rather than asserting on `_quota_line` alone: the bug was
+        never in the wording, it was that the wording never reached the banner.
+        """
+        import io, json as _json, contextlib
+        was, recall.fast_recall = recall.fast_recall, fake
+        stdin, out = sys.stdin, io.StringIO()
+        sys.stdin = io.StringIO(_json.dumps({"prompt": "what do you know about me",
+                                             "session_id": "quota-test"}))
+        try:
+            with contextlib.redirect_stdout(out):
+                recall.main()
+        finally:
+            recall.fast_recall, sys.stdin = was, stdin
+        return _json.loads(out.getvalue().strip().splitlines()[-1])
+
+    def test_the_refusal_keeps_what_the_server_said(self) -> None:
+        """`code` and `detail` are the whole point: without them the banner has nothing."""
+        hosted = self._hosted()
+        err = hosted._refusal(402, self.REFUSAL)
+        self.assertEqual(err.status, 402)
+        self.assertEqual(err.code, "quota_exhausted")
+        self.assertEqual(err.detail["resets_at"], "2026-09-01T00:00:00+00:00")
+        self.assertIn("allowance", str(err))
+
+    def test_a_body_that_will_not_parse_is_not_itself_an_error(self) -> None:
+        """Plenty of statuses arrive with no body, or with HTML from something in front of
+        the API. The status alone still has to produce a usable error.
+        """
+        hosted = self._hosted()
+        err = hosted._refusal(502, b"<html>bad gateway</html>")
+        self.assertEqual(err.status, 502)
+        self.assertEqual(err.code, "")
+        self.assertEqual(err.detail, {})
+        self.assertIn("502", str(err))
+
+    def test_only_a_stale_session_earns_a_second_round_trip(self) -> None:
+        """A refusal the server will repeat must not be replayed.
+
+        Any non-200 used to tear down a healthy session, shake hands and replay the call,
+        so a 402 cost two round trips per prompt and four on the episode-escalation path.
+        401 and 404 stay on that path because they are the statuses that actually mean the
+        session id is not one the server knows — `test_a_stale_session_recovers` scripts a
+        404 and must keep passing.
+        """
+        hosted = self._hosted()
+        self.assertIn(401, hosted._STALE_SESSION)
+        self.assertIn(404, hosted._STALE_SESSION)
+        self.assertNotIn(402, hosted._STALE_SESSION)
+        self.assertNotIn(500, hosted._STALE_SESSION)
+
+    def test_the_reason_reaches_the_caller_without_importing_the_client(self) -> None:
+        """`lib.fast` runs on every prompt against a ~30ms budget and must not import
+        `lib.hosted`, which pulls in `ssl` and `http.client`. So the reason is read off the
+        exception by attribute, not by class.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import fast
+        finally:
+            sys.path.pop(0)
+        # `fast` does import `hosted`, deliberately, INSIDE the function and only on the
+        # fallback path -- that is the design. What must not happen is paying for it at
+        # module scope on every prompt, so the check is the indentation, not the absence.
+        for line in (HOOKS / "lib" / "fast.py").read_text().splitlines():
+            if line.startswith("from .hosted") or line.startswith("import hosted"):
+                self.fail(f"module-scope import of hosted: {line!r}")
+
+        class Spent(Exception):
+            code = "quota_exhausted"
+            detail = {"resets_at": "2026-09-01T00:00:00+00:00"}
+
+        self.assertEqual(fast._reason(Spent()), "quota:2026-09-01")
+        self.assertEqual(fast._reason(Exception("something else")), "")
+
+    def test_the_banner_names_the_quota_and_when_it_returns(self) -> None:
+        """"Spent" alone reads as "broken, try later", and trying later is the one thing
+        that cannot work. The date is what turns it into something a person can act on.
+        """
+        recall = self._recall()
+        self.assertEqual(recall._quota_line("quota:2026-09-01"),
+                         "retrieval quota spent — resets 1 Sep")
+        self.assertEqual(recall._quota_line("quota"), "retrieval quota spent")
+        self.assertEqual(recall._quota_line(""), "")
+
+    def test_a_malformed_date_still_says_the_quota_is_spent(self) -> None:
+        """The date is the bonus half. Losing it must not lose the message."""
+        recall = self._recall()
+        for junk in ("quota:not-a-date", "quota:2026-13-01", "quota:2026"):
+            self.assertEqual(recall._quota_line(junk), "retrieval quota spent")
+
+    def test_a_spent_quota_is_not_reported_as_could_not_ask(self) -> None:
+        """The whole point, end to end through `main()`."""
+        recall = self._recall()
+
+        def refused(query, **kw):
+            return "", False, "quota:2026-09-01"
+
+        out = self._drive(recall, refused)
+        self.assertIn("retrieval quota spent", out["systemMessage"])
+        self.assertNotIn("recall failed", out["systemMessage"])
+        self.assertNotIn("capture.log", out["systemMessage"])
+
+    def test_every_other_failure_still_says_recall_failed(self) -> None:
+        """The generic branch has to survive, or this trades one blind spot for another."""
+        recall = self._recall()
+
+        def broke(query, **kw):
+            return "", False, ""
+
+        self.assertIn("recall failed", self._drive(recall, broke)["systemMessage"])
+
+    def test_the_refusal_survives_the_call_and_not_only_the_decoder(self) -> None:
+        """Drives `_rpc` against a scripted 402, because testing `_refusal` alone proved
+        nothing about whether anything calls it.
+
+        Written after a sabotage run: replacing `raise _refusal(...)` with `return None` --
+        restoring the exact bug this change exists to fix -- left every other test in this
+        class green. A helper that works and is never reached is the shape this repository
+        keeps finding.
+        """
+        hosted = self._hosted()
+
+        class Response:
+            status = 402
+
+            def getheader(self, _name):
+                return None
+
+            def read(self):
+                return QuotaRefusal.REFUSAL
+
+        class Conn:
+            def request(self, *a, **kw):
+                pass
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                pass
+
+        client = hosted.HostedRecall("key")
+        client._connect = lambda: Conn()
+        client._session = "stateless"          # so the handshake is not what refuses
+        with self.assertRaises(hosted.HostedError) as caught:
+            client.recall("anything", k=1)
+        self.assertEqual(caught.exception.code, "quota_exhausted")
+        self.assertEqual(caught.exception.status, 402)
+        self.assertEqual(caught.exception.detail["limit"], 2000)
+
+    def test_fast_recall_passes_the_reason_out_and_not_just_computes_it(self) -> None:
+        """Drives `fast.recall` with a client that refuses, for the same reason.
+
+        Sabotaging the hand-off -- `return "", False, _reason(exc)` back to
+        `return "", False, ""` -- also left this class green, because the only test of the
+        reason called `_reason` directly. The wiring is the thing that broke in production,
+        so the wiring is what a guard has to exercise.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import fast
+        finally:
+            sys.path.pop(0)
+
+        class Spent(Exception):
+            code = "quota_exhausted"
+            detail = {"resets_at": "2026-09-01T00:00:00+00:00"}
+
+        class Client:
+            def recall(self, *a, **kw):
+                raise Spent("spent")
+
+            def close(self):
+                pass
+
+        import lib.open as opener
+        was_store, was_hosted = opener.open_store, None
+        opener.open_store = lambda: None
+        import lib.hosted as hosted_mod
+        was_hosted, hosted_mod.open_hosted = hosted_mod.open_hosted, lambda: Client()
+        try:
+            text, ok, why = fast.recall("anything", spawn=False)
+        finally:
+            opener.open_store, hosted_mod.open_hosted = was_store, was_hosted
+        self.assertEqual((text, ok), ("", False))
+        self.assertEqual(why, "quota:2026-09-01", "the reason must reach the caller")
+
+    def test_the_banner_no_longer_names_a_log_it_never_writes(self) -> None:
+        """`capture.log` is written by `capture.py` alone. Sending a reader there to learn
+        why recall failed sends them somewhere that has never held the answer.
+        """
+        recall = self._recall()
+        for fake in (lambda q, **kw: ("", False, "quota:2026-09-01"),
+                     lambda q, **kw: ("", False, "")):
+            self.assertNotIn("capture.log", self._drive(recall, fake)["systemMessage"])
+
+    def test_a_failure_writes_a_line_where_a_success_would(self) -> None:
+        """It wrote nowhere at all. `recall.log` recorded successes and every failure path
+        returned above it, so the one event worth investigating left no trace.
+        """
+        source = (HOOKS / "recall.py").read_text(encoding="utf-8")
+        banner = source[source.index("if not ok:"):source.index("header, bullets = _split")]
+        self.assertIn('log_line("recall"', banner)
 
 
 class StandingProvenance(unittest.TestCase):

@@ -55,6 +55,36 @@ TIMEOUT_SEC = 6.0
 PROTOCOL_VERSION = "2025-06-18"
 
 
+#: Statuses that mean "the session id you are holding is not one I know" -- a server that
+#: restarted, or a session that aged out. These and only these earn a re-handshake: the
+#: call is replayed once and usually succeeds. Every other non-200 is a refusal the server
+#: will give again, so replaying it spends a second round trip to learn nothing.
+_STALE_SESSION = frozenset((401, 404))
+
+
+def _refusal(status: int, raw: bytes) -> "HostedError":
+    """A `HostedError` carrying whatever the server said about why it refused.
+
+    The API answers a refusal with `{"error": {"code": ..., "message": ..., "detail": ...}}`
+    and this is the only frame that still holds it. A body that will not parse is not an
+    error here -- plenty of statuses arrive with none, or with HTML from something in
+    front of the API -- so the status alone is the fallback.
+    """
+    code, message, detail = "", "", {}
+    try:
+        body = json.loads(raw.decode("utf-8"))
+        error = body.get("error") or {}
+        code = str(error.get("code") or "")
+        message = str(error.get("message") or "")
+        detail = error.get("detail") or {}
+    except Exception:
+        pass
+    if not isinstance(detail, dict):
+        detail = {}
+    return HostedError(message or f"the endpoint refused with HTTP {status}",
+                       status=status, code=code, detail=detail)
+
+
 class HostedError(RuntimeError):
     """The endpoint could not answer. Distinct from answering with nothing.
 
@@ -62,7 +92,21 @@ class HostedError(RuntimeError):
     different questions. A caller that cannot tell them apart reports an unreachable store
     as an empty one, which is the failure this file spent thirty minutes at a time
     demonstrating.
+
+    `code` and `detail` carry the server's own account of the refusal when it sent one.
+    They were thrown away until a quota-exhausted account spent a day reporting "recall
+    failed -- see capture.log": the server had said which allowance, how much of it, and
+    when it resets, and every word was discarded one frame below the banner that needed
+    it. `code` is the machine token (`quota_exhausted`); `detail` is the object beside it.
+    Both are `None` when the failure was transport-level and there was nothing to read.
     """
+
+    def __init__(self, message: str, *, status: "int | None" = None,
+                 code: str = "", detail: "dict | None" = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.detail = detail or {}
 
 
 def credentials() -> "dict | None":
@@ -162,12 +206,21 @@ class HostedRecall:
             # terminates because the retry runs with `retry=False`, and because the
             # `initialize` call inside `_ensure_session` has no session of its own to
             # invalidate.
-            if retry and self._session:
+            #
+            # Only for the statuses that mean "this session is not who you think it is".
+            # It used to fire on ANY non-200, which made a 402 cost two round trips per
+            # prompt -- tear down a healthy session, shake hands, replay, get 402 again --
+            # and four on the episode-escalation path. A refusal the server will repeat is
+            # not a session problem, and retrying it is only slower.
+            if response.status in _STALE_SESSION and retry and self._session:
                 self._session = None
                 self.close()
                 if self._ensure_session():
                     return self._rpc(method, params, retry=False)
-            return None
+            # The body is the whole point of a refusal and this is the only frame that
+            # still has it. Hand it back so `_call` can raise something a person can act
+            # on rather than "no reply".
+            raise _refusal(response.status, raw)
         return _decode(raw)
 
     def close(self) -> None:
@@ -193,7 +246,12 @@ class HostedRecall:
         # Some servers issue no session id and are stateless. Treat a successful
         # initialize as sufficient rather than requiring the header.
         self._session = self._session or "stateless"
-        self._rpc("notifications/initialized")
+        try:
+            self._rpc("notifications/initialized")
+        except HostedError:
+            # A notification has no reply worth having and the session is already open.
+            # Failing here would throw away a handshake that succeeded.
+            pass
         return True
 
     def accepts(self, tool: str, argument: str) -> bool:
@@ -210,18 +268,23 @@ class HostedRecall:
         """
         if self._schemas is None:
             self._schemas = {}
-            if self._ensure_session():
-                reply = self._rpc("tools/list", {})
-                result = reply.get("result") if isinstance(reply, dict) else None
-                listed = result.get("tools") if isinstance(result, dict) else None
-                for entry in listed if isinstance(listed, list) else []:
-                    if not isinstance(entry, dict):
-                        continue
-                    schema = entry.get("inputSchema")
-                    props = schema.get("properties") if isinstance(schema, dict) else None
-                    name = entry.get("name")
-                    if isinstance(name, str) and isinstance(props, dict):
-                        self._schemas[name] = set(props)
+            try:
+                reply = self._rpc("tools/list", {}) if self._ensure_session() else None
+            except HostedError:
+                # Stated above: a probe that fails answers False. A refusal here costs the
+                # provenance field and keeps the fact, which is the right way round -- and
+                # is why this catch cannot be narrowed to the transport case.
+                reply = None
+            result = reply.get("result") if isinstance(reply, dict) else None
+            listed = result.get("tools") if isinstance(result, dict) else None
+            for entry in listed if isinstance(listed, list) else []:
+                if not isinstance(entry, dict):
+                    continue
+                schema = entry.get("inputSchema")
+                props = schema.get("properties") if isinstance(schema, dict) else None
+                name = entry.get("name")
+                if isinstance(name, str) and isinstance(props, dict):
+                    self._schemas[name] = set(props)
         return argument in self._schemas.get(tool, set())
 
     def _call(self, tool: str, arguments: dict) -> str:
