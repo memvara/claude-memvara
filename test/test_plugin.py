@@ -3011,7 +3011,8 @@ class _Claim:
     """A local-library claim, with only what `lib.standing` reads off one."""
 
     def __init__(self, text, *, confidence=1.0, recorded="2026-01-01T00:00:00",
-                 ident="cl_0", kind="procedural", live=True, subject="user"):
+                 ident="cl_0", kind="procedural", live=True, subject="user",
+                 derivation="USER", extractor="api"):
         # A real claim's `text` opens with its subject -- "user prefers ...",
         # "memvara_cloud deploy_gotcha ..." -- and the hosted route recovers the subject by
         # reading the first token of exactly that string. A fixture whose text does not
@@ -3021,6 +3022,11 @@ class _Claim:
         self.text = text if text.startswith(f"{subject} ") else f"{subject} {text}"
         self.confidence, self.id = confidence, ident
         self.memory_type, self._live = kind, live
+        # Defaults say "the user stated this", which is what an `api` caller writing a
+        # triple actually produces. A fixture with no provenance at all is not a claim
+        # `get_all` ever returns, and defaulting to the unmarked case keeps every test
+        # written before the marker existed meaning what it meant.
+        self.derivation, self.extractor = derivation, extractor
         self.recorded_at = datetime.datetime.fromisoformat(recorded)
 
     def is_live(self):
@@ -3062,7 +3068,9 @@ class _Hosted:
             raise RuntimeError(f"{tool} is down")
         if tool not in self._tools:
             raise RuntimeError(f"no such tool {tool}")
-        rows = [f"+ [id={c.id} {c.memory_type} {'live' if c.is_live() else 'ended'}] {c.text}"
+        rows = [f"+ [id={c.id} {c.memory_type} {'live' if c.is_live() else 'ended'}"
+                + (" inferred" if getattr(c, "marked", False) else "")
+                + f"] {c.text}"
                 for c in self._claims]
         return ("4 arrived and 1 left.\nBelieved now, not believed then:\n"
                 + "\n".join(rows)
@@ -3431,6 +3439,204 @@ class StandingDelta(unittest.TestCase):
         block = s.standing_block(Garbage(), hosted=True, budget=4000, header=HEAD,
                                  fallback=lambda: "FALLBACK:\n- something")
         self.assertIn("something", block, "an unreadable reply falls through, never raises")
+
+
+class StandingProvenance(unittest.TestCase):
+    """Group H — the block says which rows a machine wrote, and never guesses.
+
+    `memory_standing` already puts stated rules above inferred ones, by confidence. That
+    is ordering, and ordering tells a reader the list is sorted without telling them WHERE
+    the boundary falls: in a twenty-two row block, row twelve is unknowable. The header
+    saying "some were inferred" is the block-level qualifier that either discounts every
+    row or is ignored for all of them — the argument the library accepted when `recall()`
+    grew a per-row marker, and true here for the same reason.
+
+    The rule is the library's, restated rather than imported: a `derivation` other than
+    USER is machine extraction, and USER with an `extractor` other than "api" is a
+    component naming itself — which is the case that bites, because `remember()` stamps
+    USER whatever called it.
+    """
+
+    def test_a_decisive_extractor_survives_an_unreadable_derivation(self) -> None:
+        """Absent information means BOTH fields absent, not either.
+
+        An earlier version returned early when `derivation` could not be read, discarding
+        an `extractor` that named a machine outright. A Claim shape that stopped exposing
+        `derivation` would then have silently unmarked every hook write — the failure this
+        module exists for, arriving through the guard against it.
+        """
+        s = _standing()
+        note = _Claim("user prefers spaces", derivation=None,
+                      extractor="claude-code-hook")
+        block = s.standing_block(_Local([note]), hosted=False, budget=4000, header=HEAD,
+                                 fallback=lambda: "")
+        self.assertIn("(inferred)", block)
+
+    def test_the_routes_still_agree_once_the_server_marks(self) -> None:
+        """The byte-for-byte invariant, asserted on a claim both routes CAN classify.
+
+        `test_local_and_hosted_agree_byte_for_byte` compares an unmarked claim, and both
+        fixtures produce unmarked rows by construction, so it agrees whatever the marker
+        does — it cannot see a divergence. This pins the case that matters: a derived
+        claim, against a server that marks, must render identically on both routes.
+
+        Until the library marks `_delta_lines` the two DO diverge for a derived claim, and
+        `test_the_local_route_is_ahead_of_a_server_that_does_not_mark` states that
+        outright rather than leaving it for someone to find.
+        """
+        s = _standing()
+        mined = _Claim("user prefers spaces", ident="cl_2", derivation="USER",
+                       extractor="claude-code-hook")
+        mined.marked = True
+        local = s.standing_block(_Local([mined]), hosted=False, budget=4000, header=HEAD,
+                                 fallback=lambda: "")
+        hosted = s.standing_block(_Hosted([mined]), hosted=True, budget=4000, header=HEAD,
+                                  fallback=lambda: "")
+        self.assertEqual(local, hosted)
+        self.assertIn("(inferred)", local)
+
+    def test_the_local_route_is_ahead_of_a_server_that_does_not_mark(self) -> None:
+        """A known, bounded divergence, written down rather than discovered.
+
+        `StandingRoutes` requires every route to return the same text. Against a server
+        that has not learned the marker, a local handle classifies a claim the server will
+        not, so the two differ for derived claims — local is strictly ahead, never wrong.
+
+        Asserted so it is deliberate and so it has a visible end: when the library marks
+        `_delta_lines`, this test goes red and should be deleted, not adjusted. Suppressing
+        the local marker to restore symmetry was the alternative and is worse — it makes
+        the plugin report less than it knows, to match a server that is behind.
+        """
+        s = _standing()
+        mined = _Claim("user prefers spaces", ident="cl_2", derivation="USER",
+                       extractor="claude-code-hook")  # note: no `marked`, so the fake
+        local = s.standing_block(_Local([mined]), hosted=False, budget=4000, header=HEAD,
+                                 fallback=lambda: "")   # server renders no marker
+        hosted = s.standing_block(_Hosted([mined]), hosted=True, budget=4000, header=HEAD,
+                                  fallback=lambda: "")
+        self.assertNotEqual(local, hosted, "if these now agree, the server marks — "
+                                           "delete this test rather than adjusting it")
+        self.assertIn("(inferred)", local)
+        self.assertNotIn("(inferred)", hosted)
+
+    def test_a_hook_written_note_is_marked_and_a_stated_one_is_not(self) -> None:
+        """Both directions, because a marker on everything is as useless as none."""
+        s = _standing()
+        stated = _Claim("user prefers tabs", ident="cl_1",
+                        derivation="USER", extractor="api")
+        mined = _Claim("user prefers spaces", ident="cl_2",
+                       derivation="USER", extractor="claude-code-hook")
+        block = s.standing_block(_Local([stated, mined]), hosted=False, budget=4000,
+                                 header=HEAD, fallback=lambda: "")
+        self.assertIn("user prefers spaces (inferred)", block)
+        self.assertIn("user prefers tabs\n", block + "\n")
+        self.assertNotIn("user prefers tabs (inferred)", block)
+
+    def test_a_derivation_that_is_not_user_is_marked_whatever_the_extractor(self) -> None:
+        """The obvious half. Fast-path and model extraction both land here."""
+        s = _standing()
+        note = _Claim("user prefers pytest", derivation="FAST_PATH", extractor="fast/v1")
+        block = s.standing_block(_Local([note]), hosted=False, budget=4000, header=HEAD,
+                                 fallback=lambda: "")
+        self.assertIn("(inferred)", block)
+
+    def test_an_enum_derivation_is_read_by_name(self) -> None:
+        """The library ships an enum; the fixtures use strings. Both must work, since the
+        local route is handed whatever `get_all()` returns.
+        """
+        s = _standing()
+
+        class _Derivation:
+            name = "USER"
+
+        note = _Claim("user prefers vim", derivation=_Derivation(), extractor="api")
+        block = s.standing_block(_Local([note]), hosted=False, budget=4000, header=HEAD,
+                                 fallback=lambda: "")
+        self.assertNotIn("(inferred)", block)
+
+    def test_unknown_provenance_is_not_marked(self) -> None:
+        """A route that cannot tell must not imply a machine wrote it.
+
+        The marker is a warning. Inventing one from missing data is worse than omitting
+        it, because a reader who sees it on a rule the user really did state learns to
+        ignore the marker everywhere.
+        """
+        s = _standing()
+        note = _Claim("user prefers emacs", derivation=None, extractor="")
+        block = s.standing_block(_Local([note]), hosted=False, budget=4000, header=HEAD,
+                                 fallback=lambda: "")
+        self.assertNotIn("(inferred)", block)
+
+    def test_the_hosted_route_reads_the_marker_off_the_row(self) -> None:
+        """Routes 2 and 3 render server-side; the plugin only parses. So the marker has
+        to survive the bracket rather than be recomputed, and this is the half that will
+        start firing the day the server emits it.
+        """
+        s = _standing()
+        mined = _Claim("user prefers spaces", ident="cl_2")
+        mined.marked = True
+        block = s.standing_block(_Hosted([mined]), hosted=True, budget=4000, header=HEAD,
+                                 fallback=lambda: "")
+        self.assertIn("user prefers spaces (inferred)", block)
+
+    def test_an_unknown_bracket_field_never_silently_drops_the_row(self) -> None:
+        """The reason `_ADDED_ROW` does not pin a field count, and the whole point of
+        shipping this before the server changes.
+
+        The old pattern required exactly `[id=X type state]`. A fourth field does not make
+        it fail loudly — `_rows` skips what does not match — so on the day the server
+        marks a row, every MARKED row stops parsing and the block quietly loses exactly
+        the machine-written claims while still looking whole. Silently losing the rows a
+        reader most needs to see is worse than never marking them.
+        """
+        s = _standing()
+        note = _Claim("user prefers spaces", ident="cl_2")
+        note.marked = True
+        rows = _Hosted([note])._call("memory_since", {})
+        self.assertIn("inferred]", rows, "the fixture must produce a four-field bracket")
+        block = s.standing_block(_Hosted([note]), hosted=True, budget=4000, header=HEAD,
+                                 fallback=lambda: "")
+        self.assertIn("user prefers spaces", block,
+                      "a bracket field this plugin does not know must not lose the row")
+
+    def test_a_field_this_plugin_does_not_know_at_all_is_tolerated(self) -> None:
+        """Not only `inferred`. The next field the server adds must also pass through,
+        or this fix is a one-off and the next one repeats the incident.
+        """
+        s = _standing()
+        raw = ("Believed now, not believed then:\n"
+               "+ [id=cl_9 procedural live pinned reviewed] user prefers ninja\n")
+        notes = s._rows(raw)
+        self.assertEqual([n.text for n in notes], ["user prefers ninja"])
+        self.assertFalse(notes[0].inferred, "an unrelated field is not the marker")
+
+    def test_an_empty_extractor_is_unmarked_like_api(self) -> None:
+        """The library's rule is `extractor in ("", "api")`, not `== "api"`.
+
+        A claim written before `extractor` existed, or by any caller that omits it, carries
+        the empty string and was stated rather than derived. The natural prose — "marked
+        unless the extractor is api" — silently marks all of them. Nothing in the store
+        carries an empty extractor today, so only a test keeps this from drifting into the
+        obvious-looking comparison.
+        """
+        s = _standing()
+        note = _Claim("user prefers zsh", derivation="USER", extractor="")
+        block = s.standing_block(_Local([note]), hosted=False, budget=4000, header=HEAD,
+                                 fallback=lambda: "")
+        self.assertNotIn("(inferred)", block)
+
+    def test_the_extractor_name_is_never_rendered(self) -> None:
+        """`extractor` is caller-supplied through `memory_remember`, so printing it puts
+        caller text into a model's context and obliges this renderer to flatten it
+        forever. The library states there is no such path today; this keeps it that way.
+        """
+        s = _standing()
+        note = _Claim("user prefers spaces", derivation="USER",
+                      extractor="claude-code-hook")
+        block = s.standing_block(_Local([note]), hosted=False, budget=4000, header=HEAD,
+                                 fallback=lambda: "")
+        self.assertIn("(inferred)", block)
+        self.assertNotIn("claude-code-hook", block)
 
 
 class StandingStaleness(unittest.TestCase):

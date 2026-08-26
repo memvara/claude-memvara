@@ -47,7 +47,23 @@ from typing import Any, Callable, NamedTuple
 #: re-assert every preference the user has ever withdrawn. `_from_since` stops reading at
 #: the second header for that reason, and `test_a_withdrawn_rule_never_returns_through_the
 #: _delta` is what keeps it stopping.
-_ADDED_ROW = re.compile(r"^\+\s+\[id=(\S+)\s+(\S+)\s+(\S+)\]\s+(.+)$")
+#: Deliberately open about how many fields the bracket holds. It pinned exactly three --
+#: `[id=X type state]` -- and the server is free to add a fourth: the `(inferred)` marker
+#: is the one arriving. A fixed count does not fail loudly on a fourth, it fails
+#: SILENTLY, because `_rows` skips what does not match: the day the server marks a row,
+#: every marked row stops parsing and the block quietly loses exactly the machine-written
+#: claims while still looking whole. Matching the whole bracket and reading it as a set
+#: costs nothing and removes that entirely.
+_ADDED_ROW = re.compile(r"^\+\s+\[id=(\S+)([^\]]*)\]\s+(.+)$")
+
+#: The server's word for "a machine derived this". Matched as a bracket field.
+_INFERRED = "inferred"
+
+#: What a marked row ends with. The library's own spelling, so a reader who has seen one
+#: block has seen both. The extractor's NAME is deliberately never rendered here or
+#: upstream: it is caller-supplied through `memory_remember`, so printing it would put
+#: caller text into a model's context and oblige every renderer to flatten it forever.
+MARKER = " (inferred)"
 
 #: The line that opens the half we must not read.
 _GONE_HEADER = "Believed then, not believed now"
@@ -74,6 +90,10 @@ class Note(NamedTuple):
     recorded: str
     ident: str
     subject: str = ""
+    #: True when a machine derived this rather than the user stating it. Defaults False
+    #: because a route that cannot tell must not imply a human said it -- the marker is a
+    #: warning, and inventing one where none is known is worse than omitting it.
+    inferred: bool = False
 
 
 def _flatten(text: str) -> str:
@@ -120,6 +140,45 @@ def _mine(subject: str, cwd: str) -> bool:
     return bool(cwd) and subject == f"project:{cwd}"
 
 
+def _machine_wrote(claim: Any) -> bool:
+    """Whether a machine derived this claim rather than the user stating it.
+
+    The library's rule, restated rather than imported, because this runs on the local
+    route where the caller already holds `Claim` objects and importing `memvara` to read
+    one enum costs ~95ms on a path that has a session-start budget.
+
+    Two things count as derived and the second is the one that matters. A `derivation`
+    other than USER is machine extraction and is obvious. But `remember()` stamps USER
+    whatever called it, so a capture hook mining an assistant's own prose gets USER too --
+    which is the incident this whole module exists for. `extractor` separates them.
+
+    **The unmarked set is the tuple `("", "api")`, not `== "api"`.** Stated that way round
+    deliberately: the natural prose is "marked unless the extractor is api", and that
+    formulation silently marks every claim written before `extractor` existed or by any
+    caller that omits it. Two of us restated this rule from prose on the same afternoon
+    and got it wrong in different directions, which is the argument for writing the tuple
+    down rather than a sentence about it.
+
+    Unknown reads as NOT inferred, deliberately. A claim this cannot classify gets no
+    marker rather than a wrong one, since a warning invented from missing data is worse
+    than an absent warning.
+
+    **But an extractor naming a machine is not missing data.** An earlier version returned
+    early on an unreadable `derivation`, which threw away a decisive `extractor` -- a
+    component naming itself as the deriver is the whole case this exists to catch, and a
+    Claim shape that stopped exposing `derivation` would have silently unmarked every hook
+    write. Absent information means both fields absent.
+    """
+    derivation = getattr(claim, "derivation", None)
+    name = str(getattr(derivation, "name", derivation) or "").upper()
+    extractor = str(getattr(claim, "extractor", "") or "")
+    if extractor and extractor != "api":
+        return True
+    if not name:
+        return False
+    return not (name == "USER" and extractor in ("", "api"))
+
+
 def _from_local(store: Any) -> "list[Note] | None":
     """Every live procedural claim from a local library handle, or None if this is not one.
 
@@ -150,6 +209,7 @@ def _from_local(store: Any) -> "list[Note] | None":
             recorded=recorded.isoformat() if hasattr(recorded, "isoformat") else "",
             ident=str(getattr(claim, "id", "")),
             subject=str(getattr(claim, "subject", "")),
+            inferred=_machine_wrote(claim),
         ))
     return out
 
@@ -163,8 +223,8 @@ def _rows(text: str) -> "list[Note]":
         found = _ADDED_ROW.match(line.strip())
         if not found:
             continue
-        ident, first, second, body = found.groups()
-        fields = {first.lower(), second.lower()}
+        ident, bracket, body = found.groups()
+        fields = {token.lower() for token in bracket.split()}
         if _PROCEDURAL not in fields or "live" not in fields:
             continue
         body = _flatten(body)
@@ -175,7 +235,8 @@ def _rows(text: str) -> "list[Note]":
             # the same claim, so the boundary between predicate and object is not
             # decidable from the rendering. The subject needs no boundary.
             out.append(Note(text=body, confidence=None, recorded="", ident=ident,
-                            subject=body.split(" ", 1)[0]))
+                            subject=body.split(" ", 1)[0],
+                            inferred=_INFERRED in fields))
     return out
 
 
@@ -244,7 +305,14 @@ def render(notes: "list[Note]", header: str, budget: int) -> str:
         return ""
     lines, used, kept = [header], len(header), 0
     for note in notes:
-        line = f"- {note.text}"
+        # The marker goes on the row, not in the header. The header already says some of
+        # this set was inferred, and a qualifier over a whole block is the thing that
+        # discounts every row or is ignored for all of them -- stated as the reason
+        # `recall()` grew a per-row marker upstream, and true here for the same reason:
+        # the block is ordered so stated rules come first, and order tells a reader the
+        # list is sorted without telling them WHERE the boundary falls. In twenty-two
+        # rows, row twelve is unknowable.
+        line = f"- {note.text}{MARKER if note.inferred else ''}"
         if kept and used + 1 + len(line) > budget:
             break
         lines.append(line)
