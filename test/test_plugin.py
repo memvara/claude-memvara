@@ -3703,10 +3703,20 @@ class StandingRenderContract(unittest.TestCase):
 
         It lands on `recall()` and the `memory_recall` tool only — `memory_standing`
         renders through its own path and carries no marker — so this is forward cover
-        rather than a fix. Every claim these hooks write is derived, so if the marker ever
-        does reach this surface it reaches every row at once, and `_ADDED_ROW`'s body
-        group is greedy to end-of-line: the marker is captured into the text rather than
-        failing the match. Asserted so that stays true by decision rather than by luck.
+        rather than a fix.
+
+        An earlier draft of this said the marker would reach "every row at once", reasoning
+        that every claim these hooks write is derived. The first clause is true and the
+        inference is not: the standing set is not made of what the hooks write. Sampled
+        against the live store, `memory_why` reports three distinct extractors on standing
+        claims — `api` for a session asserting a fact outright, and `claude-code-session`
+        and `claude-code-hook` for the derived ones. Only the last two would mark, and in a
+        ten-claim sample they were three. So it is a minority of rows, which is what makes
+        a marker worth having: at every row it says nothing.
+
+        `_ADDED_ROW`'s body group is greedy to end-of-line, so the marker is captured into
+        the text rather than failing the match. Asserted so that stays true by decision
+        rather than by luck.
         """
         marked = "\n".join(
             line + " (inferred)" if line.startswith("+ [id=") else line
