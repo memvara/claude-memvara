@@ -2396,6 +2396,36 @@ NUMBER_WORDS = (
 )
 
 
+def _tracked(pattern: str) -> "list[pathlib.Path]":
+    """Every file this repository TRACKS matching `pattern`, asked of git.
+
+    The filesystem is the wrong referent for "files this repository owns", and the gap is
+    not academic. Worktrees live at `.claude/worktrees/<name>/`, INSIDE the checkout, so
+    `ROOT.rglob` from the main checkout walks into every other worktree and reads their
+    files -- at whatever commits those happen to sit at -- as though they were this
+    repository's. `test_no_other_count_is_stated_anywhere` failed on `main` for precisely
+    that: a sibling worktree pinned at an older commit still said "Ten tools", and the
+    guard reported this repository as stating a count it does not state anywhere.
+
+    It survived because it is invisible from where the work happens. Run the suite from a
+    worktree and there are no worktrees below it, so the scan is correct and green; run it
+    from the main checkout and it is wrong. CI never sees it either, having no worktrees.
+
+    **Do not fix this with `.claude` in a `set(path.parts)` denylist.** From inside a
+    worktree the checkout itself sits under `.claude/worktrees/`, so every absolute path
+    contains `.claude`, the filter excludes the entire repository, and the guard passes
+    having read nothing. A guard that scanned zero files is indistinguishable from one
+    that found nothing wrong. Filtering `path.relative_to(ROOT).parts` would be correct;
+    asking git is better, because a denylist has to keep guessing the name of the next
+    scratch directory somebody drops in the tree, and `_library` -- which CI checks out
+    inside the repo -- is the one it already had to learn.
+    """
+    listed = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "-z", pattern],
+        check=True, capture_output=True, text=True).stdout
+    return [ROOT / name for name in listed.split("\0") if name]
+
+
 class ToolCount(unittest.TestCase):
     """The README states the tool surface. Nothing checked either half of it.
 
@@ -2434,6 +2464,45 @@ class ToolCount(unittest.TestCase):
         self.assertEqual(ordered, list(HOSTED_TOOLS),
                          "the README must name every hosted tool, once, in order")
 
+    def test_the_scan_never_reads_a_file_this_repository_does_not_track(self) -> None:
+        """The bug, reproduced without needing a second worktree.
+
+        An untracked file under `ROOT` stands in for a sibling worktree's copy: same
+        situation, same reason it must not be read -- it is not this repository's content,
+        whatever the filesystem says. Under `rglob` this test fails; under `git ls-files`
+        it passes, which is the whole change.
+        """
+        intruder = ROOT / "_scan_probe_not_ours.md"
+        intruder.write_text("Ten tools, and this file is not tracked.", encoding="utf-8")
+        try:
+            self.assertNotIn(intruder, _tracked("*.md"),
+                             "an untracked file is not this repository's to answer for")
+            ToolCount().test_no_other_count_is_stated_anywhere()
+        finally:
+            intruder.unlink()
+
+    def test_the_scan_is_not_empty(self) -> None:
+        """The load-bearing half, and the one the obvious fix would have broken.
+
+        Every assertion built on this scan is a loop over its results, so a scan that
+        returns nothing passes all of them. That is exactly what `.claude` in a
+        `set(path.parts)` denylist does when the suite runs from a worktree, and it looks
+        identical to a clean run.
+        """
+        self.assertTrue(_tracked("*.md"), "no markdown tracked -- the scan covers nothing")
+        self.assertTrue(_tracked("*.json"), "no json tracked -- the scan covers nothing")
+
+    def test_the_scan_holds_no_worktree_paths(self) -> None:
+        """Stated positively about the thing that actually went wrong.
+
+        Named rather than left implied by the two above, because `worktrees` is the
+        specific word that was in the failing path and is what someone greps for when this
+        recurs.
+        """
+        for pattern in ("*.md", "*.json"):
+            for path in _tracked(pattern):
+                self.assertNotIn("worktrees", path.relative_to(ROOT).parts, str(path))
+
     def test_no_other_count_is_stated_anywhere(self) -> None:
         """One number, one place.
 
@@ -2446,8 +2515,11 @@ class ToolCount(unittest.TestCase):
         pattern = re.compile(
             r"\b(" + "|".join(w for w in NUMBER_WORDS if w != word) + r")\s+tools\b",
             re.IGNORECASE)
-        for path in ROOT.rglob("*.md"):
-            if {"node_modules", "_library", "skills"} & set(path.parts):
+        for path in _tracked("*.md"):
+            # `skills` stays: it is tracked, and deliberately excluded. `node_modules` and
+            # `_library` are gone rather than forgotten -- git does not track either, so
+            # naming them would only suggest the list still has work to do.
+            if "skills" in path.relative_to(ROOT).parts:
                 continue
             found = pattern.findall(path.read_text(encoding="utf-8"))
             self.assertEqual(found, [], f"{path} states a different tool count: {found}")
@@ -2495,9 +2567,7 @@ class Hygiene(unittest.TestCase):
         rule is about anything shipped from here, and an allowlist of directories would
         stop covering the next one added.
         """
-        for path in ROOT.rglob("*.json"):
-            if {"node_modules", "_library"} & set(path.parts):
-                continue
+        for path in _tracked("*.json"):
             raw = path.read_text(encoding="utf-8")
             self.assertNotIn("npx", raw, path)
 
