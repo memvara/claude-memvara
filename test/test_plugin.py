@@ -3689,6 +3689,12 @@ class StandingRenderContract(unittest.TestCase):
         about the store into a block that claims to be the user's instructions.
         """
         rows = _standing()._rows(_SERVER_STANDING)
+        # Stated positively first. `all()` over an empty list is True, so without this the
+        # assertions below certify that a parser returning NOTHING correctly ignores prose
+        # -- and passing on a totally broken parse is the failure this class exists for.
+        # Confirmed: with `_ADDED_ROW` mutated to match nothing, this test passed while
+        # three of its siblings failed.
+        self.assertEqual(len(rows), 2, "no rows parsed; the checks below would be vacuous")
         self.assertTrue(all("not shown" not in r.text for r in rows))
         self.assertTrue(all("standing preference(s)" not in r.text for r in rows))
 
@@ -3708,6 +3714,11 @@ class StandingRenderContract(unittest.TestCase):
         rows = _standing()._rows(marked)
         self.assertEqual(len(rows), 2, "a trailing marker must not drop the row")
         self.assertEqual([r.subject for r in rows], ["user", "user"])
+        # The docstring above claims the marker is CAPTURED rather than stripped. Assert
+        # the claim itself: a body group narrowed to swallow the marker would keep both
+        # checks above green while making that sentence false.
+        self.assertIn("(inferred)", rows[0].text,
+                      "the greedy body group should carry the marker into the text")
 
     def test_the_suites_own_fake_renders_what_the_server_renders(self) -> None:
         """The assertion that closes the circle.
