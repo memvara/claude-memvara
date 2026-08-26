@@ -124,6 +124,31 @@ paid for once and then cached — instead of being retrieved again on each
 prompt, where they also crowded out the incidental facts that prompt was
 actually about.
 
+**And the block says which of them a machine wrote.** A rule you typed and a
+rule this plugin's capture hook paraphrased out of a transcript are both
+standing preferences, and they arrive in the same list. The set is ordered so
+the ones you stated come first, but ordering only tells you the list is sorted —
+in a block of twenty-two, row twelve is anyone's guess. So a note that was
+derived rather than stated now ends `(inferred)`, per row.
+
+The header already said some of the set was inferred. A qualifier over a whole
+block is the thing that either discounts every row or gets ignored for all of
+them, which is exactly the reasoning that put a per-row marker on `recall()` in
+the library, and it applies here for the same reason.
+
+What decides it is where the claim came from, not how confident its writer was:
+a confidence floor tuned on one store marks everything or nothing on another,
+while provenance does not move as the store grows. Anything this plugin writes
+names itself, so it is marked; anything you or an application asserted through
+the API is not. A route that cannot tell marks nothing — a warning invented from
+missing data is worse than an absent one, because a marker on a rule you really
+did state teaches you to ignore the marker everywhere.
+
+The name of whatever derived it is never shown, here or in the library. It is
+caller-supplied, so printing it would put caller-controlled text into a model's
+context and oblige every renderer to sanitise it forever. `memory_why` reports
+it on demand for the one claim you are actually asking about.
+
 What recall spends is now written to `~/.memvara/.hooks/recall.log`, per
 prompt. What it spends is not the same question as whether it was
 worth spending: the log records that something was injected, never that it was
