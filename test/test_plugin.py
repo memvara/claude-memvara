@@ -604,7 +604,13 @@ class Hooks(unittest.TestCase):
         self.assertTrue(_belongs_here(
             f"- project:{here} some fact",
             f"{here}/.claude/worktrees/some-branch"))
-        # A sibling whose path merely shares a prefix is a different project.
+        # A sibling whose path merely extends the fact's is a different project. The
+        # direction matters and the first version of this test had it backwards: the trap
+        # is a SHORT owner and a LONG cwd, where a bare `startswith` matches
+        # `.../claude-memvara-old` against a fact filed for `.../claude-memvara`. Written
+        # the other way round it passed against that exact bug.
+        self.assertFalse(_belongs_here(
+            f"- project:{here} some fact", f"{here}-old"))
         self.assertFalse(_belongs_here(
             "- project:/Applications/workstation/claude-memvara-old fact", here))
         # An unreadable cwd keeps everything: silently recalling less is the failure mode
