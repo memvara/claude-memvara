@@ -78,6 +78,163 @@ def under_extraction() -> bool:
     return bool(os.environ.get(CAPTURE_SENTINEL))
 
 
+def _alert_path() -> str:
+    """Where a failed `claude -p` leaves word for the next prompt to relay.
+
+    Built fresh on every call rather than cached at import, the way `store_key` and
+    `log_line` already read `_HOME` -- not `RUNTIME_DIR`'s way, which bakes it into a
+    constant. The distinction is not style: this repository's own test fixture re-homes
+    `ipc._HOME` for the whole suite, and a frozen path would go on reading and writing the
+    real `~/.memvara` from every test that touches it, silently, since a test writing to
+    the developer's own machine looks exactly like one that passed.
+
+    Beside the logs, not in the plugin: the plugin directory is replaced wholesale on
+    update, and a file that disappears on upgrade would clear every outstanding alert
+    along with it. A file rather than the log itself, because `capture.log` is an
+    append-only record and this has to answer one question -- "is capture still broken,
+    and since when did we last say so" -- without re-reading everything ever written to it.
+    """
+    return os.path.join(_HOME, ".memvara", ".hooks", "capture-alert.json")
+
+
+#: How long a failure stays reported before it is worth repeating. Not on every prompt --
+#: the reason does not change between reminders, and a line repeated every few minutes is
+#: exactly the noise a person learns to stop reading past. Not never again either: 117
+#: turns once logged `facts=0` with nothing anywhere distinguishing a dead extractor from
+#: a quiet one, and reporting once and then falling silent for the rest of a multi-day
+#: outage is the same failure with fewer words.
+CAPTURE_ALERT_REMIND_SECONDS = 6 * 60 * 60
+
+
+def _read_alert() -> dict:
+    try:
+        with open(_alert_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_alert(data: dict) -> None:
+    """Best-effort atomic write, shared by every writer of this file.
+
+    `raise_capture_alert` (the async extraction child) and `due_capture_alert` (recall.py,
+    fired on the very next prompt while that child can still be mid-run -- `capture.py`
+    says extraction takes 12-14s and hands the turn back immediately, so a fast follow-up
+    prompt is the ordinary case) are two genuinely concurrent writers of one file with no
+    lock between them.
+
+    Writing to a sibling temp file and `os.replace`-ing it over the target removes the one
+    failure mode that write order cannot fix on its own: a reader opening the file mid-write
+    and getting a truncated payload. `os.replace` is atomic on the same filesystem, so a
+    concurrent `_read_alert` sees either the whole old file or the whole new one, never a
+    half-written mix that `json.load` would raise on and `_read_alert` would then read back
+    as "no alert" -- silently hiding an active failure for one prompt.
+
+    What this does NOT fix, and is not trying to: two writers can still race between their
+    own read and their own write, so the *last* write of the two wins outright rather than
+    merging. A `raise_capture_alert` that read a stale `last_reported` can still land after
+    a `due_capture_alert` that just refreshed it, resetting the reminder clock early; a
+    `clear_capture_alert` can still be followed by a `due_capture_alert` that had already
+    read the pre-clear state and writes it straight back, undoing the clear. Closing that
+    fully needs a lock around the whole read-modify-write in both functions, which is real
+    machinery for what this is: an occasional extra reminder, or a resolved banner
+    reappearing for one more prompt before the next successful extraction clears it again.
+    Losing a fact would be the larger bug; losing a few minutes of an FYI banner's timing
+    is the trade this file already makes for `capture.log` and the session state next to it.
+    """
+    import tempfile
+
+    path = _alert_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".capture-alert-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def raise_capture_alert(reason: str) -> None:
+    """Record that `claude -p` just failed, in the words `lib.extract` already logged.
+
+    Called from every failure exit in `_payload` except the recursion guard at the very
+    top, which fires inside the extraction child itself and is the guard working, not a
+    failure -- alerting on it would mean every successful stand-down looked like an
+    outage.
+
+    The reminder clock carries forward when the reason is unchanged, and resets when it is
+    not. An extractor stuck on one cause should nag on the schedule above and no faster;
+    a second, different failure arriving mid-outage is new information and is reported
+    the moment it is seen, the same as the first.
+    """
+    current = _read_alert()
+    last_reported = current.get("last_reported", 0) if current.get("reason") == reason else 0
+    _write_alert({"reason": reason, "last_reported": last_reported})
+
+
+def clear_capture_alert() -> None:
+    """Called the first time `claude -p` succeeds after failing. A no-op if it never failed."""
+    try:
+        os.unlink(_alert_path())
+    except OSError:
+        pass
+
+
+def due_capture_alert(now: float) -> str:
+    """The clause to add to this prompt's banner, or `""` when nothing is due.
+
+    Read unconditionally on every prompt -- an `open()` that raises `FileNotFoundError` on
+    an install where capture has never failed, which is the common case and costs one
+    failed syscall rather than a stat-then-open pair that would cost two and still race.
+
+    Reports the first time a failure is seen (`last_reported` is `0`) and then again every
+    `CAPTURE_ALERT_REMIND_SECONDS` while it persists. A guard that reports once and then
+    trusts the log is the same shape this file already fixed once for extraction itself --
+    the banner is the channel a person is actually reading, and it must not go quiet just
+    because the first line already scrolled past.
+    """
+    data = _read_alert()
+    reason = data.get("reason")
+    if not isinstance(reason, str) or not reason:
+        return ""
+    last = data.get("last_reported")
+    last = float(last) if isinstance(last, (int, float)) else 0.0
+    if last and now - last < CAPTURE_ALERT_REMIND_SECONDS:
+        return ""
+    data["last_reported"] = now
+    _write_alert(data)
+    return f"capture failing: {reason}"
+
+
+def with_alert(text: str, alert: str) -> str:
+    """A status line, with word of a failing extractor riding along on it.
+
+    `capture.py` runs `async` and cannot print anything of its own -- the client discards
+    an async hook's output entirely, which is why its whole account moved to `capture.log`
+    in the first place. Nobody reads that on a schedule, so a `claude -p` that has been
+    failing for hours says nothing anyone sees until a hook that speaks -- `recall.py` on
+    every prompt, `session_start.py` once per session -- relays it.
+
+    Shared rather than defined once per hook: both call sites shadow `emit_json` locally
+    right after computing `alert`, so every `systemMessage` that file already prints picks
+    this up with no per-call-site wrapping to remember or forget. A first version of this
+    threaded `_with_alert(status(...), alert)` through five separate call sites in
+    `recall.py` by hand; only one of the five was ever covered by a test, and a sixth site
+    added later without the wrap would have printed a perfectly valid banner and failed
+    nothing -- the exact "guard nobody can count" shape this repository's CLAUDE.md warns
+    against. Shadowing removes the chance to forget rather than relying on remembering.
+    """
+    return f"{text} · {alert}" if alert else text
+
+
 #: How long a client waits. Generous next to a 6ms query and mean next to a 148ms cold
 #: fallback: past this the daemon is wedged and the in-process path is the faster answer.
 CLIENT_TIMEOUT_SEC = 2.0

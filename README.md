@@ -110,6 +110,15 @@ that was a section short. A count is a claim about what arrived, so when
 a section cannot be fetched the banner now says which and why:
 `⋈ Memvara · session opened with 29 memories · notes unavailable (quota)`.
 
+**A failing extractor rides along on whichever of these is already
+printing.** Capture runs `async` and cannot speak for itself — see
+above — so a `claude -p` that has been failing for hours said nothing
+anyone saw until the terminal, past `capture.log`, which nothing reads
+on a schedule. Recall and session start now append `· capture failing:
+<reason>` to any of the outcomes on this page — once when the failure
+starts, again every six hours while it persists, and not at all once
+extraction succeeds again.
+
 **Storage is rich; injection is clipped.** They are different jobs. A
 memory worth keeping carries its reasoning — that is what stopped captured
 facts being useless one-liners — and it made each about four times bigger.

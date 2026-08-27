@@ -53,7 +53,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.fast import recall as fast_recall  # noqa: E402
 from lib.ipc import (  # noqa: E402
-    emit_json, log_line, payload, plural, status, under_extraction,
+    due_capture_alert, emit_json, log_line, payload, plural, status, under_extraction,
+    with_alert,
 )
 
 #: Enough memories to be useful, few enough to stay out of the way. Recall drops whole
@@ -601,6 +602,23 @@ def main() -> int:
         log_line("recall", "skipped=machine prompt")
         return 0
 
+    # Read once, then every reply from here on goes through `_emit` rather than
+    # `emit_json` threaded by hand through each call site -- a first version wrapped five
+    # separate sites individually, and only one of the five was ever covered by a test; a
+    # sixth site added later without the wrap would have printed a perfectly valid banner
+    # and failed nothing. `_emit` means every `systemMessage` below picks this up whether
+    # or not whoever writes the next branch remembers this file relays a capture failure
+    # at all -- named differently from `emit_json` on purpose: shadowing the imported name
+    # with a same-named local function makes every reference to it inside this function
+    # local from the top, including the one capturing the original, which raises
+    # `UnboundLocalError` before it ever runs.
+    alert = due_capture_alert(time.time())
+
+    def _emit(reply: dict) -> None:
+        if "systemMessage" in reply:
+            reply = {**reply, "systemMessage": with_alert(reply["systemMessage"], alert)}
+        emit_json(reply)
+
     seen, carried = _read_state(session)
     standing, standing_state = _standing_refresh(
         session, time.time(), str(data.get("cwd") or ""))
@@ -622,7 +640,7 @@ def main() -> int:
         # indistinguishable from a hook that has stopped working -- which is the failure
         # this file exists to stop repeating -- but reported as what it is rather than as a
         # breakage someone would go looking for.
-        emit_json({"systemMessage": status("not configured")})
+        _emit({"systemMessage": status("not configured")})
         return 0
     if not ok:
         # Four outcomes had four messages and a fifth was wearing the wrong one. A store
@@ -632,7 +650,7 @@ def main() -> int:
         # whole file is built on.
         detail = _quota_line(why)
         log_line("recall", f"failed reason={why or 'unknown'}")
-        emit_json({"systemMessage": status(detail or "recall failed")})
+        _emit({"systemMessage": status(detail or "recall failed")})
         return 0
 
     here = str(data.get("cwd") or "")
@@ -679,7 +697,7 @@ def main() -> int:
             # Nothing new to recall, and the standing set has moved: the turn still has to
             # carry it, or a rule written mid-session waits for the next prompt that
             # happens to match something.
-            emit_json({
+            _emit({
                 "systemMessage": status("standing preferences updated"),
                 "hookSpecificOutput": {
                     "hookEventName": "UserPromptSubmit",
@@ -687,7 +705,7 @@ def main() -> int:
                 },
             })
             return 0
-        emit_json({"systemMessage": note})
+        _emit({"systemMessage": note})
         return 0
 
     _write_state(session, seen + [_digest(line) for line in fresh], topic, standing_state)
@@ -710,7 +728,7 @@ def main() -> int:
     log_line("recall", f"recalled={len(fresh)} repeats={repeats} injected={len(block_text)}c "
         f"clipped={sum(1 for s_, f_ in zip(clipped, fresh) if s_ != f_)}")
     _sample(prompt, fresh, anaphoric=anaphoric and bool(carried))
-    emit_json({
+    _emit({
         "systemMessage": label,
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",

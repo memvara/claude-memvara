@@ -30,8 +30,15 @@ That reverses a rule this repository states in CLAUDE.md, and the reason it was 
 still true: a hook nobody can see working is one nobody notices breaking. The compensating
 channel is `~/.memvara/.hooks/capture.log`, and the obligation moved there rather than
 disappearing -- every path that reaches a decision writes a line, including the ones that
-decide to do nothing. `recall.py` is unaffected: it is synchronous, it is the hook that
-gates the prompt, and it still reports itself in the terminal.
+decide to do nothing.
+
+`recall.py` and `session_start.py` are the second half of that obligation, not exempt from
+it. Neither is this hook's own async -- both are synchronous, both already speak on every
+event they answer, and `lib.ipc.raise_capture_alert`/`due_capture_alert` are how a failure
+here reaches whichever of them a person is actually watching next: on the terminal, as
+`⋈ Memvara · ... · capture failing: <reason>` riding on a banner that file was printing
+regardless. capture.log stopped being the only account of a failure the day a headless
+`claude -p` login sat expired for 34 hours with nothing anywhere saying so out loud.
 
 Per-turn costs more and loses nothing. The two guards that remain:
 
