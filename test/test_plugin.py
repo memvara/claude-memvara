@@ -613,6 +613,14 @@ class Hooks(unittest.TestCase):
             f"- project:{here} some fact", f"{here}-old"))
         self.assertFalse(_belongs_here(
             "- project:/Applications/workstation/claude-memvara-old fact", here))
+        # A path with a space in it. Splitting on whitespace truncates it, so the memory
+        # was dropped from its own directory -- recalling less, silently.
+        spaced = "/Users/me/My Project"
+        self.assertTrue(_belongs_here(f"- project:{spaced} some fact", spaced))
+        self.assertTrue(_belongs_here(f"- project:{spaced} fact",
+                                      f"{spaced}/.claude/worktrees/b"))
+        self.assertFalse(_belongs_here(f"- project:{spaced} fact", "/Users/me/Other"))
+
         # An unreadable cwd keeps everything: silently recalling less is the failure mode
         # this whole file exists to avoid.
         self.assertTrue(_belongs_here("- project:/somewhere/else fact", ""))

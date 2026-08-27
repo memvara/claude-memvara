@@ -550,15 +550,31 @@ def _belongs_here(bullet: str, cwd: str) -> bool:
     """
     if not bullet.startswith(PROJECT_SUBJECT) or not cwd:
         return True
-    rest = bullet[len(PROJECT_SUBJECT):].split()
-    if not rest or not rest[0].startswith("/"):
+    rest = bullet[len(PROJECT_SUBJECT):]
+    if not rest.startswith("/"):
         # Not a path after all. Left alone rather than guessed at.
         return True
-    owner = os.path.abspath(rest[0])
-    here = os.path.abspath(cwd)
-    # `startswith` covers the worktree case, which is the common one here: a fact filed
-    # against a repository root is true inside `<root>/.claude/worktrees/<branch>` too.
-    return here == owner or here.startswith(owner + os.sep)
+
+    # Walk up from here and ask whether the subject names this directory or one containing
+    # it, requiring the subject to END where the candidate does -- the next character must
+    # be the space before the predicate, or nothing at all.
+    #
+    # Written this way rather than by splitting `rest` on whitespace, because a path may
+    # contain a space: `/Users/me/My Project` split to `/Users/me/My`, so a memory filed
+    # for a directory was dropped from that very directory. Recalling less, silently, which
+    # is the failure this file exists to prevent.
+    #
+    # The end-of-subject requirement is also what rejects a sibling. Walking to `/A/B` and
+    # accepting any separator would match a fact filed for `/A/B/claude-memvara` against a
+    # session in `/A/B/claude-memvara-old`; insisting the subject stops there does not.
+    node = os.path.abspath(cwd)
+    while True:
+        if rest.startswith(node) and rest[len(node):len(node) + 1] in ("", " "):
+            return True
+        parent = os.path.dirname(node)
+        if parent == node:
+            return False
+        node = parent
 
 
 def main() -> int:
