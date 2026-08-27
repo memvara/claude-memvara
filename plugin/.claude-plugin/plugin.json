@@ -1,7 +1,7 @@
 {
   "name": "memvara",
   "description": "Bitemporal memory for agents: hosted MCP plus the skill that says how to use it.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "author": {
     "name": "Memvara",
     "url": "https://memvara.dev"
