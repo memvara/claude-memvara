@@ -1098,7 +1098,8 @@ class Hooks(unittest.TestCase):
             sys.path.pop(0)
 
         said = "Failed to authenticate: OAuth session expired and could not be refreshed"
-        envelope = json.dumps({"is_error": True, "result": said, "usage": {}})
+        spent = {"cache_read_input_tokens": 18946, "output_tokens": 0}
+        envelope = json.dumps({"is_error": True, "result": said, "usage": spent})
         logged: list[str] = []
 
         class _Dead:
@@ -1121,7 +1122,44 @@ class Hooks(unittest.TestCase):
         # Not merely "something went wrong": the line has to name the cause, because the
         # person reading it is deciding whether to re-authenticate or go looking elsewhere.
         self.assertIn("OAuth", logged[0])
-        self.assertEqual(usage, {})
+        # And the tokens it burned before failing are still reported. Reading the return
+        # code before the envelope discarded these too, which left the expensive failures
+        # as the ones `usage.jsonl` could not see -- the asymmetry the `is_error` path
+        # was already written to avoid, on the path beside it.
+        self.assertEqual(usage, spent)
+
+    def test_a_timed_out_extraction_says_so_rather_than_reciting_argv(self) -> None:
+        """`TimeoutExpired.__str__` opens with the whole command line.
+
+        Formatted with `{exc}` and clipped, the log line becomes `claude -p --settings
+        {"hooks":{}} --model ...` and the words "timed out" fall off the end -- argv in
+        the one line whose entire job is to say what went wrong, and the clip landing
+        inside the prompt argument. The timeout is 90s against a job measured at 12-14s,
+        so this is the likely exception on that path, not a remote one.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import extract as extract_mod
+        finally:
+            sys.path.pop(0)
+
+        def _timeout(*_a: object, **_k: object) -> None:
+            raise subprocess.TimeoutExpired(["claude", "-p", "--settings", "secret"], 90)
+
+        logged: list[str] = []
+        original_run, original_log = extract_mod.subprocess.run, extract_mod.log
+        extract_mod.subprocess.run = _timeout  # type: ignore[assignment]
+        extract_mod.log = logged.append  # type: ignore[assignment]
+        try:
+            result, usage = extract_mod._payload("a turn", "a prompt")
+        finally:
+            extract_mod.subprocess.run = original_run  # type: ignore[assignment]
+            extract_mod.log = original_log  # type: ignore[assignment]
+
+        self.assertEqual((result, usage), ("", {}))
+        self.assertTrue(logged, "a timed-out extractor wrote nothing to the log")
+        self.assertNotIn("--settings", logged[0])
+        self.assertIn(str(extract_mod.TIMEOUT_SEC), logged[0])
 
     def test_capture_mines_one_turn_and_never_skips_text(self) -> None:
         """Batching was cheaper and lost data, which is not a trade worth making.

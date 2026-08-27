@@ -77,6 +77,7 @@ def under_extraction() -> bool:
     """
     return bool(os.environ.get(CAPTURE_SENTINEL))
 
+
 #: How long a client waits. Generous next to a 6ms query and mean next to a 148ms cold
 #: fallback: past this the daemon is wedged and the in-process path is the faster answer.
 CLIENT_TIMEOUT_SEC = 2.0

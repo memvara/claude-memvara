@@ -298,7 +298,21 @@ def build_prompt(cwd: "str | None" = None) -> str:
 REASON_CHARS = 200
 
 
-def _reason(proc: "subprocess.CompletedProcess") -> str:
+def _decode(stdout: str) -> "dict | None":
+    """The reply envelope, or `None` when it is not readable JSON.
+
+    Decoded once and passed around, because the envelope is needed for three separate
+    things -- the token counts, the failure reason, and the reply itself -- and parsing it
+    per question is how they came to be read in an order that threw two of them away.
+    """
+    try:
+        body = json.loads(stdout)
+    except (ValueError, TypeError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _reason(proc: "subprocess.CompletedProcess", body: "dict | None") -> str:
     """Why a run failed, in the words the CLI used.
 
     The reason is in **stdout**, and it is there even when the process exits non-zero: an
@@ -313,10 +327,6 @@ def _reason(proc: "subprocess.CompletedProcess") -> str:
     extractor had not run at all. `usage.jsonl` went silent on the same return, for the
     same reason, and so could not contradict it either.
     """
-    try:
-        body = json.loads(proc.stdout)
-    except (ValueError, TypeError):
-        body = None
     if isinstance(body, dict):
         said = str(body.get("result") or "").strip()
         if said:
@@ -357,25 +367,32 @@ def _payload(text: str, prompt: str) -> "tuple[str, dict]":
             ],
             capture_output=True, text=True, timeout=TIMEOUT_SEC, env=env,
         )
+    except subprocess.TimeoutExpired:
+        # Named rather than formatted. `TimeoutExpired.__str__` opens with the whole argv,
+        # so `{exc}` clipped to REASON_CHARS logs the command and truncates away the words
+        # "timed out" -- argv in the one line whose job is to say what went wrong.
+        log(f"extraction did not run: no reply within {TIMEOUT_SEC}s")
+        return "", {}
     except (OSError, subprocess.SubprocessError) as exc:
         log(f"extraction did not run: {type(exc).__name__}: {exc}"[:REASON_CHARS])
         return "", {}
-    if proc.returncode != 0:
-        log(f"extraction did not run: {_reason(proc)}")
-        return "", {}
 
-    try:
-        body = json.loads(proc.stdout)
-    except ValueError:
+    body = _decode(proc.stdout)
+    usage = (body or {}).get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+
+    # Usage is read before any of the ways this returns empty. A failed run still burned
+    # the preamble, and accounting that counted only successes would make the expensive
+    # failures the invisible ones -- which is what the return-code path used to do, where
+    # it discarded the envelope's usage along with its reply.
+    if proc.returncode != 0:
+        log(f"extraction did not run: {_reason(proc, body)}")
+        return "", usage
+    if body is None:
         log("extraction did not run: claude -p returned something that is not JSON")
         return "", {}
-
-    usage = body.get("usage")
-    usage = usage if isinstance(usage, dict) else {}
     if body.get("is_error"):
-        # Reported even so. A failed run still burned the preamble, and accounting that
-        # counted only successes would make the expensive failures the invisible ones.
-        log(f"extraction failed: {_reason(proc)}")
+        log(f"extraction failed: {_reason(proc, body)}")
         return "", usage
     return str(body.get("result") or ""), usage
 
