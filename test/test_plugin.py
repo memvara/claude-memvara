@@ -539,6 +539,78 @@ class Hooks(unittest.TestCase):
                     proc.stdout.strip(), "",
                     f"{script} spoke into an extraction: {proc.stdout!r}")
 
+    def test_a_machine_envelope_is_not_a_prompt(self) -> None:
+        """`UserPromptSubmit` carries more than what a person typed.
+
+        A finished background task and a message from another session both arrive through
+        this event, wrapped in a tag. Recall answered them like anything else: over one
+        day's census, 4 of 36 real submissions were these, and each spent a retrieval
+        query on a vector over a task id and a socket path. Behavioural, and asserted on
+        stdout, because injecting into a machine envelope is the thing to prevent.
+        """
+        for envelope in ('<task-notification> <task-id>a3de0a81</task-id> done',
+                         '<cross-session-message from="uds:/tmp/cc-socks/63684.sock">hi'):
+            with self.subTest(envelope=envelope.split(">")[0]):
+                proc = subprocess.run(
+                    ["python3", str(HOOKS / "recall.py")],
+                    input=json.dumps({"prompt": envelope, "session_id": "s"}),
+                    capture_output=True, text=True, env=self.BARREN, timeout=30,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+
+        # And a person pasting markup is still asking a real question about it. The census
+        # entry that looked machine-generated and was not: browser measurements, typed by
+        # the user two minutes after "total width is 1728".
+        proc = subprocess.run(
+            ["python3", str(HOOKS / "recall.py")],
+            input=json.dumps({"prompt": '{"w":1728,"dpr":2}', "session_id": "s"}),
+            capture_output=True, text=True, env=self.BARREN, timeout=30,
+        )
+        self.assertIn("Memvara", proc.stdout,
+                      "a data-shaped prompt a person typed was silently dropped")
+
+    def test_another_checkouts_memories_stay_in_that_checkout(self) -> None:
+        """`memory_recall` takes no scope, so the server cannot filter this.
+
+        `project:<absolute path>` names one working tree. Over one day's census five such
+        memories from three unrelated checkouts reached memvara sessions -- including a
+        prompt asking which observability tool to use, answered entirely out of
+        `Desktop/snorkel` and `expense-tracker`. The standing block has filtered on `cwd`
+        since 0.2.0; the per-prompt path never has.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from recall import _belongs_here
+        finally:
+            sys.path.pop(0)
+
+        here = "/Applications/workstation/claude-memvara"
+        # The real leaked lines, verbatim from recall-sample.log.
+        for foreign in ("- project:/Users/inderjeetsingh/Desktop/snorkel terminus docs",
+                        "- project:/Applications/workstation/expense-tracker ingestion",
+                        "- project:/Applications/workstation/ai_app architecture tenant"):
+            self.assertFalse(_belongs_here(foreign, here), foreign)
+
+        # Cross-cutting subjects are what recall is for and must survive untouched.
+        for kept in ("- user prefers minimalist UI design with only interactive elements",
+                     "- memvara_web head commit 9be712f",
+                     "- memvara known defect docs/POSTGRES.md claims the tsquery"):
+            self.assertTrue(_belongs_here(kept, here), kept)
+
+        # A worktree is inside its repository, and these repos are worked in worktrees --
+        # filing a fact against the root and then not seeing it from the branch you are on
+        # would be the same blindness in a new place.
+        self.assertTrue(_belongs_here(
+            f"- project:{here} some fact",
+            f"{here}/.claude/worktrees/some-branch"))
+        # A sibling whose path merely shares a prefix is a different project.
+        self.assertFalse(_belongs_here(
+            "- project:/Applications/workstation/claude-memvara-old fact", here))
+        # An unreadable cwd keeps everything: silently recalling less is the failure mode
+        # this whole file exists to avoid.
+        self.assertTrue(_belongs_here("- project:/somewhere/else fact", ""))
+
     def test_the_sentinel_is_one_string_and_not_four(self) -> None:
         """Four copies of a magic string fail by doing nothing, which is unfalsifiable.
 
