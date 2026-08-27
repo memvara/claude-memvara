@@ -328,9 +328,24 @@ where a failed write is distinguishable from a quiet turn, and where a
 vocabulary that is too narrow is distinguishable from a model ignoring
 it.
 
-The child is launched with an empty hook set, and refuses to start if it
-finds itself already inside an extraction. Without both, a `Stop` hook
-that spawns Claude would fire the child's `Stop` hook, forever.
+A run that could not happen at all says so, and names the cause in the
+words the CLI used — `extraction did not run: Failed to authenticate:
+OAuth session expired and could not be refreshed`. That line is the
+difference between a dead extractor and a turn with nothing in it, which
+for a while did not exist: both wrote `facts=0`, the return code was
+read before the reply was parsed, and the sentence naming the cause was
+discarded with it.
+
+The child is launched with an empty hook set and refuses to start if it
+finds itself already inside an extraction — the second is the guard that
+actually holds. An empty hook set clears the hooks a *settings file*
+declares and leaves a **plugin's** registrations alone, so the child
+still fires this plugin's own `SessionStart` and `UserPromptSubmit`.
+Both of those now stand down when they find themselves inside an
+extraction, rather than spending a retrieval query and injecting the
+standing block into the prompt whose whole job is to judge which
+sentences in front of it are yours. `recall.log` records each
+stand-down, so the guard can be counted rather than assumed.
 
 Every extraction reports what it cost to
 `~/.memvara/.hooks/usage.jsonl`, under the library's own
