@@ -503,6 +503,65 @@ class Hooks(unittest.TestCase):
         # goes out. That asymmetry is the feature.
         self.assertNotIn("hookSpecificOutput", body)
 
+    def test_read_hooks_stand_down_inside_an_extraction(self) -> None:
+        """`claude -p` runs this plugin's hooks, so the child must be told to stop.
+
+        `--settings '{"hooks":{}}'` clears the hooks a settings file declares and leaves a
+        plugin's registrations alone -- confirmed with a marker file: a `claude -p` run
+        fires both `SessionStart` and `UserPromptSubmit`. So every extraction ran recall
+        and built the session block for a child that was about to be handed one prompt and
+        killed. `recall-sample.log` caught it: 41 of 77 sampled prompts were the
+        extractor's own "Extract durable facts from the exchange below".
+
+        Behavioural rather than a grep for the constant, because the failure is a hook that
+        *runs*, and only running one proves it does not. Asserted on stdout, which is where
+        the damage would land: whatever these print is prepended to the very prompt that
+        has to decide which sentences in front of it are the user's.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib.ipc import CAPTURE_SENTINEL
+        finally:
+            sys.path.pop(0)
+
+        env = dict(self.BARREN)
+        env[CAPTURE_SENTINEL] = "1"
+        for script, event in (("recall.py", {"prompt": "remember that I prefer tabs"}),
+                              ("session_start.py", {"cwd": str(ROOT)})):
+            with self.subTest(script=script):
+                proc = subprocess.run(
+                    ["python3", str(HOOKS / script)],
+                    input=json.dumps(event), capture_output=True, text=True,
+                    env=env, timeout=30,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(
+                    proc.stdout.strip(), "",
+                    f"{script} spoke into an extraction: {proc.stdout!r}")
+
+    def test_the_sentinel_is_one_string_and_not_four(self) -> None:
+        """Four copies of a magic string fail by doing nothing, which is unfalsifiable.
+
+        Every hook that stands down does it on the same environment variable, and a copy
+        that drifted would simply stop matching -- no error, no log line, just the leak
+        quietly back. So there is one definition, in the module they all already import,
+        and `lib.extract` re-exports it rather than declaring its own.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib.extract import SENTINEL
+            from lib.ipc import CAPTURE_SENTINEL as shared
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(SENTINEL, shared)
+        # Nobody re-declares it. `ipc.py` is where the string itself is allowed to appear.
+        for path in sorted(HOOKS.rglob("*.py")):
+            if path.name == "ipc.py":
+                continue
+            self.assertNotIn(
+                f'"{shared}"', path.read_text(encoding="utf-8"),
+                f"{path.name} declares its own copy of the sentinel")
+
     def test_readonly_memory_tools_are_allowed_without_a_prompt(self) -> None:
         payload = json.dumps({"tool_name": "mcp__memvara__memory_search"})
         proc = subprocess.run(
@@ -1017,6 +1076,52 @@ class Hooks(unittest.TestCase):
                 os.environ.pop(SENTINEL, None)
             else:
                 os.environ[SENTINEL] = original
+
+    def test_a_failed_extraction_says_why(self) -> None:
+        """`facts=0` must not be what a dead extractor looks like.
+
+        This is the defect that cost 34 hours. `claude -p` began exiting 1 with "Failed to
+        authenticate: OAuth session expired and could not be refreshed" at
+        2026-08-25T22:55; 117 turns were mined afterwards and every one wrote
+        `facts=0` -- the identical line a turn with genuinely nothing in it writes.
+        `usage.jsonl` went silent on the same return, so it could not contradict it either,
+        and the run that dies is the one that leaves no trace anywhere.
+
+        The reason is in **stdout**, next to the non-zero exit, and the old order returned
+        before parsing it. So the fix is an ordering one and the assertion is that the
+        sentence the CLI actually said reaches the log.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import extract as extract_mod
+        finally:
+            sys.path.pop(0)
+
+        said = "Failed to authenticate: OAuth session expired and could not be refreshed"
+        envelope = json.dumps({"is_error": True, "result": said, "usage": {}})
+        logged: list[str] = []
+
+        class _Dead:
+            returncode = 1
+            stdout = envelope
+            stderr = ""
+
+        original_run, original_log = extract_mod.subprocess.run, extract_mod.log
+        extract_mod.subprocess.run = lambda *a, **k: _Dead()  # type: ignore[assignment]
+        extract_mod.log = logged.append  # type: ignore[assignment]
+        try:
+            result, usage = extract_mod._payload("a turn", "a prompt")
+        finally:
+            extract_mod.subprocess.run = original_run  # type: ignore[assignment]
+            extract_mod.log = original_log  # type: ignore[assignment]
+
+        self.assertEqual(result, "")
+        self.assertTrue(logged, "a dead extractor wrote nothing to the log")
+        self.assertIn(said, logged[0])
+        # Not merely "something went wrong": the line has to name the cause, because the
+        # person reading it is deciding whether to re-authenticate or go looking elsewhere.
+        self.assertIn("OAuth", logged[0])
+        self.assertEqual(usage, {})
 
     def test_capture_mines_one_turn_and_never_skips_text(self) -> None:
         """Batching was cheaper and lost data, which is not a trade worth making.

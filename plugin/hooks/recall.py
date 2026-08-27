@@ -52,7 +52,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.fast import recall as fast_recall  # noqa: E402
-from lib.ipc import emit_json, log_line, payload, plural, status  # noqa: E402
+from lib.ipc import (  # noqa: E402
+    emit_json, log_line, payload, plural, status, under_extraction,
+)
 
 #: Enough memories to be useful, few enough to stay out of the way. Recall drops whole
 #: notes weakest-first to fit, so this is a ceiling and not a target.
@@ -498,6 +500,15 @@ def _quota_line(why: str) -> str:
 
 
 def main() -> int:
+    if under_extraction():
+        # The prompt in front of us is `capture.py`'s own extraction request, not a
+        # person's. Answering it spends a retrieval query and injects the standing block
+        # into the one context that must be judged on its own words. Logged rather than
+        # returned in silence, because a guard nobody can count is one nobody notices
+        # losing: these lines are what say it is still standing between the two.
+        log_line("recall", "skipped=under extraction")
+        return 0
+
     data = payload()
     prompt = str(data.get("prompt") or "").strip()
     session = str(data.get("session_id") or "")

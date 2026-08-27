@@ -44,6 +44,39 @@ RUNTIME_DIR = os.path.join(_HOME, ".memvara", ".hooks", "run")
 #: strand the old daemon rather than let it keep serving.
 CODE_FILES = ("daemon.py", "lib/ipc.py", "lib/open.py", "recall.py")
 
+#: Set in the environment of the `claude -p` child that `capture.py` spawns to mine a turn.
+#: A hook that finds it is running underneath an extraction rather than in front of a
+#: person, and must stand down.
+#:
+#: It lives here, in the one module every hook already imports, because the alternative is
+#: the literal string in each of them -- and a sentinel that has drifted apart across four
+#: files fails by doing nothing, which is the failure this whole guard exists to stop.
+#: `lib.extract` imports it from here rather than declaring its own.
+CAPTURE_SENTINEL = "MEMVARA_CAPTURE_ACTIVE"
+
+
+def under_extraction() -> bool:
+    """Whether this hook is running inside the extractor's own child process.
+
+    `capture.py` launches that child with `--settings '{"hooks":{}}'`, and the comment
+    there long claimed the empty hook set was what kept the child inert. It is not: that
+    clears the hooks a *settings file* declares and does not touch the ones a **plugin**
+    registers, so the child ran this plugin's hooks like any other session. Measured rather
+    than assumed -- a `claude -p` run fires `SessionStart` and `UserPromptSubmit`, both
+    confirmed with a marker file, and `recall-sample.log` caught the result in the act:
+    41 of 77 sampled prompts were the extractor's own "Extract durable facts from the
+    exchange below", each answered with a retrieval query and a standing block.
+
+    Two costs, and the second is the one that matters. A retrieval query is spent per
+    extraction against an allowance that is not per-session. And the child gets a session
+    id it has never used before, so nothing is deduplicated and the whole standing block is
+    injected -- into the one prompt whose entire job is to decide which sentences in front
+    of it are facts worth storing. `capture.py` already passes `injected` to `triples()` to
+    stop the store's own output being mined back in as new; letting the child recall in the
+    first place hands that filter a problem it should never have been given.
+    """
+    return bool(os.environ.get(CAPTURE_SENTINEL))
+
 #: How long a client waits. Generous next to a 6ms query and mean next to a 148ms cold
 #: fallback: past this the daemon is wedged and the in-process path is the faster answer.
 CLIENT_TIMEOUT_SEC = 2.0
