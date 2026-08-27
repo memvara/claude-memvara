@@ -98,7 +98,11 @@ class HostedError(RuntimeError):
     failed -- see capture.log": the server had said which allowance, how much of it, and
     when it resets, and every word was discarded one frame below the banner that needed
     it. `code` is the machine token (`quota_exhausted`); `detail` is the object beside it.
-    Both are `None` when the failure was transport-level and there was nothing to read.
+    Both are **empty rather than `None`** when the failure was transport-level and there
+    was nothing to read -- `code` is `""` and `detail` is `{}`, so a caller tests
+    truthiness and never identity. An earlier draft of this docstring said `None`, which
+    would have made `if err.code is None` a branch that never runs: the same shape of
+    defect this class was added to fix, in the sentence describing it.
     """
 
     def __init__(self, message: str, *, status: "int | None" = None,

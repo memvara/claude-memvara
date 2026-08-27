@@ -3670,6 +3670,31 @@ class QuotaRefusal(unittest.TestCase):
         self.assertEqual((text, ok), ("", False))
         self.assertEqual(why, "quota:2026-09-01", "the reason must reach the caller")
 
+    def test_the_stated_contract_matches_the_arity(self) -> None:
+        """The docstring's first line is what a reader builds a fake from.
+
+        It said `(text, ok)` for the whole of this change while every return had three
+        slots, and the paragraph correcting it sat further down where nobody writing a
+        two-tuple fake would reach. Two existing fakes broke on arity in this PR; this is
+        the sentence that would send the next person the same way.
+        """
+        source = (HOOKS / "lib" / "fast.py").read_text(encoding="utf-8")
+        contract = source[source.index("def recall(query"):]
+        self.assertIn("Returns `(text, ok, reason)`", contract)
+        self.assertNotIn("Returns `(text, ok)`", contract)
+
+    def test_the_error_reports_empty_rather_than_none(self) -> None:
+        """A transport failure carries no code and no detail, and says so by being empty.
+
+        The docstring claimed `None` for both while `__init__` produced `""` and `{}`, so
+        `if err.code is None` would have been a branch that never runs -- the same shape
+        of defect this class exists to fix.
+        """
+        hosted = self._hosted()
+        err = hosted.HostedError("transport died")
+        self.assertEqual((err.code, err.detail, err.status), ("", {}, None))
+        self.assertFalse(err.code or err.detail, "truthiness is the documented test")
+
     def test_the_banner_no_longer_names_a_log_it_never_writes(self) -> None:
         """`capture.log` is written by `capture.py` alone. Sending a reader there to learn
         why recall failed sends them somewhere that has never held the answer.

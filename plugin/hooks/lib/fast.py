@@ -97,7 +97,8 @@ def recall(query: str, *, k: int = 6, budget: int = 700, header: str | None = No
            spawn: bool = True) -> "tuple[str, bool | None, str]":
     """Recall text for `query`, by whatever route is available.
 
-    Returns `(text, ok)` with three states, because there are three things that can happen
+    Returns `(text, ok, reason)`. `ok` has three states, because there are three things
+    that can happen
     and collapsing any two of them hides a real one:
 
     * `True` -- a store was asked and answered. `text` may still be empty, and that is a

@@ -109,6 +109,12 @@ class Daemon:
             # docstring promising it never would -- `_serve` caught the ValueError and
             # dropped the connection without a reply, which the client reads as "no daemon"
             # and survives, so the bug was invisible from every side.
+            # No reason field, deliberately for now. A refused query falls through to the
+            # client's own hosted call, which asks the same refused question again and
+            # gets the reason first-hand -- so the banner is right and the cost is one
+            # extra round trip per prompt for as long as an allowance stays spent. Widening
+            # this wire is the fix; `test_a_failed_query_is_not_an_empty_answer` asserts
+            # the reply dict exactly, so it is a deliberate change and not a drive-by.
             return {"ok": False}
         header = request.get("header")
         if header:
