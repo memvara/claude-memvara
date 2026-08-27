@@ -78,6 +78,105 @@ def under_extraction() -> bool:
     return bool(os.environ.get(CAPTURE_SENTINEL))
 
 
+def _alert_path() -> str:
+    """Where a failed `claude -p` leaves word for the next prompt to relay.
+
+    Built fresh on every call rather than cached at import, the way `store_key` and
+    `log_line` already read `_HOME` -- not `RUNTIME_DIR`'s way, which bakes it into a
+    constant. The distinction is not style: this repository's own test fixture re-homes
+    `ipc._HOME` for the whole suite, and a frozen path would go on reading and writing the
+    real `~/.memvara` from every test that touches it, silently, since a test writing to
+    the developer's own machine looks exactly like one that passed.
+
+    Beside the logs, not in the plugin: the plugin directory is replaced wholesale on
+    update, and a file that disappears on upgrade would clear every outstanding alert
+    along with it. A file rather than the log itself, because `capture.log` is an
+    append-only record and this has to answer one question -- "is capture still broken,
+    and since when did we last say so" -- without re-reading everything ever written to it.
+    """
+    return os.path.join(_HOME, ".memvara", ".hooks", "capture-alert.json")
+
+
+#: How long a failure stays reported before it is worth repeating. Not on every prompt --
+#: the reason does not change between reminders, and a line repeated every few minutes is
+#: exactly the noise a person learns to stop reading past. Not never again either: 117
+#: turns once logged `facts=0` with nothing anywhere distinguishing a dead extractor from
+#: a quiet one, and reporting once and then falling silent for the rest of a multi-day
+#: outage is the same failure with fewer words.
+CAPTURE_ALERT_REMIND_SECONDS = 6 * 60 * 60
+
+
+def _read_alert() -> dict:
+    try:
+        with open(_alert_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def raise_capture_alert(reason: str) -> None:
+    """Record that `claude -p` just failed, in the words `lib.extract` already logged.
+
+    Called from every failure exit in `_payload` except the recursion guard at the very
+    top, which fires inside the extraction child itself and is the guard working, not a
+    failure -- alerting on it would mean every successful stand-down looked like an
+    outage.
+
+    The reminder clock carries forward when the reason is unchanged, and resets when it is
+    not. An extractor stuck on one cause should nag on the schedule above and no faster;
+    a second, different failure arriving mid-outage is new information and is reported
+    the moment it is seen, the same as the first.
+    """
+    current = _read_alert()
+    last_reported = current.get("last_reported", 0) if current.get("reason") == reason else 0
+    path = _alert_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"reason": reason, "last_reported": last_reported}, fh)
+    except OSError:
+        pass
+
+
+def clear_capture_alert() -> None:
+    """Called the first time `claude -p` succeeds after failing. A no-op if it never failed."""
+    try:
+        os.unlink(_alert_path())
+    except OSError:
+        pass
+
+
+def due_capture_alert(now: float) -> str:
+    """The clause to add to this prompt's banner, or `""` when nothing is due.
+
+    Read unconditionally on every prompt -- an `open()` that raises `FileNotFoundError` on
+    an install where capture has never failed, which is the common case and costs one
+    failed syscall rather than a stat-then-open pair that would cost two and still race.
+
+    Reports the first time a failure is seen (`last_reported` is `0`) and then again every
+    `CAPTURE_ALERT_REMIND_SECONDS` while it persists. A guard that reports once and then
+    trusts the log is the same shape this file already fixed once for extraction itself --
+    the banner is the channel a person is actually reading, and it must not go quiet just
+    because the first line already scrolled past.
+    """
+    data = _read_alert()
+    reason = data.get("reason")
+    if not isinstance(reason, str) or not reason:
+        return ""
+    last = data.get("last_reported")
+    last = float(last) if isinstance(last, (int, float)) else 0.0
+    if last and now - last < CAPTURE_ALERT_REMIND_SECONDS:
+        return ""
+    data["last_reported"] = now
+    try:
+        with open(_alert_path(), "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except OSError:
+        pass
+    return f"capture failing: {reason}"
+
+
 #: How long a client waits. Generous next to a 6ms query and mean next to a 148ms cold
 #: fallback: past this the daemon is wedged and the in-process path is the faster answer.
 CLIENT_TIMEOUT_SEC = 2.0

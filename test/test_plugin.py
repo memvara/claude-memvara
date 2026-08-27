@@ -930,6 +930,59 @@ class Hooks(unittest.TestCase):
         finally:
             sys.path.pop(0)
 
+    def test_capture_failing_rides_the_banner_that_was_already_printing(self) -> None:
+        """`capture.py` cannot speak for itself; this is the channel that speaks for it.
+
+        It runs `async`, and the client discards an async hook's output entirely, so a
+        `claude -p` that has been failing for hours says nothing anyone sees until the one
+        hook already printing on every prompt relays it. Driven as a real subprocess
+        against a real, writable `HOME`, because the whole claim is about what actually
+        reaches stdout -- not about what a mocked call was passed.
+
+        Report once, then quiet, then due again once the reminder window has passed: the
+        three states the design promises, exercised in that order against the same file
+        `lib.ipc.raise_capture_alert` writes.
+        """
+        home = tempfile.mkdtemp(prefix="memvara-test-alert-")
+        hooks_dir = os.path.join(home, ".memvara", ".hooks")
+        os.makedirs(hooks_dir, exist_ok=True)
+        alert_path = os.path.join(hooks_dir, "capture-alert.json")
+        env = {"HOME": home, "PATH": os.environ.get("PATH", "")}
+
+        def run():
+            proc = subprocess.run(
+                ["python3", str(HOOKS / "recall.py")],
+                input=json.dumps({"prompt": "a real question", "session_id": "s"}),
+                capture_output=True, text=True, env=env, timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return json.loads(proc.stdout)["systemMessage"]
+
+        try:
+            said = "Failed to authenticate: OAuth session expired"
+            with open(alert_path, "w", encoding="utf-8") as fh:
+                json.dump({"reason": said, "last_reported": 0}, fh)
+
+            first = run()
+            self.assertIn("capture failing", first)
+            self.assertIn(said, first)
+
+            second = run()
+            self.assertNotIn("capture failing", second,
+                             "reported twice for one failure with no interval between")
+
+            with open(alert_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            data["last_reported"] -= 7 * 3600  # past the 6h reminder window
+            with open(alert_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+
+            third = run()
+            self.assertIn("capture failing", third,
+                          "a failure that is still happening went silent forever")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
     def test_an_anaphoric_prompt_is_told_apart_from_a_real_one(self) -> None:
         """"yes please" has nothing in it to search on, and the query was the prompt.
 
@@ -1267,6 +1320,112 @@ class Hooks(unittest.TestCase):
         self.assertNotIn("--settings", logged[0])
         self.assertIn(str(extract_mod.TIMEOUT_SEC), logged[0])
 
+    def test_a_failed_extraction_raises_the_capture_alert(self) -> None:
+        """The reason reaching `capture.log` is necessary and no longer sufficient.
+
+        Nothing reads that log on a schedule, so a failure that only reaches it is a
+        failure only the person who goes looking for it ever sees -- which is the whole
+        history of this defect. `_fail` is the one place every failing exit in `_payload`
+        passes through, and this asserts it raises the same reason it logs, in the raw
+        words the CLI used rather than the "extraction did not run: " line prefix, since
+        that prefix is capture.log's framing and not something a banner should repeat.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import extract as extract_mod
+        finally:
+            sys.path.pop(0)
+
+        said = "Failed to authenticate: OAuth session expired and could not be refreshed"
+        envelope = json.dumps({"is_error": True, "result": said, "usage": {}})
+
+        class _Dead:
+            returncode = 1
+            stdout = envelope
+            stderr = ""
+
+        raised: list[str] = []
+        original_run = extract_mod.subprocess.run
+        original_log, original_raise = extract_mod.log, extract_mod.raise_capture_alert
+        extract_mod.subprocess.run = lambda *a, **k: _Dead()  # type: ignore[assignment]
+        extract_mod.log = lambda _line: None  # type: ignore[assignment]
+        extract_mod.raise_capture_alert = raised.append  # type: ignore[assignment]
+        try:
+            extract_mod._payload("a turn", "a prompt")
+        finally:
+            extract_mod.subprocess.run = original_run  # type: ignore[assignment]
+            extract_mod.log = original_log  # type: ignore[assignment]
+            extract_mod.raise_capture_alert = original_raise  # type: ignore[assignment]
+
+        self.assertEqual(raised, [said])
+
+    def test_the_recursion_guard_does_not_raise_an_alert(self) -> None:
+        """The child stands down on every single extraction; that is not a failure.
+
+        `_payload` returns immediately, before spawning anything, whenever it finds
+        itself already inside an extraction -- that is the guard working, not `claude -p`
+        failing. Raising an alert on this path would mean the extractor looked broken on
+        every turn it correctly mined, which is worse than the silence it replaces.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib.extract import SENTINEL, _payload
+            from lib import extract as extract_mod
+        finally:
+            sys.path.pop(0)
+
+        raised: list[str] = []
+        original_raise = extract_mod.raise_capture_alert
+        extract_mod.raise_capture_alert = raised.append  # type: ignore[assignment]
+        original_env = os.environ.get(SENTINEL)
+        os.environ[SENTINEL] = "1"
+        try:
+            result, usage = _payload("anything at all", "prompt")
+        finally:
+            extract_mod.raise_capture_alert = original_raise  # type: ignore[assignment]
+            if original_env is None:
+                os.environ.pop(SENTINEL, None)
+            else:
+                os.environ[SENTINEL] = original_env
+
+        self.assertEqual((result, usage), ("", {}))
+        self.assertEqual(raised, [], "the recursion guard raised an alert on itself")
+
+    def test_a_successful_extraction_clears_the_alert(self) -> None:
+        """An error message left on screen after the thing it described was fixed.
+
+        `claude -p` answering at all -- whether or not it found a fact worth storing --
+        means the extractor is working again, and any alert an earlier failure raised is
+        now stale. This is the one `_payload` exit that is not a failure at all, so it is
+        the one that clears rather than raises.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import extract as extract_mod
+        finally:
+            sys.path.pop(0)
+
+        envelope = json.dumps({"is_error": False, "result": '{"facts": []}', "usage": {}})
+
+        class _Fine:
+            returncode = 0
+            stdout = envelope
+            stderr = ""
+
+        cleared = []
+        original_run = extract_mod.subprocess.run
+        original_clear = extract_mod.clear_capture_alert
+        extract_mod.subprocess.run = lambda *a, **k: _Fine()  # type: ignore[assignment]
+        extract_mod.clear_capture_alert = lambda: cleared.append(True)  # type: ignore[assignment]
+        try:
+            result, _usage = extract_mod._payload("a turn", "a prompt")
+        finally:
+            extract_mod.subprocess.run = original_run  # type: ignore[assignment]
+            extract_mod.clear_capture_alert = original_clear  # type: ignore[assignment]
+
+        self.assertEqual(result, '{"facts": []}')
+        self.assertEqual(cleared, [True])
+
     def test_capture_mines_one_turn_and_never_skips_text(self) -> None:
         """Batching was cheaper and lost data, which is not a trade worth making.
 
@@ -1598,6 +1757,150 @@ class Extraction(unittest.TestCase):
                 self.assertNotIn("Memvara scope", turn)
                 self.assertNotIn("what is already known", turn)
                 self.assertNotIn("Recalled from Memvara", turn)
+
+
+class CaptureAlert(unittest.TestCase):
+    """The state machine behind `⋈ Memvara · ... · capture failing: ...`.
+
+    `lib.extract` raises this and clears it; `lib.ipc` decides when it is due; `recall.py`
+    is the only thing that ever speaks it, because `capture.py` runs `async` and cannot
+    speak for itself. These tests exercise `lib.ipc` directly, against a temp directory of
+    their own rather than the module-wide redirected `_HOME` -- the report-once / remind /
+    reset transitions are the actual claim, and asserting them against a home this class
+    owns outright is more legible than reading them back through the shared fixture.
+
+    `setUp`/`tearDown`, not a per-test `try`/`finally`, and the reason is not tidiness.
+    `ipc._HOME` is one attribute on a module object every test in this file shares --
+    `setUpModule` already points it at a home the whole suite uses for the run, and a test
+    here that reassigned it without restoring the exact prior value in a `finally` would
+    leave every test that runs afterward, in this same process, reading and writing
+    whichever temp directory this class happened to use last. A first version of this
+    class did exactly that with `importlib.reload(ipc)`, which is worse than a bare
+    reassignment: reload re-executes the whole module, so it also resets `RUNTIME_DIR`
+    and every other constant built from `_HOME` at import time, back to this developer's
+    own real home, for the rest of the run.
+    """
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import ipc
+        finally:
+            sys.path.pop(0)
+        self.ipc = ipc
+        self._was_home = ipc._HOME
+        self.home = tempfile.mkdtemp(prefix="memvara-test-alert-")
+        ipc._HOME = self.home
+
+    def tearDown(self) -> None:
+        self.ipc._HOME = self._was_home
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def test_a_fresh_failure_is_reported_immediately(self) -> None:
+        self.ipc.raise_capture_alert("OAuth session expired")
+        self.assertEqual(self.ipc.due_capture_alert(1000.0),
+                         "capture failing: OAuth session expired")
+
+    def test_it_does_not_repeat_inside_the_reminder_window(self) -> None:
+        self.ipc.raise_capture_alert("OAuth session expired")
+        first = self.ipc.due_capture_alert(1000.0)
+        self.assertTrue(first)
+        second = self.ipc.due_capture_alert(1000.0 + 60)
+        self.assertEqual(second, "", "reported twice with no interval between")
+
+    def test_it_reminds_again_once_the_window_has_passed(self) -> None:
+        self.ipc.raise_capture_alert("OAuth session expired")
+        first_at = 1000.0
+        self.assertTrue(self.ipc.due_capture_alert(first_at))
+        still_quiet = self.ipc.due_capture_alert(
+            first_at + self.ipc.CAPTURE_ALERT_REMIND_SECONDS - 1)
+        self.assertEqual(still_quiet, "")
+        due_again = self.ipc.due_capture_alert(
+            first_at + self.ipc.CAPTURE_ALERT_REMIND_SECONDS + 1)
+        self.assertTrue(due_again, "a failure that is still happening went silent")
+
+    def test_a_changed_reason_resets_the_reminder_clock(self) -> None:
+        """A second, different failure mid-outage is new information.
+
+        Reported the moment it is seen rather than waiting out the reminder window the
+        first cause was on -- an expired login and a network outage are not the same
+        thing to act on, even if one arrived while the other's timer was still running.
+        """
+        self.ipc.raise_capture_alert("OAuth session expired")
+        self.assertTrue(self.ipc.due_capture_alert(1000.0))
+        # Still inside the window a same-cause failure would have gone quiet for.
+        self.ipc.raise_capture_alert("could not resolve app.memvara.dev")
+        self.assertEqual(
+            self.ipc.due_capture_alert(1000.0 + 5),
+            "capture failing: could not resolve app.memvara.dev")
+
+    def test_a_repeated_identical_failure_does_not_reset_the_clock(self) -> None:
+        """The other half of the same rule: unchanged does not mean urgent.
+
+        `claude -p` fails identically on most turns during an outage, and raising the
+        alert on every one of them must not push the reminder clock forward each time --
+        that would mean a busy session never goes quiet no matter how long the reminder
+        interval is set to.
+        """
+        self.ipc.raise_capture_alert("OAuth session expired")
+        self.assertTrue(self.ipc.due_capture_alert(1000.0))
+        # The extractor keeps failing the same way on the next several turns.
+        for _ in range(5):
+            self.ipc.raise_capture_alert("OAuth session expired")
+        still_quiet = self.ipc.due_capture_alert(
+            1000.0 + self.ipc.CAPTURE_ALERT_REMIND_SECONDS - 1)
+        self.assertEqual(still_quiet, "",
+                         "re-raising an unchanged reason pushed the reminder clock")
+
+    def test_clearing_silences_it_until_the_next_failure(self) -> None:
+        """A cleared alert must stay quiet even once a reminder would otherwise be due.
+
+        Checking one second after `clear_capture_alert()` is not this test: inside the
+        reminder window, nothing would be due regardless of whether the file was actually
+        removed, so a `clear_capture_alert` that had quietly become a no-op would pass it
+        too. Only checking *past* the window -- the moment a still-open alert would remind
+        again -- can tell "cleared" apart from "simply not due yet".
+        """
+        self.ipc.raise_capture_alert("OAuth session expired")
+        self.assertTrue(self.ipc.due_capture_alert(1000.0))
+        self.ipc.clear_capture_alert()
+        past_the_window = 1000.0 + self.ipc.CAPTURE_ALERT_REMIND_SECONDS + 1
+        self.assertEqual(self.ipc.due_capture_alert(past_the_window), "")
+
+    def test_nothing_is_due_when_nothing_has_ever_failed(self) -> None:
+        """The common case: an install where `claude -p` has never once failed.
+
+        Asserted because `due_capture_alert` opens a file that does not exist on this
+        path -- the one call every single prompt makes, on every install that has never
+        had this problem -- and a change that turned the missing-file case into an
+        exception rather than `""` would fail silently at the layer above: `main()`
+        already treats `Exception` from `fast_recall` as "no answer", not as a crash, and
+        would swallow it the same way.
+        """
+        self.assertEqual(self.ipc.due_capture_alert(1000.0), "")
+
+    def test_clearing_something_that_was_never_raised_is_not_an_error(self) -> None:
+        self.ipc.clear_capture_alert()  # must not raise
+
+    def test_the_alert_path_follows_a_reassigned_home_rather_than_a_frozen_one(self) -> None:
+        """The one thing that made every test above possible.
+
+        `RUNTIME_DIR` is a module-level constant built from `_HOME` at import time, and
+        reassigning `ipc._HOME` afterwards does not move it -- the constant already has
+        its string. `store_key` and `log_line` avoid that by reading `_HOME` fresh inside
+        the function body, which is the only reason this repository's shared test fixture
+        (`setUpModule`, which reassigns `ipc._HOME` for the whole suite) can redirect them
+        at all. The alert path has to follow the same convention or every test above would
+        silently read and write the developer's own `~/.memvara/.hooks/capture-alert.json`
+        instead of a temp directory -- passing, and proving nothing.
+        """
+        before = self.ipc._alert_path()
+        self.assertTrue(before.startswith(self.home), "setUp's own redirection failed")
+        self.ipc._HOME = "/somewhere/nobody/has/a/home/directory"
+        after = self.ipc._alert_path()
+        self.assertNotEqual(before, after,
+                            "the alert path was computed once and cached, like RUNTIME_DIR")
+        self.assertTrue(after.startswith("/somewhere/nobody/has/a/home/directory"))
 
 
 class Usage(unittest.TestCase):

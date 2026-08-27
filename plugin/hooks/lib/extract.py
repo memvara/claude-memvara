@@ -17,8 +17,9 @@ Two guards matter more than the cost:
   child is launched with an empty hook set, and the environment sentinel is a second
   independent stop in case a future client reads hooks from somewhere this does not
   override.
-* **Silence.** Every failure here returns no facts. A capture that cannot run is a capture
-  that did not happen, never an error the user has to see.
+* **Silence.** Every failure here returns no facts, which is right: a capture that cannot
+  run must not fabricate one. It used to mean the failure itself went unseen too, and that
+  half is a defect rather than a design -- see `_fail` below.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ import unicodedata
 
 from typing import NamedTuple, Sequence
 
-from .ipc import CAPTURE_SENTINEL
+from .ipc import CAPTURE_SENTINEL, clear_capture_alert, raise_capture_alert
 from .transcript import user_lines
 from .usage import record_extraction
 from .write import log
@@ -337,6 +338,24 @@ def _reason(proc: "subprocess.CompletedProcess", body: "dict | None") -> str:
     return f"exit {proc.returncode}, and it said nothing"
 
 
+def _fail(log_line: str, reason: str) -> None:
+    """Log a failed run and raise the alert `recall.py` relays, together.
+
+    One call rather than two at each site because the two must never drift apart. Before
+    this they were separate: the reason reached `capture.log`, which nothing reads on a
+    schedule, and the terminal -- the one channel a person is actually watching -- stayed
+    silent. Extraction stopped for 34 hours and 117 turns logged `facts=0` with nothing
+    anywhere saying the extractor had not run at all; fixing the log line alone would
+    repeat that, just with a better-worded log nobody was reading either.
+
+    Not called from the recursion guard at the top of `_payload`. That branch fires inside
+    the extraction child itself on every single run -- it is the guard working, and
+    alerting on it would make every successful stand-down look like an outage.
+    """
+    log(log_line)
+    raise_capture_alert(reason)
+
+
 def _payload(text: str, prompt: str) -> "tuple[str, dict]":
     """The model's reply and what it cost, or `('', {})` if the run failed.
 
@@ -371,10 +390,12 @@ def _payload(text: str, prompt: str) -> "tuple[str, dict]":
         # Named rather than formatted. `TimeoutExpired.__str__` opens with the whole argv,
         # so `{exc}` clipped to REASON_CHARS logs the command and truncates away the words
         # "timed out" -- argv in the one line whose job is to say what went wrong.
-        log(f"extraction did not run: no reply within {TIMEOUT_SEC}s")
+        reason = f"no reply within {TIMEOUT_SEC}s"
+        _fail(f"extraction did not run: {reason}", reason)
         return "", {}
     except (OSError, subprocess.SubprocessError) as exc:
-        log(f"extraction did not run: {type(exc).__name__}: {exc}"[:REASON_CHARS])
+        reason = f"{type(exc).__name__}: {exc}"[:REASON_CHARS]
+        _fail(f"extraction did not run: {reason}", reason)
         return "", {}
 
     body = _decode(proc.stdout)
@@ -386,14 +407,23 @@ def _payload(text: str, prompt: str) -> "tuple[str, dict]":
     # failures the invisible ones -- which is what the return-code path used to do, where
     # it discarded the envelope's usage along with its reply.
     if proc.returncode != 0:
-        log(f"extraction did not run: {_reason(proc, body)}")
+        reason = _reason(proc, body)
+        _fail(f"extraction did not run: {reason}", reason)
         return "", usage
     if body is None:
-        log("extraction did not run: claude -p returned something that is not JSON")
+        reason = "claude -p returned something that is not JSON"
+        _fail(f"extraction did not run: {reason}", reason)
         return "", {}
     if body.get("is_error"):
-        log(f"extraction failed: {_reason(proc, body)}")
+        reason = _reason(proc, body)
+        _fail(f"extraction failed: {reason}", reason)
         return "", usage
+
+    # The one exit that means `claude -p` actually answered. Whatever it said about the
+    # turn -- facts, or none -- the extractor itself is working, and any earlier alert is
+    # exactly as stale as an error message left on screen after the thing it described was
+    # fixed.
+    clear_capture_alert()
     return str(body.get("result") or ""), usage
 
 

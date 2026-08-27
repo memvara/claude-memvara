@@ -53,7 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.fast import recall as fast_recall  # noqa: E402
 from lib.ipc import (  # noqa: E402
-    emit_json, log_line, payload, plural, status, under_extraction,
+    due_capture_alert, emit_json, log_line, payload, plural, status, under_extraction,
 )
 
 #: Enough memories to be useful, few enough to stay out of the way. Recall drops whole
@@ -578,6 +578,24 @@ def _belongs_here(bullet: str, cwd: str) -> bool:
         node = parent
 
 
+def _with_alert(text: str, alert: str) -> str:
+    """A status line, with word of a failing extractor riding along on it.
+
+    `capture.py` runs `async` and cannot print anything of its own -- the client discards
+    an async hook's output entirely, which is why its whole account moved to
+    `capture.log` in the first place. Nobody reads that on a schedule, so a `claude -p`
+    that has been failing for hours says nothing anyone sees until this file, the one
+    hook that already speaks on every prompt, relays it.
+
+    Attached only to a banner this file was already going to print. `under_extraction`
+    and the two skip paths above stay silent by design -- one runs inside a machine
+    child, the other two are a person who typed a command and is not waiting on a reply
+    -- and riding an alert on top of intentional silence would be a second kind of noise
+    this file exists to avoid, not the one it is trying to fix.
+    """
+    return f"{text} · {alert}" if alert else text
+
+
 def main() -> int:
     if under_extraction():
         # The prompt in front of us is `capture.py`'s own extraction request, not a
@@ -601,6 +619,10 @@ def main() -> int:
         log_line("recall", "skipped=machine prompt")
         return 0
 
+    # Read once and carried through every branch below, rather than at each emit site,
+    # so a failure seen mid-prompt cannot be reported twice for the one prompt that saw it.
+    alert = due_capture_alert(time.time())
+
     seen, carried = _read_state(session)
     standing, standing_state = _standing_refresh(
         session, time.time(), str(data.get("cwd") or ""))
@@ -622,7 +644,7 @@ def main() -> int:
         # indistinguishable from a hook that has stopped working -- which is the failure
         # this file exists to stop repeating -- but reported as what it is rather than as a
         # breakage someone would go looking for.
-        emit_json({"systemMessage": status("not configured")})
+        emit_json({"systemMessage": _with_alert(status("not configured"), alert)})
         return 0
     if not ok:
         # Four outcomes had four messages and a fifth was wearing the wrong one. A store
@@ -632,7 +654,7 @@ def main() -> int:
         # whole file is built on.
         detail = _quota_line(why)
         log_line("recall", f"failed reason={why or 'unknown'}")
-        emit_json({"systemMessage": status(detail or "recall failed")})
+        emit_json({"systemMessage": _with_alert(status(detail or "recall failed"), alert)})
         return 0
 
     here = str(data.get("cwd") or "")
@@ -680,14 +702,14 @@ def main() -> int:
             # carry it, or a rule written mid-session waits for the next prompt that
             # happens to match something.
             emit_json({
-                "systemMessage": status("standing preferences updated"),
+                "systemMessage": _with_alert(status("standing preferences updated"), alert),
                 "hookSpecificOutput": {
                     "hookEventName": "UserPromptSubmit",
                     "additionalContext": standing,
                 },
             })
             return 0
-        emit_json({"systemMessage": note})
+        emit_json({"systemMessage": _with_alert(note, alert)})
         return 0
 
     _write_state(session, seen + [_digest(line) for line in fresh], topic, standing_state)
@@ -711,7 +733,7 @@ def main() -> int:
         f"clipped={sum(1 for s_, f_ in zip(clipped, fresh) if s_ != f_)}")
     _sample(prompt, fresh, anaphoric=anaphoric and bool(carried))
     emit_json({
-        "systemMessage": label,
+        "systemMessage": _with_alert(label, alert),
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": block_text,
