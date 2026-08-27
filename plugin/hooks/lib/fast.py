@@ -67,12 +67,38 @@ def _spawn(root: str) -> None:
         pass
 
 
+#: What a caller may be told about a failure, as a token rather than a sentence. Words are
+#: the banner's business; this file's job is to say which kind of failure it was without
+#: importing anything to do it.
+QUOTA = "quota"
+
+
+def _reason(exc: "BaseException") -> str:
+    """The short token for a failure, or `""` when there is nothing useful to add.
+
+    Duck-typed on the attribute rather than on the class, so this file keeps its promise
+    not to import `lib.hosted` -- which pulls in `ssl` and `http.client` -- on a path that
+    runs for every prompt against a ~30ms budget. `getattr` on an exception costs nothing
+    and an exception that does not carry a code answers `""`.
+    """
+    if getattr(exc, "code", "") != "quota_exhausted":
+        return ""
+    detail = getattr(exc, "detail", None)
+    when = str((detail or {}).get("resets_at") or "")[:10]
+    # The date rides along because it is the half that makes the banner actionable: "spent"
+    # tells the reader to stop retrying, and only "resets on the 1st" tells them how long
+    # for. Joined into the token rather than given its own slot -- one more slot for one
+    # more fact does not generalise, and the caller splitting on a colon does.
+    return f"{QUOTA}:{when}" if when else QUOTA
+
+
 def recall(query: str, *, k: int = 6, budget: int = 700, header: str | None = None,
            include_episodes: bool = False, memory_types: "list[str] | None" = None,
-           spawn: bool = True) -> "tuple[str, bool | None]":
+           spawn: bool = True) -> "tuple[str, bool | None, str]":
     """Recall text for `query`, by whatever route is available.
 
-    Returns `(text, ok)` with three states, because there are three things that can happen
+    Returns `(text, ok, reason)`. `ok` has three states, because there are three things
+    that can happen
     and collapsing any two of them hides a real one:
 
     * `True` -- a store was asked and answered. `text` may still be empty, and that is a
@@ -85,11 +111,17 @@ def recall(query: str, *, k: int = 6, budget: int = 700, header: str | None = No
       failure, and reporting it as one sends someone who has simply not logged in to read a
       log that will tell them nothing.
 
+    The third slot is `reason`: `""` when there is nothing to add, else a short token the
+    caller can turn into words -- `"quota"` today. It exists because `False` alone sent a
+    user to read a log about a store that was answering perfectly and telling him, in the
+    body of a 402, exactly which allowance was spent and when it resets.
+
     A plain tuple rather than a NamedTuple on purpose: `typing` is not imported anywhere on
-    this path, and this file runs on every prompt against a ~30ms budget.
+    this path, and this file runs on every prompt against a ~30ms budget. A third slot
+    costs nothing; a class would cost the import.
     """
     if not query.strip():
-        return "", True
+        return "", True, ""
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -112,7 +144,7 @@ def recall(query: str, *, k: int = 6, budget: int = 700, header: str | None = No
             # `""` from a healthy daemon is a real answer -- this store has nothing
             # relevant -- and must not send the slow path off to ask again. A daemon
             # reporting failure is the opposite and falls through.
-            return served, True
+            return served, True, ""
 
     from .open import open_store
 
@@ -126,21 +158,22 @@ def recall(query: str, *, k: int = 6, budget: int = 700, header: str | None = No
         if client is None:
             # Nothing is configured at all -- no local database, no library to read one
             # with, and no credentials file. Distinct from a store that would not answer.
-            return "", None
+            return "", None, ""
         try:
             text = client.recall(query, k=k, budget=budget, header=header,
                                  include_episodes=include_episodes,
                                  memory_types=memory_types)
-        except Exception:
+        except Exception as exc:
             # Including HostedError. Nothing below this to fall through to -- but the
             # caller still has a banner to print, and "could not ask" is not "nothing
-            # to say".
-            return "", False
+            # to say". Nor is "could not ask" the same as "would not": a refusal the
+            # server explained is worth repeating rather than flattening to False.
+            return "", False, _reason(exc)
         finally:
             client.close()
         if spawn and path is not None:
             _spawn(root)
-        return text, True
+        return text, True, ""
 
     try:
         kwargs = {"k": k, "budget": budget}
@@ -151,14 +184,14 @@ def recall(query: str, *, k: int = 6, budget: int = 700, header: str | None = No
         if memory_types:
             kwargs["memory_types"] = list(memory_types)
         text = str(store.recall(query, **kwargs) or "")
-    except Exception:
+    except Exception as exc:
         if spawn and path is not None:
             _spawn(root)
-        return "", False
+        return "", False, _reason(exc)
 
     if spawn and path is not None:
         _spawn(root)
-    return text, True
+    return text, True, ""
 
 
 def _served(answer: "str | None") -> "str | None":

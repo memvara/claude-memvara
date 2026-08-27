@@ -85,10 +85,13 @@ client discards an async hook's output, so the report moves to
 that reaches a decision writes a line there, including the ones that
 decide to do nothing.
 
-Recall distinguishes three outcomes, and two of them used to read the
-same. `⋈ Memvara · no matching memories` means the store was asked and had
-nothing; `⋈ Memvara · recall failed — see capture.log` means it could not
-be asked at all. Collapsing those into one message is how a hosted client
+Recall distinguishes four outcomes, and they used to read as fewer.
+`⋈ Memvara · no matching memories` means the store was asked and had
+nothing; `⋈ Memvara · recall failed` means it could not be asked at all;
+`⋈ Memvara · retrieval quota spent — resets 1 Sep` means it answered and
+refused, which is a different thing and wants a different response — the
+date is there because "spent" alone reads as "retry later", and retrying
+is the one thing that cannot work. Collapsing those into one message is how a hosted client
 whose session id had gone stale went on reporting an empty store for a
 whole session — from the terminal that is indistinguishable from a store
 that is genuinely empty, and nobody investigates an empty store. Three
@@ -96,6 +99,16 @@ separate defects had to line up for it, and each is now closed: the
 client re-handshakes instead of holding a dead session id, the daemon
 answers `{"ok": false}` instead of an empty string, and the client only
 treats `ok: true` as authoritative.
+
+The same shape returned once more, from the other end. A spent quota is a
+refusal the server explains in full — which allowance, how much of it,
+and the instant it resets — and every word was discarded before it
+reached the banner, which then named a log this hook has never written to.
+The session block was worse: it builds one of its sections with `recall`,
+swallowed the refusal, and went on announcing a memory count over a block
+that was a section short. A count is a claim about what arrived, so when
+a section cannot be fetched the banner now says which and why:
+`⋈ Memvara · session opened with 29 memories · notes unavailable (quota)`.
 
 **Storage is rich; injection is clipped.** They are different jobs. A
 memory worth keeping carries its reasoning — that is what stopped captured

@@ -469,6 +469,34 @@ def _standing_refresh(session: str, now: float, cwd: str = "") -> "tuple[str, tu
     return block.rstrip(), (fresh, now)
 
 
+#: What the server calls a spent allowance, as `lib.fast` hands it over: `quota` alone, or
+#: `quota:2026-09-01` when the refusal named the instant the period rolls over.
+_QUOTA = "quota"
+
+#: Month names for the one date this file renders. `datetime.strftime` would do it in a
+#: line and cost an import on a path measured at ~30ms, where `import datetime` is a
+#: measurable share of the budget. Twelve strings are cheaper than a module.
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _quota_line(why: str) -> str:
+    """The banner for a spent allowance, or `""` when the failure was something else.
+
+    Says *retrieval* rather than the metric's own name: `retrieval.query` is what the
+    server meters and not a phrase anyone reads. Says the reset date because "spent" on
+    its own reads as "broken, retry later", and retrying is precisely what will not work.
+    """
+    if not why.startswith(_QUOTA):
+        return ""
+    _, _, when = why.partition(":")
+    parts = when.split("-")
+    if len(parts) == 3 and parts[1].isdigit() and 1 <= int(parts[1]) <= 12:
+        day = parts[2].lstrip("0") or parts[2]
+        return f"retrieval quota spent — resets {day} {_MONTHS[int(parts[1]) - 1]}"
+    return "retrieval quota spent"
+
+
 def main() -> int:
     data = payload()
     prompt = str(data.get("prompt") or "").strip()
@@ -488,10 +516,10 @@ def main() -> int:
     query = f"{carried} {prompt}".strip() if (anaphoric and carried) else prompt
 
     try:
-        block, ok = fast_recall(query, k=K, budget=BUDGET, header=HEADER)
+        block, ok, why = fast_recall(query, k=K, budget=BUDGET, header=HEADER)
     except Exception:
         # A retrieval failure must not become a failed prompt.
-        block, ok = "", False
+        block, ok, why = "", False, ""
 
     if ok is None:
         # Nothing configured. Still reported, because a hook that prints nothing is
@@ -501,7 +529,14 @@ def main() -> int:
         emit_json({"systemMessage": status("not configured")})
         return 0
     if not ok:
-        emit_json({"systemMessage": status("recall failed — see capture.log")})
+        # Four outcomes had four messages and a fifth was wearing the wrong one. A store
+        # that is answering, and refusing on a stated allowance, is not a store that could
+        # not be reached -- and the old line sent the reader to `capture.log`, which this
+        # file has never written a byte to. The words differ because that is the rule this
+        # whole file is built on.
+        detail = _quota_line(why)
+        log_line("recall", f"failed reason={why or 'unknown'}")
+        emit_json({"systemMessage": status(detail or "recall failed")})
         return 0
 
     header, bullets = _split(block)
@@ -518,8 +553,8 @@ def main() -> int:
         # trip on an already-thin prompt, and it starts working the day the server is
         # fixed, with no release here.
         try:
-            wider, wider_ok = fast_recall(query, k=EPISODE_K, budget=EPISODE_BUDGET,
-                                          header=HEADER, include_episodes=True)
+            wider, wider_ok, _ = fast_recall(query, k=EPISODE_K, budget=EPISODE_BUDGET,
+                                             header=HEADER, include_episodes=True)
         except Exception:
             wider, wider_ok = "", False
         if wider_ok and wider:
