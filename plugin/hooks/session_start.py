@@ -34,7 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lib.ipc import emit_json, payload, plural, status  # noqa: E402
+from lib.ipc import emit_json, payload, plural, status, under_extraction  # noqa: E402
 from lib.standing import standing_block  # noqa: E402
 from lib.write import open_writer  # noqa: E402
 
@@ -147,6 +147,20 @@ def _binding_line(scope: str, visible: str) -> str:
 
 
 def main() -> int:
+    if under_extraction():
+        # `claude -p` opens a session like any other, so this hook fired inside every
+        # extraction and built the whole standing block for a child that was about to be
+        # handed one prompt and killed. The larger of the two leaks, measured: the block
+        # runs to ~13KB and a fresh child has no session state to deduplicate it against,
+        # so all of it was spent, every time.
+        #
+        # Silent, where `recall.py` logs its own stand-down. That line already makes the
+        # sentinel countable, and the two hooks fail together -- a sentinel that stopped
+        # working would take the skip lines out of recall.log and put the standing block
+        # back into the extractor in the same breath. A second log file for a path that
+        # does nothing buys a second place to look, not a second thing to see.
+        return 0
+
     # Read before opening the store: the standing block is filtered to this user and this
     # checkout, and `cwd` is how the second half is known. An unreadable payload gives "",
     # which `_mine` treats as "user notes only" -- the safe direction, since the failure it

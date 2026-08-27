@@ -31,13 +31,19 @@ import unicodedata
 
 from typing import NamedTuple, Sequence
 
+from .ipc import CAPTURE_SENTINEL
 from .transcript import user_lines
 from .usage import record_extraction
 from .write import log
 
 #: Set in the child's environment. If a hook ever sees this, it is running underneath an
 #: extraction and must not start another one.
-SENTINEL = "MEMVARA_CAPTURE_ACTIVE"
+#:
+#: Defined in `lib.ipc` and re-exported here under the name this module has always used.
+#: The read hooks stand down on the same sentinel, and they import `ipc` and not this
+#: module -- `extract` pulls in `lib.write`, which costs ~95ms of `import memvara` on a
+#: path that runs on every prompt. One string, one definition, two import costs.
+SENTINEL = CAPTURE_SENTINEL
 
 #: Cheapest model that reliably returns well-formed triples for this job.
 MODEL = "claude-haiku-4-5-20251001"
@@ -288,6 +294,49 @@ def build_prompt(cwd: "str | None" = None) -> str:
             + PROMPT_TAIL)
 
 
+#: Enough of a failure to name it in one log line without wrapping the terminal.
+REASON_CHARS = 200
+
+
+def _decode(stdout: str) -> "dict | None":
+    """The reply envelope, or `None` when it is not readable JSON.
+
+    Decoded once and passed around, because the envelope is needed for three separate
+    things -- the token counts, the failure reason, and the reply itself -- and parsing it
+    per question is how they came to be read in an order that threw two of them away.
+    """
+    try:
+        body = json.loads(stdout)
+    except (ValueError, TypeError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _reason(proc: "subprocess.CompletedProcess", body: "dict | None") -> str:
+    """Why a run failed, in the words the CLI used.
+
+    The reason is in **stdout**, and it is there even when the process exits non-zero: an
+    expired login arrives as a well-formed envelope whose `result` reads "Failed to
+    authenticate: OAuth session expired and could not be refreshed", with `exit 1` beside
+    it. The old order checked the return code first and returned before parsing anything,
+    so the one sentence naming the cause was discarded and the failure reached the log as
+    `facts=0` -- the same line a turn with genuinely nothing in it writes.
+
+    That cost 34 hours. Extraction stopped at 2026-08-25T22:55 and 117 turns were mined
+    afterwards, every one of them logging `facts=0`, with nothing anywhere saying the
+    extractor had not run at all. `usage.jsonl` went silent on the same return, for the
+    same reason, and so could not contradict it either.
+    """
+    if isinstance(body, dict):
+        said = str(body.get("result") or "").strip()
+        if said:
+            return said[:REASON_CHARS]
+    lines = (proc.stderr or "").strip().splitlines()
+    if lines:
+        return lines[-1][:REASON_CHARS]
+    return f"exit {proc.returncode}, and it said nothing"
+
+
 def _payload(text: str, prompt: str) -> "tuple[str, dict]":
     """The model's reply and what it cost, or `('', {})` if the run failed.
 
@@ -305,8 +354,12 @@ def _payload(text: str, prompt: str) -> "tuple[str, dict]":
         proc = subprocess.run(
             [
                 "claude", "-p",
-                # An empty hook set is what stops this recursing. Without it the child's
-                # own Stop hook fires and spawns another child, without limit.
+                # Clears the hooks a settings file declares. It does NOT clear the ones a
+                # plugin registers -- measured, with a marker file: the child still fires
+                # this plugin's own SessionStart and UserPromptSubmit. So this is one of
+                # two guards and not the load-bearing one; SENTINEL is what actually stops
+                # the recursion, and `ipc.under_extraction` is what stands the read hooks
+                # down. Kept because a settings-declared Stop hook is a real way in.
                 "--settings", '{"hooks":{}}',
                 "--model", MODEL,
                 "--output-format", "json",
@@ -314,21 +367,32 @@ def _payload(text: str, prompt: str) -> "tuple[str, dict]":
             ],
             capture_output=True, text=True, timeout=TIMEOUT_SEC, env=env,
         )
-    except (OSError, subprocess.SubprocessError):
+    except subprocess.TimeoutExpired:
+        # Named rather than formatted. `TimeoutExpired.__str__` opens with the whole argv,
+        # so `{exc}` clipped to REASON_CHARS logs the command and truncates away the words
+        # "timed out" -- argv in the one line whose job is to say what went wrong.
+        log(f"extraction did not run: no reply within {TIMEOUT_SEC}s")
         return "", {}
-    if proc.returncode != 0:
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"extraction did not run: {type(exc).__name__}: {exc}"[:REASON_CHARS])
         return "", {}
 
-    try:
-        body = json.loads(proc.stdout)
-    except ValueError:
-        return "", {}
-
-    usage = body.get("usage")
+    body = _decode(proc.stdout)
+    usage = (body or {}).get("usage")
     usage = usage if isinstance(usage, dict) else {}
+
+    # Usage is read before any of the ways this returns empty. A failed run still burned
+    # the preamble, and accounting that counted only successes would make the expensive
+    # failures the invisible ones -- which is what the return-code path used to do, where
+    # it discarded the envelope's usage along with its reply.
+    if proc.returncode != 0:
+        log(f"extraction did not run: {_reason(proc, body)}")
+        return "", usage
+    if body is None:
+        log("extraction did not run: claude -p returned something that is not JSON")
+        return "", {}
     if body.get("is_error"):
-        # Reported even so. A failed run still burned the preamble, and accounting that
-        # counted only successes would make the expensive failures the invisible ones.
+        log(f"extraction failed: {_reason(proc, body)}")
         return "", usage
     return str(body.get("result") or ""), usage
 

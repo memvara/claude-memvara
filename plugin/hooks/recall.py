@@ -52,7 +52,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.fast import recall as fast_recall  # noqa: E402
-from lib.ipc import emit_json, log_line, payload, plural, status  # noqa: E402
+from lib.ipc import (  # noqa: E402
+    emit_json, log_line, payload, plural, status, under_extraction,
+)
 
 #: Enough memories to be useful, few enough to stay out of the way. Recall drops whole
 #: notes weakest-first to fit, so this is a ceiling and not a target.
@@ -154,6 +156,25 @@ EPISODE_BUDGET = 600
 #: nothing, and get it silently. Deduplication already solves the repetition this was aimed
 #: at, and solves it by measuring rather than guessing.
 SKIP_PREFIXES = ("/", "!", "#")
+
+#: Envelopes the *client* submits through this event, which no person typed.
+#:
+#: `UserPromptSubmit` is not only the user's prompt. A finished background task and a
+#: message from another session both arrive as one, wrapped in a tag, and recall answered
+#: them like anything else. Measured over one day's census: 4 of 36 real submissions were
+#: these, and every one of them was answered with memories nobody could use -- a task id
+#: and a socket path have no topic, so the query was a vector over machine punctuation.
+#:
+#: Matched on the opening tag rather than a generic "starts with `<`", because a person
+#: pasting XML, HTML or a diff is asking a real question about it. Listed rather than
+#: inferred: these are the two observed, and a third should be added when it is seen and
+#: not before -- guessing at tag names would silence prompts nobody has evidence of.
+#:
+#: Kept separate from `SKIP_PREFIXES` because the reason differs, and the reasons are what
+#: someone editing this needs. Above: the user typed a command and is not waiting on
+#: memory. Here: there is no user, and the cost is a retrieval query against an allowance
+#: that is not per-session.
+MACHINE_PREFIXES = ("<task-notification", "<cross-session-message")
 
 #: Where the per-session record of what has already been injected lives. Beside the store,
 #: not in the plugin, which is replaced wholesale on update.
@@ -497,12 +518,87 @@ def _quota_line(why: str) -> str:
     return "retrieval quota spent"
 
 
+#: A subject of this shape names one checkout on this machine and nothing else. The
+#: convention is the user's own -- `project:<absolute path>` for a fact that is true of one
+#: working tree -- and these are written by hand through `memory_remember`, not by the
+#: capture hook, which files under a git-remote name instead.
+PROJECT_SUBJECT = "- project:"
+
+
+def _belongs_here(bullet: str, cwd: str) -> bool:
+    """Whether a checkout-scoped memory belongs to the checkout we are in.
+
+    Everything that is not checkout-scoped passes untouched: a fact about `memvara_web`, or
+    about the user, is cross-cutting and is exactly what recall is for. Only a subject that
+    names an absolute path is claiming to be about one tree, and a query has no way to know
+    which tree it was asked from -- `memory_recall` takes a query, a k and a budget, and no
+    scope, so the server cannot filter this and the ranker never sees the question.
+
+    Measured over one day's census: five memories from three unrelated checkouts --
+    `Desktop/snorkel` three times, `expense-tracker`, `ai_app` -- landed in memvara
+    sessions, including on a prompt asking which observability tool to use, where both
+    answers came from other projects. The standing block has filtered on `cwd` since 0.2.0;
+    the per-prompt path never has.
+
+    Dropping rather than replacing is deliberate and is a real limit: the slot is not
+    refilled, because the candidates were ranked and cut to `k` before this sees them. Three
+    relevant notes beat three relevant notes and one about a different repository, so it is
+    still the right trade -- but the honest description is that this removes noise and does
+    not add signal.
+
+    An unreadable `cwd` keeps everything. The failure to avoid is a hook that silently stops
+    recalling, and dropping notes on the strength of a path we could not read would be it.
+    """
+    if not bullet.startswith(PROJECT_SUBJECT) or not cwd:
+        return True
+    rest = bullet[len(PROJECT_SUBJECT):]
+    if not rest.startswith("/"):
+        # Not a path after all. Left alone rather than guessed at.
+        return True
+
+    # Walk up from here and ask whether the subject names this directory or one containing
+    # it, requiring the subject to END where the candidate does -- the next character must
+    # be the space before the predicate, or nothing at all.
+    #
+    # Written this way rather than by splitting `rest` on whitespace, because a path may
+    # contain a space: `/Users/me/My Project` split to `/Users/me/My`, so a memory filed
+    # for a directory was dropped from that very directory. Recalling less, silently, which
+    # is the failure this file exists to prevent.
+    #
+    # The end-of-subject requirement is also what rejects a sibling. Walking to `/A/B` and
+    # accepting any separator would match a fact filed for `/A/B/claude-memvara` against a
+    # session in `/A/B/claude-memvara-old`; insisting the subject stops there does not.
+    node = os.path.abspath(cwd)
+    while True:
+        if rest.startswith(node) and rest[len(node):len(node) + 1] in ("", " "):
+            return True
+        parent = os.path.dirname(node)
+        if parent == node:
+            return False
+        node = parent
+
+
 def main() -> int:
+    if under_extraction():
+        # The prompt in front of us is `capture.py`'s own extraction request, not a
+        # person's. Answering it spends a retrieval query and injects the standing block
+        # into the one context that must be judged on its own words. Logged rather than
+        # returned in silence, because a guard nobody can count is one nobody notices
+        # losing: these lines are what say it is still standing between the two.
+        log_line("recall", "skipped=under extraction")
+        return 0
+
     data = payload()
     prompt = str(data.get("prompt") or "").strip()
     session = str(data.get("session_id") or "")
 
     if not prompt or prompt.startswith(SKIP_PREFIXES):
+        return 0
+    if prompt.startswith(MACHINE_PREFIXES):
+        # Logged, not silent. This is the same shape as the extraction stand-down: a query
+        # not spent is invisible, and a guard that stops firing has to be noticeable
+        # somewhere before the allowance runs out again.
+        log_line("recall", "skipped=machine prompt")
         return 0
 
     seen, carried = _read_state(session)
@@ -539,7 +635,9 @@ def main() -> int:
         emit_json({"systemMessage": status(detail or "recall failed")})
         return 0
 
+    here = str(data.get("cwd") or "")
     header, bullets = _split(block)
+    bullets = [line for line in bullets if _belongs_here(line, here)]
     known = set(seen)
     fresh = [line for line in bullets if _digest(line) not in known]
 
@@ -558,7 +656,12 @@ def main() -> int:
         except Exception:
             wider, wider_ok = "", False
         if wider_ok and wider:
+            # Filtered on the same terms as the first pass. This is the branch that most
+            # needs it: it runs precisely when `fresh` came back empty, and dropping
+            # another checkout's notes is one of the things that empties it -- so without
+            # this the filter would make its own bypass fire more often.
             header, bullets = _split(wider)
+            bullets = [line for line in bullets if _belongs_here(line, here)]
             fresh = [line for line in bullets if _digest(line) not in known]
 
     repeats = len(bullets) - len(fresh)

@@ -503,6 +503,171 @@ class Hooks(unittest.TestCase):
         # goes out. That asymmetry is the feature.
         self.assertNotIn("hookSpecificOutput", body)
 
+    def test_read_hooks_stand_down_inside_an_extraction(self) -> None:
+        """`claude -p` runs this plugin's hooks, so the child must be told to stop.
+
+        `--settings '{"hooks":{}}'` clears the hooks a settings file declares and leaves a
+        plugin's registrations alone -- confirmed with a marker file: a `claude -p` run
+        fires both `SessionStart` and `UserPromptSubmit`. So every extraction ran recall
+        and built the session block for a child that was about to be handed one prompt and
+        killed. `recall-sample.log` caught it: 41 of 77 sampled prompts were the
+        extractor's own "Extract durable facts from the exchange below".
+
+        Behavioural rather than a grep for the constant, because the failure is a hook that
+        *runs*, and only running one proves it does not. Asserted on stdout, which is where
+        the damage would land: whatever these print is prepended to the very prompt that
+        has to decide which sentences in front of it are the user's.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib.ipc import CAPTURE_SENTINEL
+        finally:
+            sys.path.pop(0)
+
+        env = dict(self.BARREN)
+        env[CAPTURE_SENTINEL] = "1"
+        for script, event in (("recall.py", {"prompt": "remember that I prefer tabs"}),
+                              ("session_start.py", {"cwd": str(ROOT)})):
+            with self.subTest(script=script):
+                proc = subprocess.run(
+                    ["python3", str(HOOKS / script)],
+                    input=json.dumps(event), capture_output=True, text=True,
+                    env=env, timeout=30,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(
+                    proc.stdout.strip(), "",
+                    f"{script} spoke into an extraction: {proc.stdout!r}")
+
+    def test_a_machine_envelope_is_not_a_prompt(self) -> None:
+        """`UserPromptSubmit` carries more than what a person typed.
+
+        A finished background task and a message from another session both arrive through
+        this event, wrapped in a tag. Recall answered them like anything else: over one
+        day's census, 4 of 36 real submissions were these, and each spent a retrieval
+        query on a vector over a task id and a socket path. Behavioural, and asserted on
+        stdout, because injecting into a machine envelope is the thing to prevent.
+        """
+        for envelope in ('<task-notification> <task-id>a3de0a81</task-id> done',
+                         '<cross-session-message from="uds:/tmp/cc-socks/63684.sock">hi'):
+            with self.subTest(envelope=envelope.split(">")[0]):
+                proc = subprocess.run(
+                    ["python3", str(HOOKS / "recall.py")],
+                    input=json.dumps({"prompt": envelope, "session_id": "s"}),
+                    capture_output=True, text=True, env=self.BARREN, timeout=30,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+
+        # And a person pasting markup is still asking a real question about it. The census
+        # entry that looked machine-generated and was not: browser measurements, typed by
+        # the user two minutes after "total width is 1728".
+        proc = subprocess.run(
+            ["python3", str(HOOKS / "recall.py")],
+            input=json.dumps({"prompt": '{"w":1728,"dpr":2}', "session_id": "s"}),
+            capture_output=True, text=True, env=self.BARREN, timeout=30,
+        )
+        self.assertIn("Memvara", proc.stdout,
+                      "a data-shaped prompt a person typed was silently dropped")
+
+    def test_another_checkouts_memories_stay_in_that_checkout(self) -> None:
+        """`memory_recall` takes no scope, so the server cannot filter this.
+
+        `project:<absolute path>` names one working tree. Over one day's census five such
+        memories from three unrelated checkouts reached memvara sessions -- including a
+        prompt asking which observability tool to use, answered entirely out of
+        `Desktop/snorkel` and `expense-tracker`. The standing block has filtered on `cwd`
+        since 0.2.0; the per-prompt path never has.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from recall import _belongs_here
+        finally:
+            sys.path.pop(0)
+
+        here = "/Applications/workstation/claude-memvara"
+        # The real leaked lines, verbatim from recall-sample.log.
+        for foreign in ("- project:/Users/inderjeetsingh/Desktop/snorkel terminus docs",
+                        "- project:/Applications/workstation/expense-tracker ingestion",
+                        "- project:/Applications/workstation/ai_app architecture tenant"):
+            self.assertFalse(_belongs_here(foreign, here), foreign)
+
+        # Cross-cutting subjects are what recall is for and must survive untouched.
+        for kept in ("- user prefers minimalist UI design with only interactive elements",
+                     "- memvara_web head commit 9be712f",
+                     "- memvara known defect docs/POSTGRES.md claims the tsquery"):
+            self.assertTrue(_belongs_here(kept, here), kept)
+
+        # A worktree is inside its repository, and these repos are worked in worktrees --
+        # filing a fact against the root and then not seeing it from the branch you are on
+        # would be the same blindness in a new place.
+        self.assertTrue(_belongs_here(
+            f"- project:{here} some fact",
+            f"{here}/.claude/worktrees/some-branch"))
+        # A sibling whose path merely extends the fact's is a different project. The
+        # direction matters and the first version of this test had it backwards: the trap
+        # is a SHORT owner and a LONG cwd, where a bare `startswith` matches
+        # `.../claude-memvara-old` against a fact filed for `.../claude-memvara`. Written
+        # the other way round it passed against that exact bug.
+        self.assertFalse(_belongs_here(
+            f"- project:{here} some fact", f"{here}-old"))
+        self.assertFalse(_belongs_here(
+            "- project:/Applications/workstation/claude-memvara-old fact", here))
+        # A path with a space in it. Splitting on whitespace truncates it, so the memory
+        # was dropped from its own directory -- recalling less, silently.
+        spaced = "/Users/me/My Project"
+        self.assertTrue(_belongs_here(f"- project:{spaced} some fact", spaced))
+        self.assertTrue(_belongs_here(f"- project:{spaced} fact",
+                                      f"{spaced}/.claude/worktrees/b"))
+        self.assertFalse(_belongs_here(f"- project:{spaced} fact", "/Users/me/Other"))
+
+        # An unreadable cwd keeps everything: silently recalling less is the failure mode
+        # this whole file exists to avoid.
+        self.assertTrue(_belongs_here("- project:/somewhere/else fact", ""))
+
+    def test_the_episode_pass_filters_checkouts_too(self) -> None:
+        """The escalation runs exactly when the first pass came back empty.
+
+        And dropping another checkout's notes is one of the things that empties it, so a
+        filter applied only to the first pass makes its own bypass fire *more* often. The
+        second pass reassigned `bullets` wholesale from `_split(wider)`, so every foreign
+        memory the first pass removed could return through it.
+
+        Asserted against the source rather than by driving `main()`, which would need a
+        store: both `_split` results must be filtered, so the count of `_belongs_here`
+        calls has to match the count of `_split` calls that produce bullets.
+        """
+        body = (HOOKS / "recall.py").read_text(encoding="utf-8")
+        main = body[body.index("\ndef main("):]
+        self.assertEqual(
+            main.count("_split("), main.count("_belongs_here("),
+            "a _split() in main() is not paired with a _belongs_here() filter")
+        self.assertGreaterEqual(main.count("_belongs_here("), 2,
+                                "the episode escalation is not filtered")
+
+    def test_the_sentinel_is_one_string_and_not_four(self) -> None:
+        """Four copies of a magic string fail by doing nothing, which is unfalsifiable.
+
+        Every hook that stands down does it on the same environment variable, and a copy
+        that drifted would simply stop matching -- no error, no log line, just the leak
+        quietly back. So there is one definition, in the module they all already import,
+        and `lib.extract` re-exports it rather than declaring its own.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib.extract import SENTINEL
+            from lib.ipc import CAPTURE_SENTINEL as shared
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(SENTINEL, shared)
+        # Nobody re-declares it. `ipc.py` is where the string itself is allowed to appear.
+        for path in sorted(HOOKS.rglob("*.py")):
+            if path.name == "ipc.py":
+                continue
+            self.assertNotIn(
+                f'"{shared}"', path.read_text(encoding="utf-8"),
+                f"{path.name} declares its own copy of the sentinel")
+
     def test_readonly_memory_tools_are_allowed_without_a_prompt(self) -> None:
         payload = json.dumps({"tool_name": "mcp__memvara__memory_search"})
         proc = subprocess.run(
@@ -1017,6 +1182,90 @@ class Hooks(unittest.TestCase):
                 os.environ.pop(SENTINEL, None)
             else:
                 os.environ[SENTINEL] = original
+
+    def test_a_failed_extraction_says_why(self) -> None:
+        """`facts=0` must not be what a dead extractor looks like.
+
+        This is the defect that cost 34 hours. `claude -p` began exiting 1 with "Failed to
+        authenticate: OAuth session expired and could not be refreshed" at
+        2026-08-25T22:55; 117 turns were mined afterwards and every one wrote
+        `facts=0` -- the identical line a turn with genuinely nothing in it writes.
+        `usage.jsonl` went silent on the same return, so it could not contradict it either,
+        and the run that dies is the one that leaves no trace anywhere.
+
+        The reason is in **stdout**, next to the non-zero exit, and the old order returned
+        before parsing it. So the fix is an ordering one and the assertion is that the
+        sentence the CLI actually said reaches the log.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import extract as extract_mod
+        finally:
+            sys.path.pop(0)
+
+        said = "Failed to authenticate: OAuth session expired and could not be refreshed"
+        spent = {"cache_read_input_tokens": 18946, "output_tokens": 0}
+        envelope = json.dumps({"is_error": True, "result": said, "usage": spent})
+        logged: list[str] = []
+
+        class _Dead:
+            returncode = 1
+            stdout = envelope
+            stderr = ""
+
+        original_run, original_log = extract_mod.subprocess.run, extract_mod.log
+        extract_mod.subprocess.run = lambda *a, **k: _Dead()  # type: ignore[assignment]
+        extract_mod.log = logged.append  # type: ignore[assignment]
+        try:
+            result, usage = extract_mod._payload("a turn", "a prompt")
+        finally:
+            extract_mod.subprocess.run = original_run  # type: ignore[assignment]
+            extract_mod.log = original_log  # type: ignore[assignment]
+
+        self.assertEqual(result, "")
+        self.assertTrue(logged, "a dead extractor wrote nothing to the log")
+        self.assertIn(said, logged[0])
+        # Not merely "something went wrong": the line has to name the cause, because the
+        # person reading it is deciding whether to re-authenticate or go looking elsewhere.
+        self.assertIn("OAuth", logged[0])
+        # And the tokens it burned before failing are still reported. Reading the return
+        # code before the envelope discarded these too, which left the expensive failures
+        # as the ones `usage.jsonl` could not see -- the asymmetry the `is_error` path
+        # was already written to avoid, on the path beside it.
+        self.assertEqual(usage, spent)
+
+    def test_a_timed_out_extraction_says_so_rather_than_reciting_argv(self) -> None:
+        """`TimeoutExpired.__str__` opens with the whole command line.
+
+        Formatted with `{exc}` and clipped, the log line becomes `claude -p --settings
+        {"hooks":{}} --model ...` and the words "timed out" fall off the end -- argv in
+        the one line whose entire job is to say what went wrong, and the clip landing
+        inside the prompt argument. The timeout is 90s against a job measured at 12-14s,
+        so this is the likely exception on that path, not a remote one.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import extract as extract_mod
+        finally:
+            sys.path.pop(0)
+
+        def _timeout(*_a: object, **_k: object) -> None:
+            raise subprocess.TimeoutExpired(["claude", "-p", "--settings", "secret"], 90)
+
+        logged: list[str] = []
+        original_run, original_log = extract_mod.subprocess.run, extract_mod.log
+        extract_mod.subprocess.run = _timeout  # type: ignore[assignment]
+        extract_mod.log = logged.append  # type: ignore[assignment]
+        try:
+            result, usage = extract_mod._payload("a turn", "a prompt")
+        finally:
+            extract_mod.subprocess.run = original_run  # type: ignore[assignment]
+            extract_mod.log = original_log  # type: ignore[assignment]
+
+        self.assertEqual((result, usage), ("", {}))
+        self.assertTrue(logged, "a timed-out extractor wrote nothing to the log")
+        self.assertNotIn("--settings", logged[0])
+        self.assertIn(str(extract_mod.TIMEOUT_SEC), logged[0])
 
     def test_capture_mines_one_turn_and_never_skips_text(self) -> None:
         """Batching was cheaper and lost data, which is not a trade worth making.
