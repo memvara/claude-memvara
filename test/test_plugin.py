@@ -983,6 +983,38 @@ class Hooks(unittest.TestCase):
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
+    def test_session_start_relays_the_same_alert_recall_does(self) -> None:
+        """The gap a code review found: `recall.py` was not the only hook that speaks.
+
+        `session_start.py`'s own module docstring already argues "the only reason this
+        went unnoticed for so long is that a hook that prints nothing looks exactly like a
+        hook that has nothing to say" -- about its own past silent-failure bug. A session
+        opened while capture is broken said nothing about it until the first prompt reached
+        `recall.py`, one hook later than that argument says it should be. Real subprocess,
+        real writable `HOME`, same shape as the `recall.py` sibling test above.
+        """
+        home = tempfile.mkdtemp(prefix="memvara-test-alert-")
+        hooks_dir = os.path.join(home, ".memvara", ".hooks")
+        os.makedirs(hooks_dir, exist_ok=True)
+        alert_path = os.path.join(hooks_dir, "capture-alert.json")
+        env = {"HOME": home, "PATH": os.environ.get("PATH", "")}
+        try:
+            said = "Failed to authenticate: OAuth session expired"
+            with open(alert_path, "w", encoding="utf-8") as fh:
+                json.dump({"reason": said, "last_reported": 0}, fh)
+
+            proc = subprocess.run(
+                ["python3", str(HOOKS / "session_start.py")],
+                input=json.dumps({"cwd": "/tmp"}),
+                capture_output=True, text=True, env=env, timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            message = json.loads(proc.stdout)["systemMessage"]
+            self.assertIn("capture failing", message)
+            self.assertIn(said, message)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
     def test_an_anaphoric_prompt_is_told_apart_from_a_real_one(self) -> None:
         """"yes please" has nothing in it to search on, and the query was the prompt.
 
@@ -1901,6 +1933,59 @@ class CaptureAlert(unittest.TestCase):
         self.assertNotEqual(before, after,
                             "the alert path was computed once and cached, like RUNTIME_DIR")
         self.assertTrue(after.startswith("/somewhere/nobody/has/a/home/directory"))
+
+    def test_the_write_is_atomic_not_a_plain_open(self) -> None:
+        """The one fix for the race a code review found: raise/due/clear share one file.
+
+        `raise_capture_alert` runs from the async extraction child; `due_capture_alert`
+        runs from `recall.py` on the very next prompt, which `capture.py`'s own docstring
+        says can arrive while that child is still mid-run. Two real processes read-modify-
+        write the same file with no lock between them, and nothing here closes that --
+        but a plain `open(path, "w")` adds a THIRD failure mode on top: a reader that
+        opens the file mid-write sees a truncated payload, `json.loads` raises, and
+        `_read_alert` treats a torn read as "no alert", hiding an active failure for one
+        prompt. Writing to a sibling temp file and `os.replace`-ing it over the target
+        removes that one specifically, because a concurrent reader always sees either the
+        whole old file or the whole new one.
+
+        Asserted on the mechanism, not just the outcome: the correct end state (`due_
+        capture_alert` sees what was written) does not distinguish this from a bare
+        `open(path, "w")`, which is exactly why a first version of this fix could have
+        looked identical from every other test in this class.
+        """
+        replaced = []
+        original_replace = os.replace
+        os.replace = lambda src, dst: (replaced.append((src, dst)), original_replace(src, dst))[-1]
+        try:
+            self.ipc.raise_capture_alert("OAuth session expired")
+        finally:
+            os.replace = original_replace
+        self.assertTrue(replaced, "raise_capture_alert wrote without os.replace")
+        self.assertEqual(replaced[0][1], self.ipc._alert_path())
+        # And the file is genuinely usable afterward -- os.replace was not merely called
+        # and then ignored.
+        self.assertEqual(self.ipc.due_capture_alert(1000.0),
+                         "capture failing: OAuth session expired")
+
+    def test_a_write_that_cannot_replace_does_not_leave_a_temp_file_behind(self) -> None:
+        """The cleanup half of the atomic write, sabotaged into firing.
+
+        `os.replace` failing after the temp file was written (a full disk, a permission
+        change mid-write) must not leave `.capture-alert-XXXXXX` litter in `.hooks/`
+        forever -- this is a directory nothing ever sweeps.
+        """
+        def _boom(_src: str, _dst: str) -> None:
+            raise OSError("simulated: disk full")
+
+        original_replace = os.replace
+        os.replace = _boom
+        try:
+            self.ipc.raise_capture_alert("OAuth session expired")
+        finally:
+            os.replace = original_replace
+        leftovers = [n for n in os.listdir(self.home + "/.memvara/.hooks")
+                    if n.startswith(".capture-alert-")]
+        self.assertEqual(leftovers, [], f"temp file(s) left behind: {leftovers}")
 
 
 class Usage(unittest.TestCase):

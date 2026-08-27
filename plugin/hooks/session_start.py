@@ -30,11 +30,14 @@ opening brief is the other case: narrative background is exactly what it is for.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lib.ipc import emit_json, payload, plural, status, under_extraction  # noqa: E402
+from lib.ipc import (  # noqa: E402
+    due_capture_alert, emit_json, payload, plural, status, under_extraction, with_alert,
+)
 from lib.standing import standing_block  # noqa: E402
 from lib.write import open_writer  # noqa: E402
 
@@ -161,6 +164,20 @@ def main() -> int:
         # does nothing buys a second place to look, not a second thing to see.
         return 0
 
+    # Once per session rather than never: this hook's own docstring already argues that "a
+    # hook that prints nothing looks exactly like a hook that has nothing to say," and a
+    # session that opens mid-outage previously said nothing about it until the first
+    # prompt reached `recall.py` -- one hook later than the argument it was making.
+    # `_emit` rather than threading the alert through each call site by hand, for the same
+    # reason `recall.py` does it this way: a call site that forgot to wrap would print a
+    # valid banner and fail nothing.
+    alert = due_capture_alert(time.time())
+
+    def _emit(reply: dict) -> None:
+        if "systemMessage" in reply:
+            reply = {**reply, "systemMessage": with_alert(reply["systemMessage"], alert)}
+        emit_json(reply)
+
     # Read before opening the store: the standing block is filtered to this user and this
     # checkout, and `cwd` is how the second half is known. An unreadable payload gives "",
     # which `_mine` treats as "user notes only" -- the safe direction, since the failure it
@@ -168,7 +185,7 @@ def main() -> int:
     cwd = str(payload().get("cwd") or "")
     store, close = open_writer()
     if store is None:
-        emit_json({"systemMessage": status("not configured")})
+        _emit({"systemMessage": status("not configured")})
         return 0
 
     # `open_writer` is named for its first caller, but what it does is resolve whichever
@@ -221,14 +238,14 @@ def main() -> int:
         # every section came back empty rather than unavailable -- otherwise a store that
         # is merely unreachable is reported as one that is empty, and nobody investigates
         # an empty store.
-        emit_json({"systemMessage": status(missing or "nothing stored yet")})
+        _emit({"systemMessage": status(missing or "nothing stored yet")})
         return 0
 
     count = sum(1 for line in "\n\n".join(parts).splitlines() if line.startswith("- "))
     opened = (f"session opened with {plural(count)}" if count else "session opened")
     # A count is a claim about what arrived. Saying it while a section is missing is the
     # failure this hook had; naming what is absent is the whole fix.
-    emit_json({
+    _emit({
         "systemMessage": status(f"{opened} · {missing}" if missing else opened),
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
