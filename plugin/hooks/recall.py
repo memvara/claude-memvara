@@ -517,6 +517,7 @@ def _quota_line(why: str) -> str:
         return f"retrieval quota spent — resets {day} {_MONTHS[int(parts[1]) - 1]}"
     return "retrieval quota spent"
 
+
 #: A subject of this shape names one checkout on this machine and nothing else. The
 #: convention is the user's own -- `project:<absolute path>` for a fact that is true of one
 #: working tree -- and these are written by hand through `memory_remember`, not by the
@@ -634,8 +635,9 @@ def main() -> int:
         emit_json({"systemMessage": status(detail or "recall failed")})
         return 0
 
+    here = str(data.get("cwd") or "")
     header, bullets = _split(block)
-    bullets = [line for line in bullets if _belongs_here(line, str(data.get("cwd") or ""))]
+    bullets = [line for line in bullets if _belongs_here(line, here)]
     known = set(seen)
     fresh = [line for line in bullets if _digest(line) not in known]
 
@@ -654,7 +656,12 @@ def main() -> int:
         except Exception:
             wider, wider_ok = "", False
         if wider_ok and wider:
+            # Filtered on the same terms as the first pass. This is the branch that most
+            # needs it: it runs precisely when `fresh` came back empty, and dropping
+            # another checkout's notes is one of the things that empties it -- so without
+            # this the filter would make its own bypass fire more often.
             header, bullets = _split(wider)
+            bullets = [line for line in bullets if _belongs_here(line, here)]
             fresh = [line for line in bullets if _digest(line) not in known]
 
     repeats = len(bullets) - len(fresh)

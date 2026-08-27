@@ -625,6 +625,26 @@ class Hooks(unittest.TestCase):
         # this whole file exists to avoid.
         self.assertTrue(_belongs_here("- project:/somewhere/else fact", ""))
 
+    def test_the_episode_pass_filters_checkouts_too(self) -> None:
+        """The escalation runs exactly when the first pass came back empty.
+
+        And dropping another checkout's notes is one of the things that empties it, so a
+        filter applied only to the first pass makes its own bypass fire *more* often. The
+        second pass reassigned `bullets` wholesale from `_split(wider)`, so every foreign
+        memory the first pass removed could return through it.
+
+        Asserted against the source rather than by driving `main()`, which would need a
+        store: both `_split` results must be filtered, so the count of `_belongs_here`
+        calls has to match the count of `_split` calls that produce bullets.
+        """
+        body = (HOOKS / "recall.py").read_text(encoding="utf-8")
+        main = body[body.index("\ndef main("):]
+        self.assertEqual(
+            main.count("_split("), main.count("_belongs_here("),
+            "a _split() in main() is not paired with a _belongs_here() filter")
+        self.assertGreaterEqual(main.count("_belongs_here("), 2,
+                                "the episode escalation is not filtered")
+
     def test_the_sentinel_is_one_string_and_not_four(self) -> None:
         """Four copies of a magic string fail by doing nothing, which is unfalsifiable.
 
