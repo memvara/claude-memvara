@@ -173,11 +173,25 @@ def raise_capture_alert(reason: str) -> None:
 
 
 def clear_capture_alert() -> None:
-    """Called the first time `claude -p` succeeds after failing. A no-op if it never failed."""
+    """Called the first time `claude -p` succeeds after failing. A no-op if it never failed.
+
+    Also resets what `due_alert_for_model` has already told the model, at the moment
+    capture actually recovers rather than lazily the next time something happens to call
+    it while nothing is failing. `due_alert_for_model` has its own defensive reset for
+    that same case, but relying on it alone would leave a gap: a recovery followed
+    immediately by a second, unrelated failure with the same reason text, with no prompt
+    landing in between to trigger the lazy path, would read as "already told" -- exactly
+    the stale-positive `raise_capture_alert`'s own docstring describes for the
+    human-visible banner, just on the model-facing side instead. The `.get` guard keeps
+    this a true no-op on the common path where capture has never failed at all -- no
+    write, not even one that would land on an already-empty file.
+    """
     try:
         os.unlink(_alert_path())
     except OSError:
         pass
+    if _read_notified_alert().get("reason"):
+        _write_notified_alert({})
 
 
 def due_capture_alert() -> str:
@@ -203,6 +217,91 @@ def due_capture_alert() -> str:
     if not isinstance(reason, str) or not reason:
         return ""
     return f"capture failing: {reason}"
+
+
+def _notified_alert_path() -> str:
+    """Where the reason last handed to the MODEL as context is recorded.
+
+    A sibling of `_alert_path()`, not the same file: `due_capture_alert` is read
+    unconditionally on every prompt for the human-visible banner, by design -- see its own
+    docstring for why that stopped being throttled. `due_alert_for_model` answers a
+    different question -- "has the model already been told about *this* failure" -- and
+    needs its own memory to answer it, or every prompt would re-tell the model the same
+    reason for as long as it stays broken, moving the exact repetition just removed from
+    the terminal banner into the model's own replies instead.
+    """
+    return os.path.join(_HOME, ".memvara", ".hooks", "capture-alert-notified.json")
+
+
+def _read_notified_alert() -> dict:
+    try:
+        with open(_notified_alert_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_notified_alert(data: dict) -> None:
+    """Atomic write, same reasoning as `_write_alert`.
+
+    Written from one place only -- `due_alert_for_model`, called synchronously from
+    `recall.py` -- so there is no concurrent-writer race to defend against the way
+    `capture-alert.json` has between `raise_capture_alert` and `clear_capture_alert`. Two
+    `recall.py` processes racing on rapid consecutive prompts is the only case left here,
+    and the same tempfile-then-`os.replace` swap covers it for free.
+    """
+    import tempfile
+
+    path = _notified_alert_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".capture-alert-notified-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def due_alert_for_model() -> str:
+    """Context to hand the model when the failing reason is new since it was last told, or `""`.
+
+    This is not the six-hour throttle `due_capture_alert` had removed from it -- that was a
+    clock silently hiding a still-active failure from a person watching a banner that should
+    have been a live indicator every time it was read. This is a value comparison, not a
+    clock: it tells the model once per distinct reason, so a person's actual conversation
+    is not interrupted on every single turn by a repeat of the same sentence for however
+    many days a failure stays unresolved. The human-visible banner from `due_capture_alert`
+    is untouched by this and keeps firing on every prompt exactly as before -- only the copy
+    that reaches the model through `hookSpecificOutput.additionalContext` is deduplicated.
+
+    A cleared alert resets what was last told, not just what is currently active: a second,
+    unrelated failure that happens to produce the same reason text as an earlier,
+    since-fixed one is a new event to tell the model about, not a repeat of the old one.
+    """
+    reason = _read_alert().get("reason")
+    reason = reason if isinstance(reason, str) and reason else ""
+    told = _read_notified_alert().get("reason")
+    told = told if isinstance(told, str) else ""
+
+    if not reason:
+        if told:
+            _write_notified_alert({})
+        return ""
+    if reason == told:
+        return ""
+    _write_notified_alert({"reason": reason})
+    return (
+        f"Memvara: memory capture just started failing ({reason}). "
+        "Mention this to the user once in your reply."
+    )
 
 
 def with_alert(text: str, alert: str) -> str:

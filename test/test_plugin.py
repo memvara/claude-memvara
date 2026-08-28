@@ -1010,6 +1010,89 @@ class Hooks(unittest.TestCase):
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
+    def test_capture_failing_reaches_the_model_once_then_stops(self) -> None:
+        """The model-facing half of the alert relay: told once per distinct reason, not
+        on every prompt the way the human-visible banner already is.
+
+        Real subprocess, real writable `HOME`, same shape as the banner test above --
+        this checks what actually leaves the hook on `hookSpecificOutput.additionalContext`,
+        not a mocked call. No credentials in this `HOME` puts every call on the
+        "not configured" branch deterministically, which has no `additionalContext` of its
+        own -- so any that shows up here can only be the alert notice, not something it
+        rode in on.
+        """
+        home = tempfile.mkdtemp(prefix="memvara-test-alert-model-")
+        hooks_dir = os.path.join(home, ".memvara", ".hooks")
+        os.makedirs(hooks_dir, exist_ok=True)
+        alert_path = os.path.join(hooks_dir, "capture-alert.json")
+        env = {"HOME": home, "PATH": os.environ.get("PATH", "")}
+
+        def run():
+            proc = subprocess.run(
+                ["python3", str(HOOKS / "recall.py")],
+                input=json.dumps({"prompt": "a real question", "session_id": "s"}),
+                capture_output=True, text=True, env=env, timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return json.loads(proc.stdout)
+
+        try:
+            said = "Failed to authenticate: OAuth session expired"
+            with open(alert_path, "w", encoding="utf-8") as fh:
+                json.dump({"reason": said}, fh)
+
+            first = run()
+            self.assertIn("capture failing", first["systemMessage"])
+            first_ctx = first.get("hookSpecificOutput", {}).get("additionalContext", "")
+            self.assertIn(said, first_ctx, "the model was never told about a fresh failure")
+
+            second = run()
+            self.assertIn("capture failing", second["systemMessage"],
+                          "the human-visible banner must still repeat every call")
+            second_ctx = second.get("hookSpecificOutput", {}).get("additionalContext", "")
+            self.assertNotIn(said, second_ctx,
+                             "the model was told about the same, unchanged reason twice")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_the_alert_notice_does_not_clobber_recalled_context(self) -> None:
+        """`_emit`'s merge must add to `additionalContext`, not overwrite it.
+
+        A capture failure and a successful recall are unrelated events that can both be
+        true on the same prompt -- whichever of the five reply branches fires must not
+        cost the other its context. `due_alert_for_model` is monkeypatched directly
+        rather than driven through a real alert file: the claim under test is the merge
+        in `_emit`, not the dedup-by-value logic already covered above.
+        """
+        recall = self._recall()
+        directory = tempfile.mkdtemp()
+        original_dir = recall.SEEN_DIR
+        original_recall_fn = recall.fast_recall
+        original_alert_for_model = recall.due_alert_for_model
+        recall.SEEN_DIR = directory
+        recall.fast_recall = lambda query, **kw: (
+            f"{recall.HEADER}\n- a fresh memory", True, "")
+        recall.due_alert_for_model = lambda: (
+            "Memvara: memory capture just started failing (boom). "
+            "Mention this to the user once in your reply.")
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                recall.main.__globals__["payload"] = lambda: {
+                    "prompt": "what does the user prefer for citation style",
+                    "session_id": "s"}
+                recall.main()
+        finally:
+            recall.SEEN_DIR = original_dir
+            recall.fast_recall = original_recall_fn
+            recall.due_alert_for_model = original_alert_for_model
+            shutil.rmtree(directory, ignore_errors=True)
+
+        reply = json.loads(buf.getvalue().strip())
+        ctx = reply["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("a fresh memory", ctx, "the recalled block was clobbered")
+        self.assertIn("just started failing", ctx, "the alert notice was dropped")
+
     def test_an_anaphoric_prompt_is_told_apart_from_a_real_one(self) -> None:
         """"yes please" has nothing in it to search on, and the query was the prompt.
 
@@ -2060,6 +2143,49 @@ class CaptureAlert(unittest.TestCase):
         leftovers = [n for n in os.listdir(self.home + "/.memvara/.hooks")
                     if n.startswith(".capture-alert-")]
         self.assertEqual(leftovers, [], f"temp file(s) left behind: {leftovers}")
+
+    def test_nothing_is_offered_to_the_model_when_nothing_has_ever_failed(self) -> None:
+        self.assertEqual(self.ipc.due_alert_for_model(), "")
+
+    def test_a_fresh_failure_is_offered_to_the_model_once(self) -> None:
+        self.ipc.raise_capture_alert("OAuth session expired")
+        notice = self.ipc.due_alert_for_model()
+        self.assertIn("OAuth session expired", notice)
+
+    def test_the_same_unchanged_reason_is_not_offered_again(self) -> None:
+        """This is the whole point: `due_capture_alert`'s banner repeats every call, but
+        what reaches the model must not, or a person's actual conversation gets the same
+        sentence appended to every single reply for however long the failure lasts.
+        """
+        self.ipc.raise_capture_alert("OAuth session expired")
+        self.assertTrue(self.ipc.due_alert_for_model())
+        for _ in range(3):
+            self.assertEqual(self.ipc.due_alert_for_model(), "")
+        # The human-visible banner is a separate question and is untouched by this.
+        self.assertTrue(self.ipc.due_capture_alert())
+
+    def test_a_changed_reason_is_offered_again(self) -> None:
+        self.ipc.raise_capture_alert("OAuth session expired")
+        self.assertTrue(self.ipc.due_alert_for_model())
+        self.assertEqual(self.ipc.due_alert_for_model(), "")
+        self.ipc.raise_capture_alert("could not resolve app.memvara.dev")
+        notice = self.ipc.due_alert_for_model()
+        self.assertIn("could not resolve app.memvara.dev", notice)
+
+    def test_clearing_resets_what_was_told_so_a_repeated_reason_is_new_again(self) -> None:
+        """A second, unrelated outage that happens to fail with the same words as an
+        earlier, since-fixed one is a new event, not a repeat of the old one.
+        """
+        self.ipc.raise_capture_alert("OAuth session expired")
+        self.assertTrue(self.ipc.due_alert_for_model())
+        self.ipc.clear_capture_alert()
+        self.ipc.raise_capture_alert("OAuth session expired")
+        self.assertTrue(self.ipc.due_alert_for_model(),
+                        "a repeat reason after a clear was treated as already told")
+
+    def test_clearing_before_ever_telling_the_model_is_not_an_error(self) -> None:
+        self.ipc.clear_capture_alert()
+        self.assertEqual(self.ipc.due_alert_for_model(), "")  # must not raise
 
 
 class Usage(unittest.TestCase):
