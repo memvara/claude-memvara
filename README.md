@@ -138,6 +138,20 @@ banner beside it changes every prompt regardless, so silence for six
 hours read as "this got fixed" to someone watching the terminal, not
 as "already told you."
 
+**The model gets told too, but only once.** The banner above is a
+terminal display, not model context — a `systemMessage` field the
+client renders to whoever is watching, never fed into what the model
+itself sees. Repeating it there on every prompt the way the banner
+does would mean the same sentence in every reply for however many
+days a failure stays unresolved, which is a different problem than
+the banner's — a person reading a static terminal line skims past a
+repeat; a person reading replies does not expect one to say the same
+thing twice. So the model is handed the failure once per distinct
+reason, as an instruction to mention it, and stays quiet about that
+same reason afterward — until it clears and a new one takes its
+place, or the same reason recurs after a genuine recovery, which
+counts as new again.
+
 **Storage is rich; injection is clipped.** They are different jobs. A
 memory worth keeping carries its reasoning — that is what stopped captured
 facts being useless one-liners — and it made each about four times bigger.
