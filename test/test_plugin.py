@@ -1093,6 +1093,51 @@ class Hooks(unittest.TestCase):
         self.assertIn("a fresh memory", ctx, "the recalled block was clobbered")
         self.assertIn("just started failing", ctx, "the alert notice was dropped")
 
+    def test_a_crash_before_delivery_does_not_mark_the_notice_told(self) -> None:
+        """A code review found this exact ordering bug.
+
+        `due_alert_for_model` persists "the model has now been told" as a side effect of
+        deciding what to say. Calling it once at the top of `main()` -- before `_read_
+        state`, `_standing_refresh`, `_anaphoric`, and `fast_recall` all run -- meant a
+        raise anywhere in that span, with the notified-state already written, would mark a
+        notice "told" that the model never actually received: worse than the per-turn
+        repetition this feature exists to prevent, since nothing would ever correct a
+        wrongly-marked notice short of the reason changing. Moved into `_emit`, one line
+        before `emit_json` actually runs, so a raise anywhere earlier in `main()` leaves
+        the notified-state untouched -- this test forces exactly that raise, via
+        `_read_state`, one of the calls between the old call site and the new one.
+        """
+        recall = self._recall()
+        ipc = sys.modules[recall.due_alert_for_model.__module__]
+        home = tempfile.mkdtemp(prefix="memvara-test-alert-order-")
+        was_home = ipc._HOME
+        ipc._HOME = home
+        directory = tempfile.mkdtemp()
+        original_dir = recall.SEEN_DIR
+        original_read_state = recall._read_state
+        recall.SEEN_DIR = directory
+
+        def _boom(_session):
+            raise RuntimeError("simulated: something between due_alert_for_model's old "
+                               "call site and _emit broke")
+
+        recall._read_state = _boom
+        try:
+            ipc.raise_capture_alert("OAuth session expired")
+            recall.main.__globals__["payload"] = lambda: {
+                "prompt": "a real question", "session_id": "s"}
+            with self.assertRaises(RuntimeError):
+                recall.main()
+            self.assertEqual(
+                ipc._read_notified_alert(), {},
+                "the notice was marked told before it was ever delivered")
+        finally:
+            recall._read_state = original_read_state
+            recall.SEEN_DIR = original_dir
+            ipc._HOME = was_home
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(directory, ignore_errors=True)
+
     def test_an_anaphoric_prompt_is_told_apart_from_a_real_one(self) -> None:
         """"yes please" has nothing in it to search on, and the query was the prompt.
 
@@ -2186,6 +2231,62 @@ class CaptureAlert(unittest.TestCase):
     def test_clearing_before_ever_telling_the_model_is_not_an_error(self) -> None:
         self.ipc.clear_capture_alert()
         self.assertEqual(self.ipc.due_alert_for_model(), "")  # must not raise
+
+    def test_a_notified_write_that_cannot_replace_does_not_leave_a_temp_file_behind(
+            self) -> None:
+        """The same cleanup guarantee `_write_alert` has, now proven for its sibling.
+
+        `_write_notified_alert` shares `_write_json_file_atomic` with `_write_alert`, but a
+        shared implementation is not itself proof the second caller gets the same
+        guarantee -- the prefix, the target directory, and the call site all differ, and
+        this is the class of bug `test_a_write_that_cannot_replace_does_not_leave_a_temp_file_behind`
+        already exists to catch for the first file.
+        """
+        # `raise_capture_alert` first, UNMOCKED: it has its own `os.replace` call
+        # (`_write_alert`'s), and sabotaging that too would make it fail silently, leaving
+        # `capture-alert.json` empty -- `due_alert_for_model` would then see no reason at
+        # all and return before ever attempting the write this test means to sabotage,
+        # passing whether or not the cleanup it claims to check actually happened.
+        self.ipc.raise_capture_alert("OAuth session expired")
+
+        def _boom(_src: str, _dst: str) -> None:
+            raise OSError("simulated: disk full")
+
+        original_replace = os.replace
+        os.replace = _boom
+        try:
+            self.ipc.due_alert_for_model()
+        finally:
+            os.replace = original_replace
+        leftovers = [n for n in os.listdir(self.home + "/.memvara/.hooks")
+                    if n.startswith(".capture-alert-notified-")]
+        self.assertEqual(leftovers, [], f"temp file(s) left behind: {leftovers}")
+
+    def test_a_notified_write_that_keeps_failing_is_logged_not_silent(self) -> None:
+        """A write that never lands is a different failure than one that misses once.
+
+        `_write_alert`'s own occasional-miss tradeoff is accepted silently elsewhere in
+        this file, but a `_write_notified_alert` that never succeeds means `due_alert_for_
+        model` never learns anything was told -- the model-facing notice would repeat on
+        every single prompt for as long as the write keeps failing, which is exactly the
+        per-turn repetition this feature exists to prevent, and nothing would say why it
+        stopped working without this line.
+        """
+        # Same reordering as the test above, same reason: `raise_capture_alert` must
+        # succeed for real before `os.replace` is sabotaged, or `due_alert_for_model`
+        # never reaches the write this test means to sabotage.
+        self.ipc.raise_capture_alert("OAuth session expired")
+
+        original_replace = os.replace
+        os.replace = lambda _s, _d: (_ for _ in ()).throw(OSError("simulated: disk full"))
+        try:
+            self.ipc.due_alert_for_model()
+        finally:
+            os.replace = original_replace
+        with open(self.home + "/.memvara/.hooks/recall.log", encoding="utf-8") as fh:
+            logged = fh.read()
+        self.assertIn("write failed", logged)
+        self.assertIn("capture-alert-notified.json", logged)
 
 
 class Usage(unittest.TestCase):

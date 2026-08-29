@@ -97,17 +97,67 @@ def _alert_path() -> str:
     return os.path.join(_HOME, ".memvara", ".hooks", "capture-alert.json")
 
 
-def _read_alert() -> dict:
+def _read_json_file(path: str) -> dict:
+    """A dict from a JSON file, or `{}` for anything short of one -- missing, unreadable,
+    corrupt, or holding some other JSON shape entirely. Shared by `_read_alert` and
+    `_read_notified_alert`: same file shape, same failure handling, same reason for it --
+    only the path differs.
+    """
     try:
-        with open(_alert_path(), encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
+def _write_json_file_atomic(path: str, data: dict, tmp_prefix: str,
+                            log_name: str = "") -> None:
+    """Write `data` to `path` via a sibling temp file and `os.replace`, so a concurrent
+    reader never sees a truncated payload. Shared by `_write_alert` and
+    `_write_notified_alert` -- the mechanism is identical between the two files; it is WHO
+    writes each one and WHAT race each accepts that differs, which is why that reasoning
+    stays on each wrapper's own docstring rather than living here.
+
+    `log_name`, when given, is the one thing this helper does that a plain `open(path, "w")`
+    would not have needed: a line to that log on a write failure. Silent is fine for a
+    write's FIRST failure -- an occasional missed update is a tradeoff this repository
+    already accepts for `capture-alert.json`'s siblings -- but a write that keeps failing
+    forever is a different thing, and for at least one caller (`due_alert_for_model`) a
+    permanently failing write means the state it exists to update never advances, so the
+    same notice repeats on every single prompt for as long as the write keeps losing --
+    exactly the per-turn repetition that function exists to prevent, with nothing anywhere
+    saying why it stopped working. Omitted (empty string) for `_write_alert`, unchanged from
+    before this helper existed, since that failure mode was already reviewed and accepted
+    on its own terms.
+    """
+    import tempfile
+
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=tmp_prefix)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            if log_name:
+                log_line(log_name, f"write failed: {os.path.basename(path)}")
+    except OSError:
+        if log_name:
+            log_line(log_name, f"write failed: {os.path.basename(path)}")
+
+
+def _read_alert() -> dict:
+    return _read_json_file(_alert_path())
+
+
 def _write_alert(data: dict) -> None:
-    """Atomic write of this file's only writer that has a payload to write.
+    """This file's only writer that has a payload to write.
 
     `clear_capture_alert` is the OTHER thing that touches this file, and does not call
     this function -- it does a plain `os.unlink`, which needs no atomicity dance because
@@ -118,15 +168,14 @@ def _write_alert(data: dict) -> None:
     12-14s and hands the turn back immediately, so an extraction still finishing while
     another one starts is the ordinary case, not a rare one.
 
-    What THIS function's atomicity fixes is narrower: a reader opening the file mid-write
-    and getting a truncated payload. Writing to a sibling temp file and `os.replace`-ing
-    it over the target means a concurrent `_read_alert` sees either the whole old file or
-    the whole new one, never a half-written mix that `json.load` would raise on and
-    `_read_alert` would then read back as "no alert" -- silently hiding an active failure
-    for one prompt.
+    What atomicity fixes here is narrower: a reader opening the file mid-write and getting
+    a truncated payload. Writing to a sibling temp file and `os.replace`-ing it over the
+    target means a concurrent `_read_alert` sees either the whole old file or the whole new
+    one, never a half-written mix that `json.load` would raise on and `_read_alert` would
+    then read back as "no alert" -- silently hiding an active failure for one prompt.
 
-    What neither this function nor `clear_capture_alert`'s unlink fixes: the two can still
-    race with each other, so whichever lands last wins outright rather than merging -- a
+    What neither this nor `clear_capture_alert`'s unlink fixes: the two can still race with
+    each other, so whichever lands last wins outright rather than merging -- a
     `clear_capture_alert` from one extraction can land after a `raise_capture_alert` from
     a second, failing one, dropping a real alert; the reverse can resurrect a resolved one
     for one more prompt. Closing that needs a lock around both writers, which is real
@@ -135,23 +184,7 @@ def _write_alert(data: dict) -> None:
     be the larger bug; losing a few seconds of an FYI banner's accuracy is the trade this
     file already makes for `capture.log` and the session state next to it.
     """
-    import tempfile
-
-    path = _alert_path()
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".capture-alert-")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(data, fh)
-            os.replace(tmp, path)
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-    except OSError:
-        pass
+    _write_json_file_atomic(_alert_path(), data, ".capture-alert-")
 
 
 def raise_capture_alert(reason: str) -> None:
@@ -234,40 +267,29 @@ def _notified_alert_path() -> str:
 
 
 def _read_notified_alert() -> dict:
-    try:
-        with open(_notified_alert_path(), encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return _read_json_file(_notified_alert_path())
 
 
 def _write_notified_alert(data: dict) -> None:
-    """Atomic write, same reasoning as `_write_alert`.
+    """Atomic write, same mechanism as `_write_alert` -- but NOT the single-writer file an
+    earlier version of this docstring claimed.
 
-    Written from one place only -- `due_alert_for_model`, called synchronously from
-    `recall.py` -- so there is no concurrent-writer race to defend against the way
-    `capture-alert.json` has between `raise_capture_alert` and `clear_capture_alert`. Two
-    `recall.py` processes racing on rapid consecutive prompts is the only case left here,
-    and the same tempfile-then-`os.replace` swap covers it for free.
+    Two things write here, from two different, genuinely concurrent processes: `recall.py`
+    calls `due_alert_for_model()` synchronously on every prompt, and `clear_capture_alert()`
+    -- called from the async extraction child, the same one `raise_capture_alert` runs from
+    -- resets this file the moment capture recovers. Those two can race exactly the way
+    `raise_capture_alert`/`clear_capture_alert` already race on `capture-alert.json`: each
+    does its own read-then-conditional-write with no lock between them, so a recovery's
+    reset can land on a stale read and silently no-op while a fresh notify write is still in
+    flight, or two overlapping `recall.py` processes can clobber each other's write outright.
+    The accepted trade is identical to that sibling file's: whichever write lands last wins,
+    an occasional stale "already told" or an occasional extra retelling, corrected the next
+    time either side runs again. Closing it needs the same lock this file's neighbor already
+    declines for the same reason -- real machinery for what is, at worst, one repeated or
+    one skipped sentence in a reply.
     """
-    import tempfile
-
-    path = _notified_alert_path()
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".capture-alert-notified-")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(data, fh)
-            os.replace(tmp, path)
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-    except OSError:
-        pass
+    _write_json_file_atomic(_notified_alert_path(), data, ".capture-alert-notified-",
+                            log_name="recall")
 
 
 def due_alert_for_model() -> str:

@@ -661,15 +661,20 @@ def main() -> int:
     # `UnboundLocalError` before it ever runs.
     alert = due_capture_alert()
 
-    # `due_alert_for_model` is a value comparison, not a clock -- see its own docstring for
-    # why that is not the throttle this file just removed. Computed once here, same as
-    # `alert`, so every branch below picks it up through `_emit` with nothing to remember
-    # at each of the five call sites.
-    alert_notice = due_alert_for_model()
-
     def _emit(reply: dict) -> None:
         if "systemMessage" in reply:
             reply = {**reply, "systemMessage": with_alert(reply["systemMessage"], alert)}
+        # Called here, at the point delivery is actually about to happen, rather than once
+        # at the top of `main()` -- `due_alert_for_model` persists "the model has now been
+        # told" as a side effect of deciding what to say, and everything between the top of
+        # `main()` and this point (`_read_state`, `_standing_refresh`, `_anaphoric`,
+        # `fast_recall`) is exactly the code most likely to grow a new call that can raise.
+        # A raise anywhere in that span, with the decision already made and persisted
+        # earlier, would mark a notice "told" that never actually reached the model -- worse
+        # than the repetition this function exists to prevent, because nothing would ever
+        # correct it short of the reason changing. Calling it from inside `_emit`, one line
+        # before `emit_json` actually runs, leaves nothing but dict merges in between.
+        alert_notice = due_alert_for_model()
         if alert_notice:
             # Merged onto whatever `additionalContext` this branch already carries (recalled
             # memories, standing preferences) rather than replacing it -- a capture failure
@@ -677,7 +682,7 @@ def main() -> int:
             # prompt, and either one arriving first should not cost the other its context.
             hook_out = dict(reply.get("hookSpecificOutput") or {})
             existing_ctx = hook_out.get("additionalContext") or ""
-            hook_out["hookEventName"] = "UserPromptSubmit"
+            hook_out.setdefault("hookEventName", "UserPromptSubmit")
             hook_out["additionalContext"] = (
                 f"{existing_ctx}\n\n{alert_notice}" if existing_ctx else alert_notice)
             reply = {**reply, "hookSpecificOutput": hook_out}
