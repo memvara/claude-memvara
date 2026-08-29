@@ -365,6 +365,16 @@ class HostedRecall:
         """
         return self._call("memory_stats", {})
 
+    def search(self, query: str, *, k: int = 10) -> str:
+        """`memory_search`'s own rendered block, or raise.
+
+        `recall` cannot stand in for this. It returns notes meant to be read, with the
+        claim ids deliberately stripped, and an id is the whole point of asking here --
+        `lib.sweep` needs something it can hand to `memory_end`. This is the only caller,
+        and it parses the ids back out rather than the server growing a second shape.
+        """
+        return self._call("memory_search", {"query": query, "k": k})
+
     def add(self, text: str, *, role: str = "user") -> str:
         """Store one turn as an episode. Returns the server's receipt line, or raises.
 

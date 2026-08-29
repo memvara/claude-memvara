@@ -11,11 +11,14 @@ says how to use it, in one install.
 The first connection opens a browser so you can click Allow. That grant
 lasts 90 days, and no API key is involved.
 
-The hooks below do run locally, and one of them starts a short-lived
-background process to keep recall fast. Nothing is installed to do it:
-they use the standard library, and the process exits after 30 minutes
-idle. Delete the `hooks/` directory and the plugin is still a working
-MCP server plus the skill.
+The hooks below do run locally, and two of them spawn something. One
+starts a short-lived background process to keep recall fast; it exits
+after 30 minutes idle. The other shells out to `gh`, at most once every
+six hours, to ask GitHub whether a defect you have stored has since been
+fixed — the only thing here that talks to anything but your own store,
+and it is skipped entirely when `gh` is not installed. Nothing is
+installed for either: they use the standard library. Delete the `hooks/`
+directory and the plugin is still a working MCP server plus the skill.
 
 ## What you get
 
@@ -33,10 +36,33 @@ Four hooks, so memory happens without being asked for:
 
 | Event | What it does |
 |---|---|
-| `SessionStart` | Opens the session with standing facts, and names the scope it is bound to |
+| `SessionStart` | Opens the session with standing facts, names the scope it is bound to, and lists stored defects whose fix has landed |
 | `UserPromptSubmit` | Recalls against every prompt, skipping what it has already injected |
-| `Stop` | Keeps the turn that just ended, and mines it for facts |
+| `Stop` | Keeps the turn that just ended, mines it for facts, and asks GitHub whether any stored defect is fixed |
 | `PreToolUse` | Auto-allows read-only `memory_*` tools; writes still ask |
+
+## Closing what capture opens
+
+The `Stop` hook can record a defect and has no way to close one. Nothing here calls
+`memory_end`, `memory_forget` or sets `true_until`, so a `known_defect` claim answers
+present-tense questions forever. That is not something a vocabulary fixes: the engineering
+pack declares `known_defect` as `cardinality = "many"` on purpose — a project has many open
+defects and a new one must not erase the others — so a defect is never superseded by another
+defect. It ends when something happens in the world.
+
+So `Stop` also looks for GitHub refs in stored defects and asks `gh` whether they merged,
+and `SessionStart` lists what it found. **It never closes anything.** A wrong `memory_end`
+records a false reason for a change that nothing downstream can detect, and the input is a
+subprocess that answers wrongly for reasons unrelated to the claim — no auth, no network, a
+renamed repository. It proposes; you decide.
+
+This is the plugin's second background process and the only one that leaves the machine, so
+it is bounded on purpose: it runs at most **once every six hours**, resolves at most twelve
+refs per run, caches merged answers forever (a pull request does not un-merge), and goes
+quiet for a week on any candidate it has already shown. Without `gh` on `PATH` it does
+nothing and says so in `~/.memvara/.hooks/capture.log`; its cache is
+`~/.memvara/.hooks/sweep-state.json`. Delete `hooks/` and, as with everything else here,
+the plugin still works.
 
 The hooks try three routes and return the same text from each; only the
 latency differs. A resident daemon answers in ~38 ms. Without one, a

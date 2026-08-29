@@ -61,6 +61,7 @@ ALLOWED_PLUGIN_FILES = {
     pathlib.Path("hooks") / "lib" / "transcript.py",
     pathlib.Path("hooks") / "lib" / "standing.py",
     pathlib.Path("hooks") / "lib" / "write.py",
+    pathlib.Path("hooks") / "lib" / "sweep.py",
 }
 
 
@@ -4950,3 +4951,307 @@ class StandingRenderContract(unittest.TestCase):
                 row, _SERVER_ROW,
                 "the fake's row shape has drifted from the recorded server shape; "
                 "the hosted tests are no longer evidence about the server")
+
+
+#: One row of `memory_search` output, recorded verbatim from app.memvara.dev on
+#: 2026-08-30. `lib/sweep._ROW` parses this shape, and like `_SERVER_ROW` above it is
+#: pinned against something the server actually sent rather than against a fake this
+#: suite writes -- a parser and a fixture built from the same assumption agree with each
+#: other forever, which is this repository's own recurring defect shape.
+_SEARCH_ROW = (
+    "1. [id=cl_72838b5ed985430984a1 semantic relevance=0.686] memvara-cloud known defect "
+    "ProfileTab's effect resets the name field on timezone changes. Fixed in "
+    "memvara/memvara-cloud#207."
+)
+
+
+class Sweep(unittest.TestCase):
+    """That a stored defect whose fix has landed gets said out loud, and never closed.
+
+    `capture.py` can open a defect and has no vocabulary for closing one, so a
+    `known_defect` claim answers present-tense questions forever. Six were closed by hand
+    on 2026-08-30; five had gone stale by mechanism, and one had been stale for four days
+    with its own closing instruction stored beside it -- naming the claim id and the right
+    verb, at confidence 1.0. Knowing how to close was never the gap. Nothing read a memory
+    looking for work to do.
+
+    Every test here is written so that it fails when the behaviour it names is removed,
+    not merely when it is wrong: the `OPEN`, `CLOSED` and unreachable cases each assert
+    that *no* candidate appears, which is what a sweep that fires on everything would break.
+    """
+
+    #: A plausible wall clock. Not a small number: `refresh` rate-limits on
+    #: `now - swept_at`, so a `now` below `SWEEP_EVERY_SEC` never clears the gate on a
+    #: fresh state file and every sweep returns having done nothing. The negative tests
+    #: below then pass by vacuity -- which is how this was found.
+    NOW = 1_800_000_000.0
+
+    def _sweep(self, tmp: str):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            module = importlib.import_module("lib.sweep")
+        finally:
+            sys.path.pop(0)
+        module.STATE = pathlib.Path(tmp) / "sweep-state.json"
+        return module
+
+    class _Store:
+        """A store whose only job is to answer `search` -- and to fail loudly if the sweep
+        ever reaches for a write. `end` and `forget` are the two calls that would make this
+        thing dangerous, so they are landmines rather than absences."""
+
+        def __init__(self, rendered: str) -> None:
+            self.rendered = rendered
+
+        def search(self, query, k=10):  # noqa: ARG002
+            return self.rendered
+
+        def end(self, *a, **k):  # pragma: no cover - the point is that it is never called
+            raise AssertionError("the sweep closed a claim; it must only propose")
+
+        def forget(self, *a, **k):  # pragma: no cover - as above
+            raise AssertionError("the sweep retired a claim; it must only propose")
+
+    def _runner(self, verdict: str, calls: "list | None" = None):
+        def run(args):
+            if calls is not None:
+                calls.append(args)
+            if verdict is None:
+                raise OSError("gh is not installed")
+            return verdict
+        return run
+
+    def test_a_merged_pull_request_makes_a_stored_defect_a_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            store = self._Store(_SEARCH_ROW)
+            outstanding = sweep.refresh(store, True, self.NOW, self._runner("MERGED"))
+            self.assertEqual(outstanding, 1)
+            block = sweep.block(self.NOW)
+            self.assertIn("cl_72838b5ed985430984a1", block)
+            self.assertIn("memvara/memvara-cloud#207", block)
+
+    def test_an_open_pull_request_is_not_a_candidate(self) -> None:
+        """The guard has to be able to stay quiet, or it is not a guard."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            outstanding = sweep.refresh(self._Store(_SEARCH_ROW), True, self.NOW,
+                                        self._runner("OPEN"))
+            self.assertEqual(outstanding, 0)
+            self.assertEqual(sweep.block(self.NOW), "")
+
+    def test_an_abandoned_pull_request_is_not_a_fix(self) -> None:
+        """`CLOSED` unmerged means the fix was given up on, which says nothing about the
+        defect. Reading it as terminal would close a claim that is *more* true than before."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            self.assertEqual(
+                sweep.refresh(self._Store(_SEARCH_ROW), True, self.NOW,
+                              self._runner("CLOSED")), 0)
+
+    def test_a_ref_that_could_not_be_checked_is_not_remembered_as_open(self) -> None:
+        """"We could not ask" and "it is still open" must not look alike.
+
+        Collapsing them caches one offline run as a real answer, and the ref is then never
+        asked about again -- the claim stays live forever and the sweep reports success.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            sweep.refresh(self._Store(_SEARCH_ROW), True, self.NOW, self._runner(None))
+            self.assertEqual(sweep.read_state().get("verdicts"), {},
+                             "an unreachable probe was cached as a verdict")
+            # And the next sweep, once GitHub answers, still finds it.
+            later = self.NOW + sweep.SWEEP_EVERY_SEC + 1
+            self.assertEqual(
+                sweep.refresh(self._Store(_SEARCH_ROW), True, later,
+                              self._runner("MERGED")), 1)
+
+    def test_a_bare_number_resolves_through_the_claims_own_subject(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            self.assertEqual(sweep.refs("memvara_cloud", "fixed in #205"),
+                             ["memvara/memvara-cloud#205"])
+
+    def test_a_bare_number_under_an_unmapped_subject_names_no_repository(self) -> None:
+        """A guessed repository resolves to somebody else's pull request, which is a
+        confident answer about the wrong thing. No mapping means no bare-ref lookup."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            self.assertEqual(sweep.refs("some_project_nobody_mapped", "fixed in #205"), [])
+
+    def test_a_claim_naming_a_second_repository_contributes_no_bare_refs(self) -> None:
+        """Found against the real store, not reasoned about.
+
+        A status claim under subject `memvara` reads "memvara #79 stacked to #80 to #82 to
+        #83; memvara-cloud #181, #182, #183". Resolving every bare number through the
+        subject turned three memvara-cloud pull requests into memvara ones -- and those
+        numbers exist in both repositories, so the mistake resolves cleanly and reports a
+        merged pull request that has nothing to do with the claim. The qualified refs in
+        the same text must still come through: refusing the ambiguous half is the point,
+        refusing everything would be a different bug.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            text = ("memvara review status implemented as open PRs (memvara #79 stacked "
+                    "to #80 to #82 to #83; memvara-cloud #181, #182, #183)")
+            self.assertEqual(sweep.refs("memvara", text), [])
+            self.assertEqual(
+                sweep.refs("memvara", text + " and memvara/memvara-cloud#183"),
+                ["memvara/memvara-cloud#183"])
+
+    def test_a_qualified_ref_needs_no_mapping_and_a_url_is_read_too(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            found = sweep.refs("unmapped",
+                               "see memvara/memvara-web#75 and "
+                               "https://github.com/memvara/memvara-cloud/pull/183")
+            self.assertEqual(found, ["memvara/memvara-cloud#183", "memvara/memvara-web#75"])
+
+    def test_the_parser_reads_the_shape_the_server_actually_sends(self) -> None:
+        """Pinned against a recorded row, not against a fake this suite renders."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            parsed = sweep.rows(_SEARCH_ROW)
+            self.assertEqual(len(parsed), 1, "the search-row parser no longer matches "
+                                             "what the server sends; the sweep is blind")
+            self.assertEqual(parsed[0][0], "cl_72838b5ed985430984a1")
+            self.assertTrue(parsed[0][1].startswith("memvara-cloud known defect"))
+
+    def test_the_sweep_holds_no_way_to_close_a_claim(self) -> None:
+        """The safety property, asserted on the source rather than on one code path.
+
+        `_Store.end`/`.forget` raise if the sweep ever calls them, which covers the paths
+        these tests walk. This covers the ones they do not: a closing call added to a
+        branch no test reaches would still be a hook that edits history unattended.
+
+        Read as syntax rather than as text, because the module's own docstring explains at
+        length why it does not call `memory_end` -- and a substring search cannot tell a
+        sentence about a tool from a call to it. The first version of this test could not,
+        and failed on the paragraph arguing for the very property it was checking.
+        """
+        import ast
+
+        source = (HOOKS / "lib" / "sweep.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        defined = {node.name for node in ast.walk(tree)
+                   if isinstance(node, ast.FunctionDef)}
+        # Positively: the sweep must still be here. A guard a deletion satisfies has
+        # quietly stopped guarding.
+        self.assertLessEqual({"refresh", "block", "probe"}, defined,
+                             "lib/sweep.py no longer defines the sweep")
+
+        closing = {"end", "forget", "memory_end", "memory_forget"}
+        called = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+                if name in closing:
+                    called.append(name)
+                # A tool invoked by name through a generic caller, e.g. `_call("memory_end")`.
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and arg.value in closing:
+                        called.append(str(arg.value))
+        self.assertEqual(called, [],
+                         f"lib/sweep.py now calls {called}; it must propose, never close")
+
+    def test_a_candidate_goes_quiet_after_it_is_shown(self) -> None:
+        """A block that reappears unchanged every session is one the eye learns to skip."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            sweep.refresh(self._Store(_SEARCH_ROW), True, self.NOW, self._runner("MERGED"))
+            self.assertNotEqual(sweep.block(self.NOW), "")
+            self.assertEqual(sweep.block(self.NOW + 60), "",
+                             "the same candidate was shown twice in a row")
+
+    def test_a_candidate_that_was_ignored_comes_back_later(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            sweep.refresh(self._Store(_SEARCH_ROW), True, self.NOW, self._runner("MERGED"))
+            sweep.block(self.NOW)
+            self.assertNotEqual(sweep.block(self.NOW + sweep.REMIND_AFTER_SEC + 1), "",
+                                "an ignored candidate was silently dropped forever")
+
+    def test_a_closed_candidate_stops_being_offered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            sweep.refresh(self._Store(_SEARCH_ROW), True, self.NOW, self._runner("MERGED"))
+            sweep.forget_candidate("cl_72838b5ed985430984a1")
+            self.assertEqual(sweep.block(self.NOW + sweep.REMIND_AFTER_SEC + 1), "")
+
+    def test_a_second_sweep_inside_the_window_asks_github_nothing(self) -> None:
+        """The rate limit, on a ref the cache would NOT have spared.
+
+        Written against `OPEN` deliberately. With `MERGED` this test passes whether or not
+        the rate limit exists, because a terminal verdict is cached and skipped anyway --
+        so it was a duplicate of `test_a_terminal_verdict_is_never_asked_about_twice`
+        wearing this one's name, and it stayed green when the rate limit was deleted. An
+        open pull request is re-probed by design, which makes the interval the only thing
+        standing between this hook and a subprocess on every turn.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            calls: list = []
+            sweep.refresh(self._Store(_SEARCH_ROW), True, self.NOW,
+                          self._runner("OPEN", calls))
+            self.assertEqual(len(calls), 1, "the first sweep asked GitHub nothing")
+            sweep.refresh(self._Store(_SEARCH_ROW), True, self.NOW + 60,
+                          self._runner("OPEN", calls))
+            self.assertEqual(len(calls), 1,
+                             "the rate limit is gone; every turn now shells out")
+            # And it does resume once the interval has passed, or it is not a rate limit.
+            sweep.refresh(self._Store(_SEARCH_ROW), True,
+                          self.NOW + sweep.SWEEP_EVERY_SEC + 1,
+                          self._runner("OPEN", calls))
+            self.assertEqual(len(calls), 2, "the sweep never ran again")
+
+    def test_a_terminal_verdict_is_never_asked_about_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            calls: list = []
+            sweep.refresh(self._Store(_SEARCH_ROW), True, self.NOW,
+                          self._runner("MERGED", calls))
+            first = len(calls)
+            self.assertGreater(first, 0)
+            sweep.refresh(self._Store(_SEARCH_ROW), True,
+                          self.NOW + sweep.SWEEP_EVERY_SEC + 1,
+                          self._runner("MERGED", calls))
+            self.assertEqual(len(calls), first,
+                             "a merged pull request was re-checked; it cannot un-merge")
+
+    def test_a_store_that_cannot_be_read_leaves_the_hook_standing(self) -> None:
+        """A sweep is a convenience laid on a write that already succeeded."""
+        class Exploding:
+            def search(self, *a, **k):
+                raise RuntimeError("no")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            self.assertEqual(sweep.refresh(Exploding(), True, self.NOW,
+                                           self._runner("MERGED")), 0)
+
+    def test_an_unreadable_state_file_is_an_empty_one(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sweep = self._sweep(tmp)
+            sweep.STATE.write_text("{ not json", encoding="utf-8")
+            self.assertEqual(sweep.read_state(), {})
+            self.assertEqual(sweep.block(self.NOW), "")
+
+    def test_the_banner_counts_memories_and_candidates_separately(self) -> None:
+        """The count is a claim about how many *memories* arrived.
+
+        This hook was already fixed once for announcing a count over a block that was
+        short a section; folding candidates into the same number is the same defect from
+        the other direction. The sweep's own lines start with `- ` like every recall note,
+        so nothing but the ordering keeps them out of the total.
+        """
+        source = (HOOKS / "session_start.py").read_text(encoding="utf-8")
+        count_at = source.index("count = sum(")
+        sweep_at = source.index("sweep_block(")
+        self.assertLess(count_at, sweep_at,
+                        "the sweep block is appended before the count is taken, so "
+                        "candidates are being reported as memories")
+        self.assertIn("may be fixed", source,
+                      "the banner no longer names the candidates; a section nobody is "
+                      "told about is one the eye slides past")

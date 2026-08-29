@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -257,9 +258,11 @@ def main() -> int:
         facts = triples(turn, str(data.get("cwd") or "") or None, injected=injected)
         if not facts:
             log(f"turn={len(turn)}c facts=0 episode={'yes' if kept else 'no'}")
+            _sweep(store, close is not None)
             return 0
         stored, failed = store_facts(store, facts, turn, hosted=close is not None,
                                      sources=turn_of)
+        _sweep(store, close is not None)
     finally:
         if close is not None:
             close()
@@ -269,6 +272,30 @@ def main() -> int:
         + ("; failed=" + "; ".join(failed) if failed else ""))
 
     return 0
+
+
+def _sweep(store: object, hosted: bool) -> None:
+    """Ask GitHub whether any stored defect's fix has landed. Never raises, never closes.
+
+    Here rather than in `session_start.py` because of the budget: this hook runs `async`
+    with 120s and the client discards its output, while that one is synchronous with 20s
+    and its output is the opening brief. So the subprocess and the network live on this
+    side and the other side reads a file. `lib.sweep.refresh` rate-limits itself, so most
+    turns reach this and return without doing anything.
+
+    `have_gh` first, so a machine without the CLI logs one line and skips rather than
+    paying a `FileNotFoundError` per ref. Its absence is a normal install, not a fault.
+    """
+    try:
+        from lib.sweep import have_gh, refresh
+
+        if not have_gh():
+            return
+        refresh(store, hosted, time.time())
+    except Exception as exc:
+        # A sweep is a convenience laid on top of the write that already succeeded. It must
+        # not turn a stored turn into a failed hook.
+        log(f"sweep skipped: {type(exc).__name__}: {exc}")
 
 
 def _keep_turn(store: object, turn: str, cwd: str) -> "tuple[bool, list[str]]":

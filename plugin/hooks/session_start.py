@@ -229,9 +229,29 @@ def main() -> int:
             notes, missing = "", _why(exc)
         if notes.strip():
             parts.append(notes.rstrip())
+
     finally:
         if close is not None:
             close()
+
+    # Counted before the sweep block is appended, and that ordering is the point. The
+    # banner's number is a claim about how many *memories* arrived; a candidate is work to
+    # do about a memory, and folding the two together would inflate a count this hook was
+    # already fixed once for overstating. They are separate sections and separate words.
+    count = sum(1 for line in "\n\n".join(parts).splitlines() if line.startswith("- "))
+
+    # Last, and after the count: the sections above are what is known, this one is what to
+    # do about it. It reads the file `capture.py` left behind and asks nothing of the
+    # network, so a session opens no slower for it -- and it is empty on almost every
+    # session, because a candidate goes quiet for a week once it has been shown.
+    try:
+        from lib.sweep import block as sweep_block
+
+        stale = sweep_block(time.time())
+    except Exception:
+        stale = ""
+    if stale.strip():
+        parts.append(stale.rstrip())
 
     if not parts:
         # "Nothing stored yet" is a claim about the store's contents. Only make it when
@@ -241,8 +261,13 @@ def main() -> int:
         _emit({"systemMessage": status(missing or "nothing stored yet")})
         return 0
 
-    count = sum(1 for line in "\n\n".join(parts).splitlines() if line.startswith("- "))
     opened = (f"session opened with {plural(count)}" if count else "session opened")
+    if stale.strip():
+        # Named in the banner rather than left to be noticed in the context block. A
+        # section nobody is told about is one the eye slides past, which is the whole
+        # failure this sweep exists to end.
+        fixed = sum(1 for line in stale.splitlines() if line.startswith("- "))
+        opened += f" · {fixed} may be fixed"
     # A count is a claim about what arrived. Saying it while a section is missing is the
     # failure this hook had; naming what is absent is the whole fix.
     _emit({
