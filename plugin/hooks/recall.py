@@ -53,8 +53,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.fast import recall as fast_recall  # noqa: E402
 from lib.ipc import (  # noqa: E402
-    due_capture_alert, emit_json, log_line, payload, plural, status, under_extraction,
-    with_alert,
+    due_alert_for_model, due_capture_alert, emit_json, log_line, payload, plural, status,
+    under_extraction, with_alert,
 )
 
 #: Enough memories to be useful, few enough to stay out of the way. Recall drops whole
@@ -146,6 +146,42 @@ THIN = 1
 #: _CHARS gates what is *sent*, and clips a 1,853-character median episode to a pointer.
 EPISODE_K = 4
 EPISODE_BUDGET = 600
+
+#: Wall-clock ceiling on the *optional* work in one invocation, measured from the top of
+#: `main()`. `hooks.json` gives this hook 10 seconds total, and nothing here tracks
+#: cumulative time across the up-to-three hosted calls one invocation can make -- the main
+#: `fast_recall()`, the episode-widening retry, and `_standing_refresh()`'s own hosted call
+#: -- so a slow or flaky connection could spend the whole budget on retries and have the
+#: harness kill the process with nothing printed: no `systemMessage`, no banner, no line in
+#: `recall.log` saying why. `lib.hosted.TIMEOUT_SEC` is 6s per network call and each call
+#: may retry once, so a single `HostedRecall` round trip that still needs its handshake can
+#: cost up to 4x that alone -- the arithmetic this constant exists to not have to survive.
+#:
+#: 7.5s leaves 2.5s of the 10s for interpreter startup, the primary `fast_recall()` call
+#: this file has never skipped, and JSON emission -- none of them measured in the single
+#: digits of milliseconds this file's other budgets are, because none of them can be timed
+#: from inside a process about to be killed by the thing measuring them. The margin is
+#: deliberately generous rather than tight against that 10s: this is the harness's own
+#: kill timer, not a cost to shave, and headroom here is what keeps a process a little slow
+#: to exit from being confused with one that is hung.
+#:
+#: Gates the two calls this file can afford to skip -- the standing refresh and the
+#: episode-widening retry -- and nothing else. The primary `fast_recall()` call is what
+#: this hook exists to make and runs regardless of elapsed time; skipping it to stay inside
+#: a budget would be answering the timeout by not doing the hook's own job.
+#:
+#: What this does NOT close: it is checked before starting a call, not while one is
+#: already running, so it stops a SECOND slow call from compounding a first one but cannot
+#: shorten a call already in flight. On a fresh process the connection cache above is
+#: empty, so whichever hosted call happens to run first -- the standing refresh, if its own
+#: 15-minute interval is due, or otherwise the primary call itself -- gets no benefit from
+#: it and can still cost the full worst case on its own. If that first call is the standing
+#: refresh, in the worst case it alone can outlast this hook's entire 10s allowance before
+#: the primary call the budget was written to protect ever starts. Closing that fully would
+#: mean bounding the DURATION of an in-flight call -- a deadline enforced inside
+#: `lib.hosted` itself, shared by every caller of it, not a clock kept in this one file --
+#: which is a deeper change than a wall-clock gate on whether to start a second one.
+OVERALL_BUDGET_SEC = 7.5
 
 #: Prompts that are not questions to the model: a slash command, a bash escape, a comment.
 #: Silence is right for these -- the user typed a command and is not waiting on memory.
@@ -580,6 +616,17 @@ def _belongs_here(bullet: str, cwd: str) -> bool:
 
 
 def main() -> int:
+    # The clock the optional hosted work below is measured against -- see
+    # OVERALL_BUDGET_SEC. `monotonic`, not `time.time()`: this is an ELAPSED-time budget,
+    # and `daemon.py` already uses `time.monotonic()` for its own idle-timeout for the same
+    # reason. A wall clock can step backward -- an NTP correction, a VM resuming from
+    # suspend -- and a step big enough would make the elapsed-time comparison negative
+    # forever, silently disabling the one guard this file added against a hook the harness
+    # kills with nothing printed. Started before the cheap checks below rather than after
+    # them so it covers the whole invocation, even though nothing before the first hosted
+    # call is expensive enough to matter in practice.
+    start = time.monotonic()
+
     if under_extraction():
         # The prompt in front of us is `capture.py`'s own extraction request, not a
         # person's. Answering it spends a retrieval query and injects the standing block
@@ -612,16 +659,48 @@ def main() -> int:
     # with a same-named local function makes every reference to it inside this function
     # local from the top, including the one capturing the original, which raises
     # `UnboundLocalError` before it ever runs.
-    alert = due_capture_alert(time.time())
+    alert = due_capture_alert()
 
     def _emit(reply: dict) -> None:
         if "systemMessage" in reply:
             reply = {**reply, "systemMessage": with_alert(reply["systemMessage"], alert)}
+        # Called here, at the point delivery is actually about to happen, rather than once
+        # at the top of `main()` -- `due_alert_for_model` persists "the model has now been
+        # told" as a side effect of deciding what to say, and everything between the top of
+        # `main()` and this point (`_read_state`, `_standing_refresh`, `_anaphoric`,
+        # `fast_recall`) is exactly the code most likely to grow a new call that can raise.
+        # A raise anywhere in that span, with the decision already made and persisted
+        # earlier, would mark a notice "told" that never actually reached the model -- worse
+        # than the repetition this function exists to prevent, because nothing would ever
+        # correct it short of the reason changing. Calling it from inside `_emit`, one line
+        # before `emit_json` actually runs, leaves nothing but dict merges in between.
+        alert_notice = due_alert_for_model()
+        if alert_notice:
+            # Merged onto whatever `additionalContext` this branch already carries (recalled
+            # memories, standing preferences) rather than replacing it -- a capture failure
+            # and a successful recall are unrelated events that can both be true on the same
+            # prompt, and either one arriving first should not cost the other its context.
+            hook_out = dict(reply.get("hookSpecificOutput") or {})
+            existing_ctx = hook_out.get("additionalContext") or ""
+            hook_out.setdefault("hookEventName", "UserPromptSubmit")
+            hook_out["additionalContext"] = (
+                f"{existing_ctx}\n\n{alert_notice}" if existing_ctx else alert_notice)
+            reply = {**reply, "hookSpecificOutput": hook_out}
         emit_json(reply)
 
     seen, carried = _read_state(session)
-    standing, standing_state = _standing_refresh(
-        session, time.time(), str(data.get("cwd") or ""))
+    if time.monotonic() - start < OVERALL_BUDGET_SEC:
+        standing, standing_state = _standing_refresh(
+            session, time.time(), str(data.get("cwd") or ""))
+    else:
+        # `("", None)` is exactly what `_standing_refresh` itself returns for "nothing to
+        # do" -- see its own interval check -- so skipping the call is indistinguishable
+        # from having made it and finding the refresh not due. `_write_state` reads `None`
+        # as "carry the existing refresh clock forward," never as "refreshed just now,"
+        # so a skip here cannot fool a later prompt into thinking this one already paid
+        # for the check it did not make.
+        log_line("recall", "skipped=standing refresh, budget exhausted")
+        standing, standing_state = "", None
     anaphoric = _anaphoric(prompt)
 
     # An anaphoric prompt is searched together with the last substantive one, not instead
@@ -668,19 +747,26 @@ def main() -> int:
         # that type, so it raises and the client retries without it. It costs one round
         # trip on an already-thin prompt, and it starts working the day the server is
         # fixed, with no release here.
-        try:
-            wider, wider_ok, _ = fast_recall(query, k=EPISODE_K, budget=EPISODE_BUDGET,
-                                             header=HEADER, include_episodes=True)
-        except Exception:
-            wider, wider_ok = "", False
-        if wider_ok and wider:
-            # Filtered on the same terms as the first pass. This is the branch that most
-            # needs it: it runs precisely when `fresh` came back empty, and dropping
-            # another checkout's notes is one of the things that empties it -- so without
-            # this the filter would make its own bypass fire more often.
-            header, bullets = _split(wider)
-            bullets = [line for line in bullets if _belongs_here(line, here)]
-            fresh = [line for line in bullets if _digest(line) not in known]
+        if time.monotonic() - start < OVERALL_BUDGET_SEC:
+            try:
+                wider, wider_ok, _ = fast_recall(query, k=EPISODE_K, budget=EPISODE_BUDGET,
+                                                 header=HEADER, include_episodes=True)
+            except Exception:
+                wider, wider_ok = "", False
+            if wider_ok and wider:
+                # Filtered on the same terms as the first pass. This is the branch that
+                # most needs it: it runs precisely when `fresh` came back empty, and
+                # dropping another checkout's notes is one of the things that empties it --
+                # so without this the filter would make its own bypass fire more often.
+                header, bullets = _split(wider)
+                bullets = [line for line in bullets if _belongs_here(line, here)]
+                fresh = [line for line in bullets if _digest(line) not in known]
+        else:
+            # `fresh` (and `bullets`) stay exactly what the primary pass returned -- an
+            # already-thin answer, not a wrong one. The prompt still gets whatever that
+            # pass found; it just does not get a second, wider round trip spent looking
+            # for more of it.
+            log_line("recall", "skipped=episode widen, budget exhausted")
 
     repeats = len(bullets) - len(fresh)
 

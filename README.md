@@ -63,6 +63,21 @@ needs a **CA bundle**, because python.org's macOS build does not use the
 system trust store and fails with `CERTIFICATE_VERIFY_FAILED` on a
 certificate every other tool accepts.
 
+One recall can reach the hosted route from up to three places without a
+daemon running — the memory lookup itself, a wider retry when the first
+answer is thin, and an occasional refresh of your standing preferences —
+and each used to open its own connection and re-authenticate from
+scratch. They now share one hosted connection for the life of the
+process, so only the first of the three pays for the handshake.
+
+That still leaves a slow or unreachable connection able to run long, so
+`UserPromptSubmit` also tracks its own elapsed time against the ten
+seconds Claude Code allows it. Past that, the wider retry and the
+preferences refresh are skipped — logged, not silent — so a bad
+connection costs a plainer answer rather than the hook going silent.
+The memory lookup itself is never skipped this way, since skipping the
+one thing this hook exists to do would not be a fix.
+
 Configuration is discovered from the `memvara` server block in your own
 client settings, so the hooks open the store the MCP server writes to
 rather than one of their own choosing, and they degrade to doing nothing
@@ -115,9 +130,27 @@ printing.** Capture runs `async` and cannot speak for itself — see
 above — so a `claude -p` that has been failing for hours said nothing
 anyone saw until the terminal, past `capture.log`, which nothing reads
 on a schedule. Recall and session start now append `· capture failing:
-<reason>` to any of the outcomes on this page — once when the failure
-starts, again every six hours while it persists, and not at all once
-extraction succeeds again.
+<reason>` to any of the outcomes on this page, on every prompt for as
+long as the failure lasts, and not at all once extraction succeeds
+again. It used to report once and then suppress the same reason for
+six hours, on the reasoning that a repeated line is noise — but the
+banner beside it changes every prompt regardless, so silence for six
+hours read as "this got fixed" to someone watching the terminal, not
+as "already told you."
+
+**The model gets told too, but only once.** The banner above is a
+terminal display, not model context — a `systemMessage` field the
+client renders to whoever is watching, never fed into what the model
+itself sees. Repeating it there on every prompt the way the banner
+does would mean the same sentence in every reply for however many
+days a failure stays unresolved, which is a different problem than
+the banner's — a person reading a static terminal line skims past a
+repeat; a person reading replies does not expect one to say the same
+thing twice. So the model is handed the failure once per distinct
+reason, as an instruction to mention it, and stays quiet about that
+same reason afterward — until it clears and a new one takes its
+place, or the same reason recurs after a genuine recovery, which
+counts as new again.
 
 **Storage is rich; injection is clipped.** They are different jobs. A
 memory worth keeping carries its reasoning — that is what stopped captured

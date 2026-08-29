@@ -97,58 +97,45 @@ def _alert_path() -> str:
     return os.path.join(_HOME, ".memvara", ".hooks", "capture-alert.json")
 
 
-#: How long a failure stays reported before it is worth repeating. Not on every prompt --
-#: the reason does not change between reminders, and a line repeated every few minutes is
-#: exactly the noise a person learns to stop reading past. Not never again either: 117
-#: turns once logged `facts=0` with nothing anywhere distinguishing a dead extractor from
-#: a quiet one, and reporting once and then falling silent for the rest of a multi-day
-#: outage is the same failure with fewer words.
-CAPTURE_ALERT_REMIND_SECONDS = 6 * 60 * 60
-
-
-def _read_alert() -> dict:
+def _read_json_file(path: str) -> dict:
+    """A dict from a JSON file, or `{}` for anything short of one -- missing, unreadable,
+    corrupt, or holding some other JSON shape entirely. Shared by `_read_alert` and
+    `_read_notified_alert`: same file shape, same failure handling, same reason for it --
+    only the path differs.
+    """
     try:
-        with open(_alert_path(), encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def _write_alert(data: dict) -> None:
-    """Best-effort atomic write, shared by every writer of this file.
+def _write_json_file_atomic(path: str, data: dict, tmp_prefix: str,
+                            log_name: str = "") -> None:
+    """Write `data` to `path` via a sibling temp file and `os.replace`, so a concurrent
+    reader never sees a truncated payload. Shared by `_write_alert` and
+    `_write_notified_alert` -- the mechanism is identical between the two files; it is WHO
+    writes each one and WHAT race each accepts that differs, which is why that reasoning
+    stays on each wrapper's own docstring rather than living here.
 
-    `raise_capture_alert` (the async extraction child) and `due_capture_alert` (recall.py,
-    fired on the very next prompt while that child can still be mid-run -- `capture.py`
-    says extraction takes 12-14s and hands the turn back immediately, so a fast follow-up
-    prompt is the ordinary case) are two genuinely concurrent writers of one file with no
-    lock between them.
-
-    Writing to a sibling temp file and `os.replace`-ing it over the target removes the one
-    failure mode that write order cannot fix on its own: a reader opening the file mid-write
-    and getting a truncated payload. `os.replace` is atomic on the same filesystem, so a
-    concurrent `_read_alert` sees either the whole old file or the whole new one, never a
-    half-written mix that `json.load` would raise on and `_read_alert` would then read back
-    as "no alert" -- silently hiding an active failure for one prompt.
-
-    What this does NOT fix, and is not trying to: two writers can still race between their
-    own read and their own write, so the *last* write of the two wins outright rather than
-    merging. A `raise_capture_alert` that read a stale `last_reported` can still land after
-    a `due_capture_alert` that just refreshed it, resetting the reminder clock early; a
-    `clear_capture_alert` can still be followed by a `due_capture_alert` that had already
-    read the pre-clear state and writes it straight back, undoing the clear. Closing that
-    fully needs a lock around the whole read-modify-write in both functions, which is real
-    machinery for what this is: an occasional extra reminder, or a resolved banner
-    reappearing for one more prompt before the next successful extraction clears it again.
-    Losing a fact would be the larger bug; losing a few minutes of an FYI banner's timing
-    is the trade this file already makes for `capture.log` and the session state next to it.
+    `log_name`, when given, is the one thing this helper does that a plain `open(path, "w")`
+    would not have needed: a line to that log on a write failure. Silent is fine for a
+    write's FIRST failure -- an occasional missed update is a tradeoff this repository
+    already accepts for `capture-alert.json`'s siblings -- but a write that keeps failing
+    forever is a different thing, and for at least one caller (`due_alert_for_model`) a
+    permanently failing write means the state it exists to update never advances, so the
+    same notice repeats on every single prompt for as long as the write keeps losing --
+    exactly the per-turn repetition that function exists to prevent, with nothing anywhere
+    saying why it stopped working. Omitted (empty string) for `_write_alert`, unchanged from
+    before this helper existed, since that failure mode was already reviewed and accepted
+    on its own terms.
     """
     import tempfile
 
-    path = _alert_path()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".capture-alert-")
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=tmp_prefix)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(data, fh)
@@ -158,8 +145,46 @@ def _write_alert(data: dict) -> None:
                 os.unlink(tmp)
             except OSError:
                 pass
+            if log_name:
+                log_line(log_name, f"write failed: {os.path.basename(path)}")
     except OSError:
-        pass
+        if log_name:
+            log_line(log_name, f"write failed: {os.path.basename(path)}")
+
+
+def _read_alert() -> dict:
+    return _read_json_file(_alert_path())
+
+
+def _write_alert(data: dict) -> None:
+    """This file's only writer that has a payload to write.
+
+    `clear_capture_alert` is the OTHER thing that touches this file, and does not call
+    this function -- it does a plain `os.unlink`, which needs no atomicity dance because
+    an unlink has no partial-write state to leave behind. The two are still genuinely
+    concurrent with each other: `raise_capture_alert` (the async extraction child) and
+    `clear_capture_alert` (the same child, the next time it succeeds) can each run while
+    the other is mid-call, with no lock between them -- `capture.py` says extraction takes
+    12-14s and hands the turn back immediately, so an extraction still finishing while
+    another one starts is the ordinary case, not a rare one.
+
+    What atomicity fixes here is narrower: a reader opening the file mid-write and getting
+    a truncated payload. Writing to a sibling temp file and `os.replace`-ing it over the
+    target means a concurrent `_read_alert` sees either the whole old file or the whole new
+    one, never a half-written mix that `json.load` would raise on and `_read_alert` would
+    then read back as "no alert" -- silently hiding an active failure for one prompt.
+
+    What neither this nor `clear_capture_alert`'s unlink fixes: the two can still race with
+    each other, so whichever lands last wins outright rather than merging -- a
+    `clear_capture_alert` from one extraction can land after a `raise_capture_alert` from
+    a second, failing one, dropping a real alert; the reverse can resurrect a resolved one
+    for one more prompt. Closing that needs a lock around both writers, which is real
+    machinery for what this is: an occasional missed or resurrected banner between two
+    concurrent extractions, corrected the moment either one runs again. Losing a fact would
+    be the larger bug; losing a few seconds of an FYI banner's accuracy is the trade this
+    file already makes for `capture.log` and the session state next to it.
+    """
+    _write_json_file_atomic(_alert_path(), data, ".capture-alert-")
 
 
 def raise_capture_alert(reason: str) -> None:
@@ -170,48 +195,135 @@ def raise_capture_alert(reason: str) -> None:
     failure -- alerting on it would mean every successful stand-down looked like an
     outage.
 
-    The reminder clock carries forward when the reason is unchanged, and resets when it is
-    not. An extractor stuck on one cause should nag on the schedule above and no faster;
-    a second, different failure arriving mid-outage is new information and is reported
-    the moment it is seen, the same as the first.
+    Overwrites whatever was here before unconditionally. There used to be a clock in this
+    file too -- report once, then suppress the same reason for six hours -- and it meant a
+    prompt sent minutes after the throttle window opened got the plain banner back with no
+    word that anything was wrong, which reads as "fixed" to someone who was never told
+    otherwise. `due_capture_alert` no longer owns a schedule to consult, so there is nothing
+    here left to preserve between failures.
     """
-    current = _read_alert()
-    last_reported = current.get("last_reported", 0) if current.get("reason") == reason else 0
-    _write_alert({"reason": reason, "last_reported": last_reported})
+    _write_alert({"reason": reason})
 
 
 def clear_capture_alert() -> None:
-    """Called the first time `claude -p` succeeds after failing. A no-op if it never failed."""
+    """Called the first time `claude -p` succeeds after failing. A no-op if it never failed.
+
+    Also resets what `due_alert_for_model` has already told the model, at the moment
+    capture actually recovers rather than lazily the next time something happens to call
+    it while nothing is failing. `due_alert_for_model` has its own defensive reset for
+    that same case, but relying on it alone would leave a gap: a recovery followed
+    immediately by a second, unrelated failure with the same reason text, with no prompt
+    landing in between to trigger the lazy path, would read as "already told" -- exactly
+    the stale-positive `raise_capture_alert`'s own docstring describes for the
+    human-visible banner, just on the model-facing side instead. The `.get` guard keeps
+    this a true no-op on the common path where capture has never failed at all -- no
+    write, not even one that would land on an already-empty file.
+    """
     try:
         os.unlink(_alert_path())
     except OSError:
         pass
+    if _read_notified_alert().get("reason"):
+        _write_notified_alert({})
 
 
-def due_capture_alert(now: float) -> str:
+def due_capture_alert() -> str:
     """The clause to add to this prompt's banner, or `""` when nothing is due.
 
     Read unconditionally on every prompt -- an `open()` that raises `FileNotFoundError` on
     an install where capture has never failed, which is the common case and costs one
     failed syscall rather than a stat-then-open pair that would cost two and still race.
 
-    Reports the first time a failure is seen (`last_reported` is `0`) and then again every
-    `CAPTURE_ALERT_REMIND_SECONDS` while it persists. A guard that reports once and then
-    trusts the log is the same shape this file already fixed once for extraction itself --
-    the banner is the channel a person is actually reading, and it must not go quiet just
-    because the first line already scrolled past.
+    Every prompt, for as long as `capture-alert.json` names a reason -- no reminder clock,
+    no suppression window. There used to be one, on the reasoning that repeating the same
+    line is noise a person learns to stop reading. Measured against what it actually cost:
+    a person watching one banner every few minutes during an outage read the SAME banner
+    dozens of times regardless, since recall's own message rides beside it and changes on
+    its own schedule -- the alert clause was the only part of that line that ever silently
+    disappeared and reappeared, on a clock nothing on screen explained. Silence for six
+    hours reads as "this got fixed," not as "already told you," and the six hours where it
+    stayed wrong was chosen to match a channel -- `capture.log` -- that nobody was actually
+    reading in real time. The channel that matters is exactly the one this function feeds.
     """
     data = _read_alert()
     reason = data.get("reason")
     if not isinstance(reason, str) or not reason:
         return ""
-    last = data.get("last_reported")
-    last = float(last) if isinstance(last, (int, float)) else 0.0
-    if last and now - last < CAPTURE_ALERT_REMIND_SECONDS:
-        return ""
-    data["last_reported"] = now
-    _write_alert(data)
     return f"capture failing: {reason}"
+
+
+def _notified_alert_path() -> str:
+    """Where the reason last handed to the MODEL as context is recorded.
+
+    A sibling of `_alert_path()`, not the same file: `due_capture_alert` is read
+    unconditionally on every prompt for the human-visible banner, by design -- see its own
+    docstring for why that stopped being throttled. `due_alert_for_model` answers a
+    different question -- "has the model already been told about *this* failure" -- and
+    needs its own memory to answer it, or every prompt would re-tell the model the same
+    reason for as long as it stays broken, moving the exact repetition just removed from
+    the terminal banner into the model's own replies instead.
+    """
+    return os.path.join(_HOME, ".memvara", ".hooks", "capture-alert-notified.json")
+
+
+def _read_notified_alert() -> dict:
+    return _read_json_file(_notified_alert_path())
+
+
+def _write_notified_alert(data: dict) -> None:
+    """Atomic write, same mechanism as `_write_alert` -- but NOT the single-writer file an
+    earlier version of this docstring claimed.
+
+    Two things write here, from two different, genuinely concurrent processes: `recall.py`
+    calls `due_alert_for_model()` synchronously on every prompt, and `clear_capture_alert()`
+    -- called from the async extraction child, the same one `raise_capture_alert` runs from
+    -- resets this file the moment capture recovers. Those two can race exactly the way
+    `raise_capture_alert`/`clear_capture_alert` already race on `capture-alert.json`: each
+    does its own read-then-conditional-write with no lock between them, so a recovery's
+    reset can land on a stale read and silently no-op while a fresh notify write is still in
+    flight, or two overlapping `recall.py` processes can clobber each other's write outright.
+    The accepted trade is identical to that sibling file's: whichever write lands last wins,
+    an occasional stale "already told" or an occasional extra retelling, corrected the next
+    time either side runs again. Closing it needs the same lock this file's neighbor already
+    declines for the same reason -- real machinery for what is, at worst, one repeated or
+    one skipped sentence in a reply.
+    """
+    _write_json_file_atomic(_notified_alert_path(), data, ".capture-alert-notified-",
+                            log_name="recall")
+
+
+def due_alert_for_model() -> str:
+    """Context to hand the model when the failing reason is new since it was last told, or `""`.
+
+    This is not the six-hour throttle `due_capture_alert` had removed from it -- that was a
+    clock silently hiding a still-active failure from a person watching a banner that should
+    have been a live indicator every time it was read. This is a value comparison, not a
+    clock: it tells the model once per distinct reason, so a person's actual conversation
+    is not interrupted on every single turn by a repeat of the same sentence for however
+    many days a failure stays unresolved. The human-visible banner from `due_capture_alert`
+    is untouched by this and keeps firing on every prompt exactly as before -- only the copy
+    that reaches the model through `hookSpecificOutput.additionalContext` is deduplicated.
+
+    A cleared alert resets what was last told, not just what is currently active: a second,
+    unrelated failure that happens to produce the same reason text as an earlier,
+    since-fixed one is a new event to tell the model about, not a repeat of the old one.
+    """
+    reason = _read_alert().get("reason")
+    reason = reason if isinstance(reason, str) and reason else ""
+    told = _read_notified_alert().get("reason")
+    told = told if isinstance(told, str) else ""
+
+    if not reason:
+        if told:
+            _write_notified_alert({})
+        return ""
+    if reason == told:
+        return ""
+    _write_notified_alert({"reason": reason})
+    return (
+        f"Memvara: memory capture just started failing ({reason}). "
+        "Mention this to the user once in your reply."
+    )
 
 
 def with_alert(text: str, alert: str) -> str:
