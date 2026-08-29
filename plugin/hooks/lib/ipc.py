@@ -97,15 +97,6 @@ def _alert_path() -> str:
     return os.path.join(_HOME, ".memvara", ".hooks", "capture-alert.json")
 
 
-#: How long a failure stays reported before it is worth repeating. Not on every prompt --
-#: the reason does not change between reminders, and a line repeated every few minutes is
-#: exactly the noise a person learns to stop reading past. Not never again either: 117
-#: turns once logged `facts=0` with nothing anywhere distinguishing a dead extractor from
-#: a quiet one, and reporting once and then falling silent for the rest of a multi-day
-#: outage is the same failure with fewer words.
-CAPTURE_ALERT_REMIND_SECONDS = 6 * 60 * 60
-
-
 def _read_alert() -> dict:
     try:
         with open(_alert_path(), encoding="utf-8") as fh:
@@ -116,32 +107,33 @@ def _read_alert() -> dict:
 
 
 def _write_alert(data: dict) -> None:
-    """Best-effort atomic write, shared by every writer of this file.
+    """Atomic write of this file's only writer that has a payload to write.
 
-    `raise_capture_alert` (the async extraction child) and `due_capture_alert` (recall.py,
-    fired on the very next prompt while that child can still be mid-run -- `capture.py`
-    says extraction takes 12-14s and hands the turn back immediately, so a fast follow-up
-    prompt is the ordinary case) are two genuinely concurrent writers of one file with no
-    lock between them.
+    `clear_capture_alert` is the OTHER thing that touches this file, and does not call
+    this function -- it does a plain `os.unlink`, which needs no atomicity dance because
+    an unlink has no partial-write state to leave behind. The two are still genuinely
+    concurrent with each other: `raise_capture_alert` (the async extraction child) and
+    `clear_capture_alert` (the same child, the next time it succeeds) can each run while
+    the other is mid-call, with no lock between them -- `capture.py` says extraction takes
+    12-14s and hands the turn back immediately, so an extraction still finishing while
+    another one starts is the ordinary case, not a rare one.
 
-    Writing to a sibling temp file and `os.replace`-ing it over the target removes the one
-    failure mode that write order cannot fix on its own: a reader opening the file mid-write
-    and getting a truncated payload. `os.replace` is atomic on the same filesystem, so a
-    concurrent `_read_alert` sees either the whole old file or the whole new one, never a
-    half-written mix that `json.load` would raise on and `_read_alert` would then read back
-    as "no alert" -- silently hiding an active failure for one prompt.
+    What THIS function's atomicity fixes is narrower: a reader opening the file mid-write
+    and getting a truncated payload. Writing to a sibling temp file and `os.replace`-ing
+    it over the target means a concurrent `_read_alert` sees either the whole old file or
+    the whole new one, never a half-written mix that `json.load` would raise on and
+    `_read_alert` would then read back as "no alert" -- silently hiding an active failure
+    for one prompt.
 
-    What this does NOT fix, and is not trying to: two writers can still race between their
-    own read and their own write, so the *last* write of the two wins outright rather than
-    merging. A `raise_capture_alert` that read a stale `last_reported` can still land after
-    a `due_capture_alert` that just refreshed it, resetting the reminder clock early; a
-    `clear_capture_alert` can still be followed by a `due_capture_alert` that had already
-    read the pre-clear state and writes it straight back, undoing the clear. Closing that
-    fully needs a lock around the whole read-modify-write in both functions, which is real
-    machinery for what this is: an occasional extra reminder, or a resolved banner
-    reappearing for one more prompt before the next successful extraction clears it again.
-    Losing a fact would be the larger bug; losing a few minutes of an FYI banner's timing
-    is the trade this file already makes for `capture.log` and the session state next to it.
+    What neither this function nor `clear_capture_alert`'s unlink fixes: the two can still
+    race with each other, so whichever lands last wins outright rather than merging -- a
+    `clear_capture_alert` from one extraction can land after a `raise_capture_alert` from
+    a second, failing one, dropping a real alert; the reverse can resurrect a resolved one
+    for one more prompt. Closing that needs a lock around both writers, which is real
+    machinery for what this is: an occasional missed or resurrected banner between two
+    concurrent extractions, corrected the moment either one runs again. Losing a fact would
+    be the larger bug; losing a few seconds of an FYI banner's accuracy is the trade this
+    file already makes for `capture.log` and the session state next to it.
     """
     import tempfile
 
@@ -170,14 +162,14 @@ def raise_capture_alert(reason: str) -> None:
     failure -- alerting on it would mean every successful stand-down looked like an
     outage.
 
-    The reminder clock carries forward when the reason is unchanged, and resets when it is
-    not. An extractor stuck on one cause should nag on the schedule above and no faster;
-    a second, different failure arriving mid-outage is new information and is reported
-    the moment it is seen, the same as the first.
+    Overwrites whatever was here before unconditionally. There used to be a clock in this
+    file too -- report once, then suppress the same reason for six hours -- and it meant a
+    prompt sent minutes after the throttle window opened got the plain banner back with no
+    word that anything was wrong, which reads as "fixed" to someone who was never told
+    otherwise. `due_capture_alert` no longer owns a schedule to consult, so there is nothing
+    here left to preserve between failures.
     """
-    current = _read_alert()
-    last_reported = current.get("last_reported", 0) if current.get("reason") == reason else 0
-    _write_alert({"reason": reason, "last_reported": last_reported})
+    _write_alert({"reason": reason})
 
 
 def clear_capture_alert() -> None:
@@ -188,29 +180,28 @@ def clear_capture_alert() -> None:
         pass
 
 
-def due_capture_alert(now: float) -> str:
+def due_capture_alert() -> str:
     """The clause to add to this prompt's banner, or `""` when nothing is due.
 
     Read unconditionally on every prompt -- an `open()` that raises `FileNotFoundError` on
     an install where capture has never failed, which is the common case and costs one
     failed syscall rather than a stat-then-open pair that would cost two and still race.
 
-    Reports the first time a failure is seen (`last_reported` is `0`) and then again every
-    `CAPTURE_ALERT_REMIND_SECONDS` while it persists. A guard that reports once and then
-    trusts the log is the same shape this file already fixed once for extraction itself --
-    the banner is the channel a person is actually reading, and it must not go quiet just
-    because the first line already scrolled past.
+    Every prompt, for as long as `capture-alert.json` names a reason -- no reminder clock,
+    no suppression window. There used to be one, on the reasoning that repeating the same
+    line is noise a person learns to stop reading. Measured against what it actually cost:
+    a person watching one banner every few minutes during an outage read the SAME banner
+    dozens of times regardless, since recall's own message rides beside it and changes on
+    its own schedule -- the alert clause was the only part of that line that ever silently
+    disappeared and reappeared, on a clock nothing on screen explained. Silence for six
+    hours reads as "this got fixed," not as "already told you," and the six hours where it
+    stayed wrong was chosen to match a channel -- `capture.log` -- that nobody was actually
+    reading in real time. The channel that matters is exactly the one this function feeds.
     """
     data = _read_alert()
     reason = data.get("reason")
     if not isinstance(reason, str) or not reason:
         return ""
-    last = data.get("last_reported")
-    last = float(last) if isinstance(last, (int, float)) else 0.0
-    if last and now - last < CAPTURE_ALERT_REMIND_SECONDS:
-        return ""
-    data["last_reported"] = now
-    _write_alert(data)
     return f"capture failing: {reason}"
 
 

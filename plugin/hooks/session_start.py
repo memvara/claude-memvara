@@ -30,7 +30,6 @@ opening brief is the other case: narrative background is exactly what it is for.
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -171,7 +170,7 @@ def main() -> int:
     # `_emit` rather than threading the alert through each call site by hand, for the same
     # reason `recall.py` does it this way: a call site that forgot to wrap would print a
     # valid banner and fail nothing.
-    alert = due_capture_alert(time.time())
+    alert = due_capture_alert()
 
     def _emit(reply: dict) -> None:
         if "systemMessage" in reply:

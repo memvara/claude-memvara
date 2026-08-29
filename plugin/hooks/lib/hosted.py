@@ -478,10 +478,39 @@ def _decode(raw: bytes) -> "dict | None":
     return None
 
 
+#: One `HostedRecall` per (api key, server) for the life of this process, keyed rather
+#: than a bare singleton so a credentials file that legitimately names two different
+#: projects mid-process -- unlikely, but cheap to get right -- still gets two clients
+#: rather than one wrongly shared between them.
+#:
+#: `recall.py` can reach `open_hosted()` from up to three places in a single invocation:
+#: `fast.recall()`'s main pass, its episode-widening retry, and `_standing_refresh()`'s own
+#: `open_writer()`. A fresh `HostedRecall` per call meant a fresh `_ensure_session()`
+#: handshake per call -- a full `_rpc()` round trip with its own one retry -- so a hook that
+#: reached this three times paid for the handshake three times before any of the three tool
+#: calls it actually wanted even started. `close()` clears `_conn` but never `_session` (see
+#: `HostedRecall.close`), so a cached instance's session survives a caller closing it after
+#: its own use; the only round trip `_ensure_session()` ever needed happens once per process
+#: instead of once per call.
+#:
+#: `daemon.py` calls this exactly once, at startup, and holds the result for the process's
+#: whole life -- caching changes nothing there. The win is entirely in the short-lived hook
+#: processes that used to rebuild the handshake on every call within their one invocation.
+_HOSTED_CACHE: "dict[tuple[str, str], HostedRecall]" = {}
+
+
 def open_hosted() -> "HostedRecall | None":
-    """A hosted client if this machine is logged in, else None."""
+    """A hosted client if this machine is logged in, else None.
+
+    Cached per process by `(api_key, server_url)` -- see `_HOSTED_CACHE` above.
+    """
     creds = credentials()
     if creds is None:
         return None
-    return HostedRecall(str(creds["api_key"]),
-                        str(creds.get("server_url") or DEFAULT_BASE))
+    key = (str(creds["api_key"]), str(creds.get("server_url") or DEFAULT_BASE))
+    cached = _HOSTED_CACHE.get(key)
+    if cached is not None:
+        return cached
+    client = HostedRecall(key[0], key[1])
+    _HOSTED_CACHE[key] = client
+    return client

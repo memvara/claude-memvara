@@ -939,9 +939,12 @@ class Hooks(unittest.TestCase):
         against a real, writable `HOME`, because the whole claim is about what actually
         reaches stdout -- not about what a mocked call was passed.
 
-        Report once, then quiet, then due again once the reminder window has passed: the
-        three states the design promises, exercised in that order against the same file
-        `lib.ipc.raise_capture_alert` writes.
+        Reported on every single call while the reason is active, with no interval to wait
+        out -- this used to test a report-once-then-throttle design and asserted the
+        second of three prompts went quiet. That throttle read as "this got fixed" to
+        someone watching the terminal during an outage, since recall's own message beside
+        it kept changing regardless; removed, and this now asserts the replacement
+        promise: consecutive prompts during one outage all carry the same word of it.
         """
         home = tempfile.mkdtemp(prefix="memvara-test-alert-")
         hooks_dir = os.path.join(home, ".memvara", ".hooks")
@@ -961,25 +964,17 @@ class Hooks(unittest.TestCase):
         try:
             said = "Failed to authenticate: OAuth session expired"
             with open(alert_path, "w", encoding="utf-8") as fh:
-                json.dump({"reason": said, "last_reported": 0}, fh)
+                json.dump({"reason": said}, fh)
 
-            first = run()
-            self.assertIn("capture failing", first)
-            self.assertIn(said, first)
+            for i in range(3):
+                message = run()
+                self.assertIn("capture failing", message, f"prompt {i + 1} went quiet")
+                self.assertIn(said, message)
 
-            second = run()
-            self.assertNotIn("capture failing", second,
-                             "reported twice for one failure with no interval between")
-
-            with open(alert_path, encoding="utf-8") as fh:
-                data = json.load(fh)
-            data["last_reported"] -= 7 * 3600  # past the 6h reminder window
-            with open(alert_path, "w", encoding="utf-8") as fh:
-                json.dump(data, fh)
-
-            third = run()
-            self.assertIn("capture failing", third,
-                          "a failure that is still happening went silent forever")
+            # And a resolved outage stops immediately, on the very next prompt -- no
+            # window to wait out in that direction either.
+            os.unlink(alert_path)
+            self.assertNotIn("capture failing", run())
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
@@ -1001,7 +996,7 @@ class Hooks(unittest.TestCase):
         try:
             said = "Failed to authenticate: OAuth session expired"
             with open(alert_path, "w", encoding="utf-8") as fh:
-                json.dump({"reason": said, "last_reported": 0}, fh)
+                json.dump({"reason": said}, fh)
 
             proc = subprocess.run(
                 ["python3", str(HOOKS / "session_start.py")],
@@ -1081,6 +1076,91 @@ class Hooks(unittest.TestCase):
             recall.SEEN_DIR = original_dir
             recall.fast_recall = original_recall
             shutil.rmtree(directory)
+
+    def test_an_exhausted_budget_skips_extras_but_still_answers(self) -> None:
+        """A slow or flaky hosted connection must not silently kill the whole hook.
+
+        Nothing tracked cumulative time across the up-to-three hosted calls one
+        invocation can make, so a connection having a bad day could spend the entire
+        10-second hook timeout on retries and be killed with nothing printed at all -- no
+        `systemMessage`, no banner, no line saying why. `OVERALL_BUDGET_SEC` forced to a
+        value already spent the instant `main()` starts is the deterministic stand-in for
+        "the primary call took unexpectedly long": the standing refresh and the
+        episode-widening retry must both be skipped and both say so, while the primary
+        `fast_recall()` call -- this hook's actual job -- still runs and still produces a
+        real answer.
+        """
+        recall = self._recall()
+        directory = tempfile.mkdtemp()
+        original_dir = recall.SEEN_DIR
+        original_recall_fn = recall.fast_recall
+        original_budget = recall.OVERALL_BUDGET_SEC
+        original_log_line = recall.log_line
+        recall.SEEN_DIR = directory
+        recall.OVERALL_BUDGET_SEC = -1.0  # spent before main() takes its first breath
+        logged = []
+        recall.log_line = lambda name, text: logged.append((name, text))
+        calls = []
+
+        def fake_recall(query, **kw):
+            calls.append(kw)
+            # Zero bullets: `fresh` comes back empty after the first pass, which is what
+            # puts the episode-widening branch on the path that must be skipped.
+            return f"{recall.HEADER}\n", True, ""
+
+        recall.fast_recall = fake_recall
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                recall.main.__globals__["payload"] = lambda: {
+                    "prompt": "a real question about something specific", "session_id": "s"}
+                result = recall.main()
+        finally:
+            recall.SEEN_DIR = original_dir
+            recall.fast_recall = original_recall_fn
+            recall.OVERALL_BUDGET_SEC = original_budget
+            recall.log_line = original_log_line
+            shutil.rmtree(directory, ignore_errors=True)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(calls), 1,
+                         "the episode-widening retry ran despite an exhausted budget")
+        printed = buf.getvalue().strip()
+        self.assertTrue(printed, "the hook produced no output at all")
+        message = json.loads(printed)
+        self.assertTrue(message.get("systemMessage"),
+                        "a truncated answer is still an answer; an empty one is a hang "
+                        "with extra steps")
+        self.assertIn(("recall", "skipped=standing refresh, budget exhausted"), logged)
+        self.assertIn(("recall", "skipped=episode widen, budget exhausted"), logged)
+
+    def test_the_budget_clock_is_monotonic_not_wall_clock(self) -> None:
+        """A code review found this exact bug: `time.time()` can step backward.
+
+        An NTP correction or a VM resuming from suspend -- plausible during the same kind
+        of infra hiccup `OVERALL_BUDGET_SEC` exists to survive -- can make `time.time()`
+        jump back. If `start` or either budget comparison used it, `time.time() - start`
+        would go negative and `< OVERALL_BUDGET_SEC` would stay true forever, silently
+        disabling the one guard this file has against a hook the harness kills with
+        nothing printed. `daemon.py` already uses `time.monotonic()` for its own
+        idle-timeout for the same reason.
+
+        Source-checked rather than driven through a mocked clock: `time` here is the
+        actual stdlib module, shared process-wide, and patching `time.time` globally to
+        prove this would risk corrupting every other test that happens to run around it
+        if cleanup ever went wrong. `_standing_refresh`'s own `now` parameter is
+        deliberately excluded from this check -- it persists a timestamp to disk and
+        compares it against a PREVIOUS process's wall-clock reading, so it has to stay
+        `time.time()`; only the two `OVERALL_BUDGET_SEC` comparisons and the `start` they
+        are measured against must be monotonic.
+        """
+        source = (HOOKS / "recall.py").read_text(encoding="utf-8")
+        self.assertIn("start = time.monotonic()", source)
+        self.assertEqual(
+            source.count("time.monotonic() - start < OVERALL_BUDGET_SEC"), 2,
+            "both budget comparisons must use the monotonic clock")
+        self.assertNotIn("time.time() - start", source,
+                         "a budget comparison reverted to the wall clock")
 
     def test_session_state_survives_junk_and_the_format_it_used_to_have(self) -> None:
         """An upgrade mid-session costs the carried query, never the dedup."""
@@ -1830,74 +1910,68 @@ class CaptureAlert(unittest.TestCase):
 
     def test_a_fresh_failure_is_reported_immediately(self) -> None:
         self.ipc.raise_capture_alert("OAuth session expired")
-        self.assertEqual(self.ipc.due_capture_alert(1000.0),
+        self.assertEqual(self.ipc.due_capture_alert(),
                          "capture failing: OAuth session expired")
 
-    def test_it_does_not_repeat_inside_the_reminder_window(self) -> None:
-        self.ipc.raise_capture_alert("OAuth session expired")
-        first = self.ipc.due_capture_alert(1000.0)
-        self.assertTrue(first)
-        second = self.ipc.due_capture_alert(1000.0 + 60)
-        self.assertEqual(second, "", "reported twice with no interval between")
+    def test_it_reports_on_every_call_with_no_suppression(self) -> None:
+        """There is no reminder clock left to consult, so every call while a reason is
+        active gets the same answer -- immediately, and again, and again.
 
-    def test_it_reminds_again_once_the_window_has_passed(self) -> None:
-        self.ipc.raise_capture_alert("OAuth session expired")
-        first_at = 1000.0
-        self.assertTrue(self.ipc.due_capture_alert(first_at))
-        still_quiet = self.ipc.due_capture_alert(
-            first_at + self.ipc.CAPTURE_ALERT_REMIND_SECONDS - 1)
-        self.assertEqual(still_quiet, "")
-        due_again = self.ipc.due_capture_alert(
-            first_at + self.ipc.CAPTURE_ALERT_REMIND_SECONDS + 1)
-        self.assertTrue(due_again, "a failure that is still happening went silent")
-
-    def test_a_changed_reason_resets_the_reminder_clock(self) -> None:
-        """A second, different failure mid-outage is new information.
-
-        Reported the moment it is seen rather than waiting out the reminder window the
-        first cause was on -- an expired login and a network outage are not the same
-        thing to act on, even if one arrived while the other's timer was still running.
+        This used to be `test_it_does_not_repeat_inside_the_reminder_window`, asserting
+        the opposite: a second call moments after the first got back `""`. The throttle it
+        tested is gone, and the reasoning behind it did not survive contact with how the
+        banner is actually read -- recall's own message beside this clause changes on its
+        own schedule regardless, so a silence meant to read as "already told you" read as
+        "this got fixed" to someone watching the terminal during an outage.
         """
         self.ipc.raise_capture_alert("OAuth session expired")
-        self.assertTrue(self.ipc.due_capture_alert(1000.0))
-        # Still inside the window a same-cause failure would have gone quiet for.
+        for _ in range(3):
+            self.assertEqual(self.ipc.due_capture_alert(),
+                             "capture failing: OAuth session expired")
+
+    def test_a_changed_reason_is_reported_immediately(self) -> None:
+        """A second, different failure mid-outage is new information either way.
+
+        With no clock left to reset, this is no longer a special case distinct from
+        reporting every call -- but it was its own test while a clock existed, and the
+        two failures are still worth showing arrive as two different sentences rather
+        than one repeated.
+        """
+        self.ipc.raise_capture_alert("OAuth session expired")
+        self.assertTrue(self.ipc.due_capture_alert())
         self.ipc.raise_capture_alert("could not resolve app.memvara.dev")
         self.assertEqual(
-            self.ipc.due_capture_alert(1000.0 + 5),
+            self.ipc.due_capture_alert(),
             "capture failing: could not resolve app.memvara.dev")
 
-    def test_a_repeated_identical_failure_does_not_reset_the_clock(self) -> None:
-        """The other half of the same rule: unchanged does not mean urgent.
+    def test_a_repeated_identical_failure_still_reports_every_time(self) -> None:
+        """The other half of the same rule: unchanged does not mean stale.
 
-        `claude -p` fails identically on most turns during an outage, and raising the
-        alert on every one of them must not push the reminder clock forward each time --
-        that would mean a busy session never goes quiet no matter how long the reminder
-        interval is set to.
+        `claude -p` fails identically on most turns during an outage, and re-raising the
+        same reason on every one of them must still answer every `due_capture_alert` call
+        -- that repetition is the point of removing the throttle, not a case it has to
+        guard against: it is what tells a person watching the terminal the outage is
+        still happening, rather than reading as it having stopped between one prompt and
+        the next.
         """
         self.ipc.raise_capture_alert("OAuth session expired")
-        self.assertTrue(self.ipc.due_capture_alert(1000.0))
-        # The extractor keeps failing the same way on the next several turns.
         for _ in range(5):
             self.ipc.raise_capture_alert("OAuth session expired")
-        still_quiet = self.ipc.due_capture_alert(
-            1000.0 + self.ipc.CAPTURE_ALERT_REMIND_SECONDS - 1)
-        self.assertEqual(still_quiet, "",
-                         "re-raising an unchanged reason pushed the reminder clock")
+            self.assertEqual(self.ipc.due_capture_alert(),
+                             "capture failing: OAuth session expired")
 
-    def test_clearing_silences_it_until_the_next_failure(self) -> None:
-        """A cleared alert must stay quiet even once a reminder would otherwise be due.
+    def test_clearing_silences_it_immediately(self) -> None:
+        """A cleared alert must stay quiet on the very next call, not after a window.
 
-        Checking one second after `clear_capture_alert()` is not this test: inside the
-        reminder window, nothing would be due regardless of whether the file was actually
-        removed, so a `clear_capture_alert` that had quietly become a no-op would pass it
-        too. Only checking *past* the window -- the moment a still-open alert would remind
-        again -- can tell "cleared" apart from "simply not due yet".
+        There is no window left to wait out: `due_capture_alert` reads the file fresh on
+        every call with nothing cached between them, so a clear takes effect on the
+        prompt immediately after it, the same as a fresh failure is reported on the
+        prompt immediately after that.
         """
         self.ipc.raise_capture_alert("OAuth session expired")
-        self.assertTrue(self.ipc.due_capture_alert(1000.0))
+        self.assertTrue(self.ipc.due_capture_alert())
         self.ipc.clear_capture_alert()
-        past_the_window = 1000.0 + self.ipc.CAPTURE_ALERT_REMIND_SECONDS + 1
-        self.assertEqual(self.ipc.due_capture_alert(past_the_window), "")
+        self.assertEqual(self.ipc.due_capture_alert(), "")
 
     def test_nothing_is_due_when_nothing_has_ever_failed(self) -> None:
         """The common case: an install where `claude -p` has never once failed.
@@ -1909,7 +1983,7 @@ class CaptureAlert(unittest.TestCase):
         already treats `Exception` from `fast_recall` as "no answer", not as a crash, and
         would swallow it the same way.
         """
-        self.assertEqual(self.ipc.due_capture_alert(1000.0), "")
+        self.assertEqual(self.ipc.due_capture_alert(), "")
 
     def test_clearing_something_that_was_never_raised_is_not_an_error(self) -> None:
         self.ipc.clear_capture_alert()  # must not raise
@@ -1964,7 +2038,7 @@ class CaptureAlert(unittest.TestCase):
         self.assertEqual(replaced[0][1], self.ipc._alert_path())
         # And the file is genuinely usable afterward -- os.replace was not merely called
         # and then ignored.
-        self.assertEqual(self.ipc.due_capture_alert(1000.0),
+        self.assertEqual(self.ipc.due_capture_alert(),
                          "capture failing: OAuth session expired")
 
     def test_a_write_that_cannot_replace_does_not_leave_a_temp_file_behind(self) -> None:
@@ -2417,6 +2491,98 @@ class Hosted(unittest.TestCase):
             self.assertIsNone(hosted.open_hosted())
         finally:
             hosted.CREDENTIALS = original
+
+    def _fake_credentials(self, hosted, api_key: str = "test-key",
+                          server_url: str = "https://example.test"):
+        """Point `hosted.CREDENTIALS` at a real file and return it for cleanup."""
+        directory = tempfile.mkdtemp(prefix="memvara-test-creds-")
+        path = os.path.join(directory, "credentials.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"api_key": api_key, "server_url": server_url}, fh)
+        original = hosted.CREDENTIALS
+        hosted.CREDENTIALS = path
+        return directory, original
+
+    def test_open_hosted_caches_one_client_per_process(self) -> None:
+        """One `recall.py` invocation can reach `open_hosted()` from up to three places --
+        `fast.recall()`'s main pass, its episode-widening retry, and
+        `_standing_refresh()`'s own `open_writer()`. A fresh `HostedRecall` per call meant
+        a fresh `_ensure_session()` handshake per call: a full `_rpc()` round trip with its
+        own one retry, paid up to three times in one ten-second hook before any of the
+        three tool calls it actually wanted even started.
+
+        Asserted on identity, not merely on behaviour matching: two calls that happened to
+        answer the same way would not distinguish a shared client from two independent
+        ones that both worked correctly, which is exactly the distinction this test exists
+        to make.
+        """
+        hosted = self._hosted()
+        directory, original = self._fake_credentials(hosted)
+        original_cache = dict(hosted._HOSTED_CACHE)
+        hosted._HOSTED_CACHE.clear()
+        try:
+            first = hosted.open_hosted()
+            second = hosted.open_hosted()
+            self.assertIsNotNone(first)
+            self.assertIs(first, second,
+                          "open_hosted() built a fresh client on the second call")
+        finally:
+            hosted.CREDENTIALS = original
+            hosted._HOSTED_CACHE.clear()
+            hosted._HOSTED_CACHE.update(original_cache)
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_a_cached_clients_session_survives_being_closed(self) -> None:
+        """The whole point of caching the object rather than just its return value.
+
+        `HostedRecall.close()` clears `_conn` and deliberately leaves `_session` alone --
+        a caller finishing its own work is allowed to close the connection without tearing
+        down the handshake a *different* caller, later in the same process, still needs.
+        `open_hosted()`'s cache is what lets that second caller reach the same object
+        `close()` was called on, rather than a fresh one that never had a session to lose.
+        """
+        hosted = self._hosted()
+        directory, original = self._fake_credentials(hosted)
+        original_cache = dict(hosted._HOSTED_CACHE)
+        hosted._HOSTED_CACHE.clear()
+        try:
+            client = hosted.open_hosted()
+            client._session = "s1"
+            client.close()
+            self.assertEqual(client._session, "s1",
+                             "close() must not clear the session it took a handshake to get")
+            again = hosted.open_hosted()
+            self.assertIs(again, client)
+            self.assertEqual(again._session, "s1",
+                             "a later caller in the same process rebuilt the session")
+        finally:
+            hosted.CREDENTIALS = original
+            hosted._HOSTED_CACHE.clear()
+            hosted._HOSTED_CACHE.update(original_cache)
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_different_credentials_get_different_cached_clients(self) -> None:
+        """The cache is keyed, not a bare singleton.
+
+        Unlikely mid-process, but cheap to get right: a credentials file naming two
+        different projects must never hand project B a client that already has project
+        A's session on it -- that would answer B's queries as A.
+        """
+        hosted = self._hosted()
+        directory, original = self._fake_credentials(hosted, api_key="key-a")
+        original_cache = dict(hosted._HOSTED_CACHE)
+        hosted._HOSTED_CACHE.clear()
+        try:
+            a = hosted.open_hosted()
+            with open(hosted.CREDENTIALS, "w", encoding="utf-8") as fh:
+                json.dump({"api_key": "key-b", "server_url": "https://example.test"}, fh)
+            b = hosted.open_hosted()
+            self.assertIsNot(a, b, "a different api_key reused the wrong cached client")
+        finally:
+            hosted.CREDENTIALS = original
+            hosted._HOSTED_CACHE.clear()
+            hosted._HOSTED_CACHE.update(original_cache)
+            shutil.rmtree(directory, ignore_errors=True)
 
 
 class SpeakerBlocks(unittest.TestCase):
