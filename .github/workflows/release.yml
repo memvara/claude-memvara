@@ -11,6 +11,11 @@ permissions:
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml
+    # The whole suite runs -- a tag must not skip it. ci.yml drops exactly one check on
+    # a tag ref, the vendored skill's freshness against the library's current default
+    # branch, because that is a fact about the world and not about the tagged commit.
+    # Nothing is passed from here: ci.yml reads `github.ref` itself, so there is no flag
+    # to copy into another workflow by accident.
 
   release:
     needs: ci

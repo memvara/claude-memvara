@@ -301,6 +301,52 @@ class SkillTree(unittest.TestCase):
             self.assertEqual(got, expected, f"{rel} drifted from {sha}")
 
 
+    def test_freshness_is_dropped_on_tags_and_nowhere_else(self) -> None:
+        """The one check that may be skipped, and the exact condition that skips it.
+
+        `MEMVARA_SKIP_FRESHNESS` turns off the only check here that can fail on a commit
+        that was perfectly good when written, so it is the flag most likely to spread: a
+        red run, a plausible reason, one more caller opting out, and the vendored skill
+        is frozen again with nothing saying so.
+
+        This asserts the *condition*, not merely that some condition exists, because the
+        first version of this change got the condition wrong in the safe-looking
+        direction and no test noticed. It threaded a `workflow_call` input and set the
+        variable from `inputs.check_skill_freshness == false`. Outside `workflow_call`
+        `inputs` is null, GitHub coerces `null == false` to TRUE, and freshness silently
+        stopped running on pull requests and pushes as well. The suite was green, the run
+        said `OK (skipped=1)`, and the YAML-shaped guard that stood here passed happily --
+        it read the file's words and never the semantics.
+
+        Hence a literal `refs/tags/`: a form with no coercion in it, and one this test can
+        actually pin. The runtime half is not assertable from here at all -- only a CI run
+        can show which paths really skipped -- so the log is the other half of this guard.
+        """
+        workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+        self.assertTrue(workflows, "no workflows found — this guard would pass on an "
+                                   "empty directory, which is the shape it exists to stop")
+
+        setters = {path.name for path in workflows
+                   if "MEMVARA_SKIP_FRESHNESS" in path.read_text(encoding="utf-8")}
+        self.assertEqual(
+            setters, {"ci.yml"},
+            "only ci.yml may set MEMVARA_SKIP_FRESHNESS — a second workflow setting it "
+            "is a second place freshness can be switched off from")
+
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            "MEMVARA_SKIP_FRESHNESS: ${{ startsWith(github.ref, 'refs/tags/') }}", ci,
+            "freshness must be dropped on tag refs and by nothing else. Any other "
+            "expression here — an input, a matrix value, a repository variable — is one "
+            "whose falsy behaviour has to be reasoned about, and that reasoning is what "
+            "was wrong last time")
+
+        self.assertNotIn(
+            "check_skill_freshness", ci + "".join(
+                path.read_text(encoding="utf-8") for path in workflows),
+            "the input form is gone deliberately: `inputs` is null outside workflow_call "
+            "and `null == false` coerces to true, so it disabled the check everywhere")
+
     def test_the_vendored_skill_is_not_behind_the_library(self) -> None:
         """The whole tree, against the library's CURRENT default branch.
 
@@ -321,6 +367,22 @@ class SkillTree(unittest.TestCase):
         visible in the run output; a pass is not, and a check that silently succeeds when
         it could not look is the failure it exists to prevent, one level up.
         """
+        if os.environ.get("MEMVARA_SKIP_FRESHNESS") == "true":
+            # Set only by the release gate, which re-runs this suite at a frozen tag.
+            # Freshness is a fact about the world now, not about that commit: a tag cut
+            # today passes and the same tag re-run after the library's skill moves fails,
+            # having changed nothing. v0.2.5 hit the sharp end -- tagged a day late, its
+            # release run could never go green, so the release job never built its
+            # plugin.zip and the artifact had to be attached by hand.
+            #
+            # Skipping here does not stop anything being checked. PRs and pushes to main
+            # both run with this unset, and `skill-sync.yml` asks nightly. What is given
+            # up is only the second answer to a question already answered on main minutes
+            # earlier, by a run whose commit was actually the current one.
+            raise unittest.SkipTest(
+                "freshness not re-checked in the release gate: it is a property of the "
+                "library right now, not of the tagged commit (MEMVARA_SKIP_FRESHNESS)")
+
         try:
             head = _library_head()
             upstream = _library_skill_files(head)

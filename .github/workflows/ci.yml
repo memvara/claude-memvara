@@ -51,4 +51,19 @@ jobs:
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
           MEMVARA_LIBRARY: ${{ github.workspace }}/_library
+          # Skip the freshness check on a tag, and only on a tag. Freshness compares the
+          # vendored skill against the library's CURRENT default branch, so it is a fact
+          # about the world now rather than about the commit under test: a tag passes the
+          # day it is cut and the same tag re-run after the library's skill moves fails,
+          # having changed nothing. v0.2.5 could never go green at all, and its release
+          # job therefore never built its plugin.zip.
+          #
+          # Read off `github.ref`, which a reusable workflow inherits from the caller, so
+          # a tag build is recognised without release.yml having to say anything. The
+          # first attempt threaded a `workflow_call` input instead and was wrong in the
+          # dangerous direction: `inputs` is null outside workflow_call, GitHub coerces
+          # `null == false` to TRUE, and the check silently stopped running on pull
+          # requests and pushes too. CI went green and the log said `OK (skipped=1)`.
+          # This form has no such subtlety -- refs/tags/ or not.
+          MEMVARA_SKIP_FRESHNESS: ${{ startsWith(github.ref, 'refs/tags/') }}
         run: python3 -m unittest discover -s test -v
