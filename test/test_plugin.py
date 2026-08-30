@@ -4155,7 +4155,7 @@ class Version(unittest.TestCase):
     would silently cover less than the caller believes.
     """
 
-    VERSION = "0.2.7"
+    VERSION = "0.2.8"
     DECLARED = {"plugin/.claude-plugin/plugin.json"}
 
     @classmethod
