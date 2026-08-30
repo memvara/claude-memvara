@@ -102,7 +102,7 @@ Host = namedtuple(
     "id plugin_root_env events fields envelope context_key status_key "
     "context_token_cap supports_async timeouts client_configs config_format "
     "transcript tools noise skip_prefixes machine_prompt_prefixes reentry_field approve "
-    "extractor extractor_label",
+    "extractor extractor_label description",
 )
 
 #: Canonical hook names. The bodies and `run.py` speak these; `Host.events` maps each to

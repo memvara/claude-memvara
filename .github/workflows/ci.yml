@@ -21,9 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Read skill.lock
+      - name: Read the vendoring locks
         id: lock
-        run: echo "sha=$(awk -F= '/^sha=/{print $2}' skill.lock)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "sha=$(awk -F= '/^sha=/{print $2}' skill.lock)" >> "$GITHUB_OUTPUT"
+          echo "hooks_sha=$(awk -F= '/^sha=/{print $2}' hooks.lock)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v7
         with:
@@ -40,8 +42,20 @@ jobs:
       # one guard against a frozen vendored skill had never once run here.
       #
       # One shallow ref, no token, no API. `--depth 1` because only the tip's tree is read.
-      - name: Fetch the library's default branch, so the drift check can run
+      - name: Fetch the library's default branch, so the drift checks can run
         run: git -C _library fetch --depth 1 origin main:refs/remotes/origin/main
+
+      # The hook tree is pinned by `hooks.lock`, separately from the skill, so the two
+      # locks name different commits most of the time. ONE checkout serves both: fetching
+      # that object into it lets the hook gate read the library with `git show`.
+      #
+      # Deliberately not a second `actions/checkout`. `MEMVARA_LIBRARY` names one
+      # directory, so whichever lock it did not point at would fall through to
+      # raw.githubusercontent -- one request per file, over twenty of them, on every run,
+      # and a check that is one outage away from reporting the library unreachable. The
+      # `git fetch <sha>` form is what `actions/checkout` itself does when handed a sha.
+      - name: Fetch the hook tree's pinned commit into the same checkout
+        run: git -C _library fetch --depth 1 origin ${{ steps.lock.outputs.hooks_sha }}
 
       - uses: actions/setup-python@v7
         with:

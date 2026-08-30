@@ -47,6 +47,12 @@ record beside it. A run that cannot dispatch at all — an unknown host, a
 hook that client has no event for — exits 0 like every other failure here
 and writes the reason to `~/.memvara/.hooks/hooks.log`.
 
+Those bodies are vendored, not written here: `plugin/hooks/` is a copy of the
+same directory in [memvara/memvara](https://github.com/memvara/memvara), pinned
+by `hooks.lock`. `hooks/hooks.json` is the one file that is not copied — it is
+generated from `hooks/hosts/claude.py`, because each editor's install surface
+registers its own client.
+
 The hooks try three routes and return the same text from each; only the
 latency differs. A resident daemon answers in ~38 ms. Without one, a
 local install queries in-process in ~148 ms. A hosted install with no
@@ -487,5 +493,7 @@ claude plugin install memvara@claude-memvara
 
 ## License
 
-Apache-2.0. The skill is vendored from [memvara/memvara](https://github.com/memvara/memvara);
-a test fails if the copy drifts.
+Apache-2.0. The skill and the hook tree are both vendored from
+[memvara/memvara](https://github.com/memvara/memvara), pinned by `skill.lock`
+and `hooks.lock`; tests fail if either copy drifts, or if either falls behind
+the library.

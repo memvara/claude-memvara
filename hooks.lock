@@ -1,0 +1,9 @@
+# The library commit whose plugin/hooks/ tree this plugin vendors.
+# CI diffs plugin/hooks against that SHA byte for byte, with no transforms at all --
+# unlike skill.lock, which allows exactly one line.
+# host= names the record in hooks/hosts/ that hooks/hooks.json is generated from. It is
+# this repository's own: hooks-sync.yml reads it and writes it back, never overwrites it.
+repo=memvara/memvara
+sha=501cb1e6d5f4fe631ff4c9f3f6e3e32837e1d9e4
+path=plugin/hooks
+host=claude

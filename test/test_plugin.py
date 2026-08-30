@@ -45,35 +45,63 @@ LIBRARY_SKILL_NAME = "memvara"
 LIBRARY_SKILL_PATH = "memvara/skills/memvara"
 SKILL = PLUGIN / "skills" / SKILL_NAME
 
+#: The hook tree is vendored from `plugin/hooks/` in memvara/memvara, which is where it
+#: is written now. It sits at the library's TOP level rather than inside the `memvara`
+#: package because `pyproject.toml` says `packages = ["memvara"]`: anything under that
+#: directory is swept into the wheel, so `memvara/hooks/` would ship an importable
+#: `memvara.hooks.lib` to every `pip install memvara` user. Top level keeps it in the
+#: sdist, out of the wheel, and -- because the canonical path and the vendored path are
+#: then the same three characters -- makes sync a plain copy and this gate a plain
+#: subtree byte compare, with no path rewriting anywhere to get wrong.
+LIBRARY_HOOKS_PATH = "plugin/hooks"
+
+#: The one file under `hooks/` that is NOT vendored. It is generated here, from the host
+#: record `hooks.lock` names, by the library's `plugin/hooks/tools/generate.py`. Six
+#: plugin repositories vendor the same tree and each one registers a different host, so a
+#: canonical copy of this file would be one repository's manifest shipped to all of them.
+#: That is the whole of the exception -- every other byte still has to match the library,
+#: and `test_the_registration_file_is_what_the_generator_produces` covers this one
+#: against the generator instead of leaving it uncovered.
+GENERATED_REGISTRATION = "hooks.json"
+
 #: Hook scripts are executable content the client runs on every prompt, so the allowlist
 #: names them one by one. A file appearing under `hooks/` that nobody listed here is the
-#: failure this gate exists to catch.
+#: failure this gate exists to catch. Paths are relative to `hooks/`, POSIX-spelled,
+#: because that is how the library addresses them too.
+ALLOWED_HOOK_FILES = {
+    "hooks.json",
+    "run.py",
+    "core/__init__.py",
+    "core/host.py",
+    "core/envelope.py",
+    "hosts/__init__.py",
+    "hosts/claude.py",
+    "tools/__init__.py",
+    "tools/generate.py",
+    "recall.py",
+    "session_start.py",
+    "capture.py",
+    "lib/__init__.py",
+    "lib/open.py",
+    "lib/extract.py",
+    "lib/usage.py",
+    "daemon.py",
+    "lib/ipc.py",
+    "lib/fast.py",
+    "lib/hosted.py",
+    "approve.py",
+    "lib/transcript.py",
+    "lib/standing.py",
+    "lib/write.py",
+}
+
+#: The hook half is derived rather than restated. Two hand-maintained lists of the same
+#: files drift, and the one that drifts is the one nobody is looking at -- this
+#: repository has already shipped a guard that stopped covering a file and stayed green.
 ALLOWED_PLUGIN_FILES = {
     pathlib.Path(".claude-plugin") / "plugin.json",
     pathlib.Path(".mcp.json"),
-    pathlib.Path("hooks") / "hooks.json",
-    pathlib.Path("hooks") / "run.py",
-    pathlib.Path("hooks") / "core" / "__init__.py",
-    pathlib.Path("hooks") / "core" / "host.py",
-    pathlib.Path("hooks") / "core" / "envelope.py",
-    pathlib.Path("hooks") / "hosts" / "__init__.py",
-    pathlib.Path("hooks") / "hosts" / "claude.py",
-    pathlib.Path("hooks") / "recall.py",
-    pathlib.Path("hooks") / "session_start.py",
-    pathlib.Path("hooks") / "capture.py",
-    pathlib.Path("hooks") / "lib" / "__init__.py",
-    pathlib.Path("hooks") / "lib" / "open.py",
-    pathlib.Path("hooks") / "lib" / "extract.py",
-    pathlib.Path("hooks") / "lib" / "usage.py",
-    pathlib.Path("hooks") / "daemon.py",
-    pathlib.Path("hooks") / "lib" / "ipc.py",
-    pathlib.Path("hooks") / "lib" / "fast.py",
-    pathlib.Path("hooks") / "lib" / "hosted.py",
-    pathlib.Path("hooks") / "approve.py",
-    pathlib.Path("hooks") / "lib" / "transcript.py",
-    pathlib.Path("hooks") / "lib" / "standing.py",
-    pathlib.Path("hooks") / "lib" / "write.py",
-}
+} | {pathlib.Path("hooks", *rel.split("/")) for rel in ALLOWED_HOOK_FILES}
 
 
 def _json(path: pathlib.Path) -> object:
@@ -153,13 +181,18 @@ def _library_head() -> str:
 
 def _library_skill_files(sha: str) -> "set[str]":
     """Every path under the packaged skill at `sha`, relative to it."""
+    return _library_files(sha, LIBRARY_SKILL_PATH)
+
+
+def _library_files(sha: str, path: str) -> "set[str]":
+    """Every path under `path` at `sha`, relative to `path`."""
     root = os.environ.get("MEMVARA_LIBRARY")
-    prefix = f"{LIBRARY_SKILL_PATH}/"
+    prefix = f"{path}/"
     if root:
         try:
             out = subprocess.check_output(
                 ["git", "-C", root, "ls-tree", "-r", "--name-only", sha,
-                 LIBRARY_SKILL_PATH], stderr=subprocess.DEVNULL).decode()
+                 path], stderr=subprocess.DEVNULL).decode()
         except subprocess.CalledProcessError:
             # Not an object in this checkout -- see `_library_bytes`. Ask GitHub instead of
             # reporting the library unreachable, which would SKIP the check on the one run
@@ -177,9 +210,9 @@ def _library_skill_files(sha: str) -> "set[str]":
             if entry.get("type") == "blob" and entry["path"].startswith(prefix)}
 
 
-def _lock() -> dict[str, str]:
+def _lock(name: str = "skill.lock") -> dict[str, str]:
     out: dict[str, str] = {}
-    for line in (ROOT / "skill.lock").read_text(encoding="utf-8").splitlines():
+    for line in (ROOT / name).read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -423,6 +456,192 @@ class SkillTree(unittest.TestCase):
             drifted, [],
             f"vendored skill is behind memvara/memvara@{head[:7]}: {drifted} — "
             "sync it, or check why skill-sync.yml has not")
+
+
+class HookTree(unittest.TestCase):
+    """The vendored hook tree, against the library that now owns it.
+
+    The skill established this shape and the hooks reuse it with one difference that is
+    worth stating plainly: there are NO sanctioned transforms here at all. The skill
+    allows exactly one -- a frontmatter rename -- and every allowance is a hole someone
+    later widens. The hook tree's canonical path in the library is `plugin/hooks`, the
+    same three characters it has here, so nothing needs rewriting on the way across and
+    the comparison is a plain byte compare of a subtree.
+
+    Two guards, and they are not the same guard twice. The first compares the copy
+    against the sha the copy itself names, which proves this repository is self-consistent
+    and nothing else: a lock and a tree frozen together agree with each other forever, and
+    that is precisely how the vendored *skill* shipped five commits behind for four days
+    while every check here was green. The second compares against the library's CURRENT
+    default branch, which is the one that can notice. It skips -- loudly, with the reason
+    in the message -- when the library cannot be reached, because a check that passes when
+    it could not look is the failure one level up.
+    """
+
+    def _ours(self) -> "set[str]":
+        """Every vendored file, relative to `hooks/`, POSIX-spelled.
+
+        `__pycache__` is dropped: running a hook writes bytecode next to it, it is
+        gitignored and never committed, and failing on it would fail on every machine
+        that has used the plugin once.
+        """
+        return {path.relative_to(HOOKS).as_posix() for path in HOOKS.rglob("*")
+                if path.is_file() and "__pycache__" not in path.parts}
+
+    def _vendored(self) -> "set[str]":
+        return self._ours() - {GENERATED_REGISTRATION}
+
+    def test_the_vendored_hook_bytes_match_the_library_at_the_pinned_sha(self) -> None:
+        """Byte for byte, every file, at `hooks.lock`'s sha. No exceptions but the
+        generated registration file, which has its own guard below."""
+        lock = _lock("hooks.lock")
+        self.assertEqual(lock["repo"], "memvara/memvara")
+        self.assertEqual(lock["path"], LIBRARY_HOOKS_PATH)
+        self.assertEqual(lock["host"], "claude")
+        sha = lock["sha"]
+        self.assertEqual(len(sha), 40, f"hooks.lock sha is not a full sha: {sha!r}")
+
+        ours = self._vendored()
+        self.assertTrue(ours, "no vendored hook files found — this guard would pass on "
+                              "an empty tree, which is the shape it exists to stop")
+        upstream = _library_files(sha, LIBRARY_HOOKS_PATH)
+        self.assertEqual(
+            ours, upstream,
+            f"the vendored hook file set differs from memvara/memvara@{sha[:7]}")
+
+        drifted = []
+        for rel in sorted(ours):
+            if (HOOKS / rel).read_bytes() != _library_bytes(
+                    sha, f"{LIBRARY_HOOKS_PATH}/{rel}"):
+                drifted.append(rel)
+        self.assertEqual(drifted, [], f"vendored hooks drifted from {sha[:7]}: {drifted}")
+
+    def test_the_vendored_hooks_are_not_behind_the_library(self) -> None:
+        """The whole tree, and the file SET, against the library's CURRENT default branch.
+
+        The set matters as much as the bytes: a new module upstream is drift that a
+        per-file comparison of the files we already have would never see.
+        """
+        if os.environ.get("MEMVARA_SKIP_FRESHNESS") == "true":
+            # The same flag the skill's freshness check reads, deliberately, rather than a
+            # second lever. Freshness is a fact about the library right now and not about
+            # the commit under test, so a tag that passed the day it was cut fails when
+            # re-run after the library moves, having changed nothing. One opt-out that
+            # `test_freshness_is_dropped_on_tags_and_nowhere_else` already pins is safer
+            # than two, one of which nobody is watching.
+            raise unittest.SkipTest(
+                "freshness not re-checked in the release gate: it is a property of the "
+                "library right now, not of the tagged commit (MEMVARA_SKIP_FRESHNESS)")
+
+        try:
+            head = _library_head()
+            upstream = _library_files(head, LIBRARY_HOOKS_PATH)
+        except LibraryUnreachable as exc:
+            raise unittest.SkipTest(
+                f"library unreachable, hook drift NOT checked: {exc}") from exc
+
+        self.assertTrue(upstream, "the library reported an empty hook tree")
+        self.assertEqual(
+            self._vendored(), upstream,
+            f"the vendored hook file set differs from the library at {head[:7]} — "
+            "re-vendor plugin/hooks and update hooks.lock")
+
+        drifted = []
+        for rel in sorted(upstream):
+            if (HOOKS / rel).read_bytes() != _library_bytes(
+                    head, f"{LIBRARY_HOOKS_PATH}/{rel}"):
+                drifted.append(rel)
+        self.assertEqual(
+            drifted, [],
+            f"vendored hooks are behind memvara/memvara@{head[:7]}: {drifted} — "
+            "re-vendor, or check why hooks-sync.yml has not")
+
+    def test_the_hook_file_set_is_named_here_one_by_one(self) -> None:
+        """A file the client will execute that nobody listed is the thing to catch."""
+        extra = self._ours() - ALLOWED_HOOK_FILES
+        self.assertFalse(
+            extra, f"unlisted hook files: {sorted(extra)} — add them to "
+                   "ALLOWED_HOOK_FILES deliberately, having read them")
+
+    def test_the_allowlist_names_nothing_that_is_no_longer_in_the_tree(self) -> None:
+        """The other direction, and the one that is easy to leave out.
+
+        A hand-maintained list of what is covered is itself unguarded: a file deleted
+        upstream leaves its entry behind, the entry covers nothing, and from outside a
+        list that has stopped covering a file looks exactly like a list that covers
+        everything. Removing a file from `AgentSetup.tsx`'s guard in a sibling repository
+        produced fifteen passing tests and no failure at all.
+        """
+        missing = ALLOWED_HOOK_FILES - self._ours()
+        self.assertFalse(
+            missing, f"ALLOWED_HOOK_FILES names files that are not in the tree: "
+                     f"{sorted(missing)}")
+
+    def test_the_sync_workflow_rewrites_the_lock_it_already_has(self) -> None:
+        """`hooks-sync.yml` must write back exactly the lock that is committed here.
+
+        The workflow replaces `hooks.lock` wholesale on every run. One stray character
+        between the heredoc there and the file here and the diff is never empty, so the
+        nightly job opens a pull request that changes nothing, every night, forever --
+        and the honest daily PR is what everybody then stops reading.
+
+        `host` is the half that must NOT come from the workflow. Seven repositories vendor
+        one tree and each registers a different client, so a literal host in the heredoc
+        would flatten six install surfaces into a copy of this one on the first sync. It
+        is read out of the file being replaced, and this asserts the heredoc interpolates
+        it rather than naming it.
+        """
+        source = (ROOT / ".github" / "workflows" / "hooks-sync.yml").read_text(
+            encoding="utf-8")
+        opener = "cat > hooks.lock <<LOCK\n"
+        self.assertIn(opener, source, "hooks-sync.yml no longer writes hooks.lock")
+        indent = " " * (source.index(opener) - source.rindex("\n", 0, source.index(opener))
+                        - 1)
+        body, _, rest = source.split(opener, 1)[1].partition(f"{indent}LOCK\n")
+        self.assertTrue(rest, "the hooks.lock heredoc is not terminated")
+
+        lines = []
+        for line in body.splitlines(True):
+            self.assertTrue(line.startswith(indent), f"ragged heredoc line: {line!r}")
+            lines.append(line[len(indent):])
+        written = "".join(lines)
+
+        self.assertIn("host=$host\n", written,
+                      "the heredoc must interpolate this repository's own host, not "
+                      "name one — a literal there flattens every sibling repo into this "
+                      "one on the first sync")
+        self.assertIn('host=$(awk -F= \'/^host=/{print $2}\' hooks.lock)', source,
+                      "the host must be read back out of the lock being replaced")
+
+        lock = _lock("hooks.lock")
+        written = written.replace("$sha", lock["sha"]).replace("$host", lock["host"])
+        self.assertEqual(
+            written, (ROOT / "hooks.lock").read_text(encoding="utf-8"),
+            "hooks-sync.yml would rewrite hooks.lock differently from how it is "
+            "committed, so every scheduled run would open a PR that changes nothing")
+
+    def test_the_registration_file_is_what_the_generator_produces(self) -> None:
+        """`hooks.json` is the one unvendored file, so it is checked against its source.
+
+        Its source is not a copy of itself in the library -- that is the comparison this
+        repository keeps getting wrong -- but the generator plus the host record
+        `hooks.lock` names. A hand edit here, or a host record that stops agreeing with
+        the manifest built from it, fails.
+        """
+        lock = _lock("hooks.lock")
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            generate = importlib.import_module("tools.generate")
+            host = importlib.import_module(f"hosts.{lock['host']}").HOST
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(
+            generate.registration(host),
+            (HOOKS / GENERATED_REGISTRATION).read_bytes(),
+            f"{GENERATED_REGISTRATION} is not what tools/generate.py builds from "
+            f"hosts/{lock['host']}.py — regenerate it rather than editing it by hand")
 
 
 class SharedInstructions(unittest.TestCase):

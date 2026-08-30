@@ -88,4 +88,17 @@ HOST = Host(
     #: Written into every claim this plugin stores and rendered back by `memory_why`.
     #: Changing it for tidiness re-labels history.
     extractor_label="claude-code-hook",
+    #: The prose `tools/generate.py` writes into this host's registration file. It lives
+    #: on the record rather than in the generator because it is a fact about one client,
+    #: and a per-host literal inside a shared tool is the shape that goes stale in the
+    #: copy nobody is reading.
+    description=(
+        "Memvara: recall on every prompt, capture when a turn ends. Every command goes "
+        "through run.py, which binds the host record in hosts/claude.py before "
+        "dispatching -- the client's field names, reply keys and event names are data "
+        "there rather than literals in the hook bodies. Capture runs async so a 12-14s "
+        "extraction never holds the turn open; async hook output is discarded by the "
+        "client, so its record is ~/.memvara/.hooks/capture.log rather than a "
+        "systemMessage."
+    ),
 )
