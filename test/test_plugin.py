@@ -2956,6 +2956,59 @@ class StoreRoute(unittest.TestCase):
                          "and so must the header, which lib.hosted renders itself")
 
 
+    def test_a_writer_still_gets_the_library_handle(self) -> None:
+        """The half the first attempt at this fix broke, and broke silently.
+
+        `capture.py` is the only caller that purely writes, and it is the only one that
+        wants a `RemoteMemvara` on a hosted install: `store_facts` attaches the turn as
+        `sources=[Episode]` in the same transaction as the claim, which that client takes
+        (`remember(..., sources=...)` in `memvara/remote/api.py`) and `lib.hosted` cannot
+        until the server renders episode ids. Routing the writer to `lib.hosted` as well
+        stored every captured fact unlinked while `capture.log` went on reporting
+        `stored=N` -- no exception, no banner, and `memory_why` answering nothing about
+        any of them a session later.
+        """
+        built = object()
+        with self._library("cloud", built), self._env(MEMVARA_MODE="cloud"):
+            self.assertIs(
+                self._opener().open_store(recalls=False), built,
+                "a write-only caller must keep the library handle, sources= and all")
+
+    def test_the_writer_route_reports_itself_as_local(self) -> None:
+        """`open_writer`'s second slot is what `capture.py` derives `hosted` from.
+
+        `store_facts(hosted=...)` picks the `sources=` branch off it, so a `close` that
+        is not None here is the same outage as the wrong handle, reached one step later.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import write as write_mod
+        finally:
+            sys.path.pop(0)
+        built = object()
+        with self._library("cloud", built), self._env(MEMVARA_MODE="cloud"):
+            store, close = write_mod.open_writer(recalls=False)
+        self.assertIs(store, built)
+        self.assertIsNone(close, "capture.py reads `hosted = close is not None`, and a "
+                                 "library handle is not hosted")
+
+    def test_capture_asks_for_the_writer_route(self) -> None:
+        """The default is the dangerous direction, so the one caller that needs the other
+        one is pinned here.
+
+        `recalls` defaults to True because every other caller reads, which means a writer
+        that simply forgets the argument is demoted in silence -- the exact failure this
+        parameter was added to end, reintroduced by omission. Asserted against `capture.py`
+        itself rather than a list of callers kept somewhere else: a list is a thing that
+        stops covering a file without anyone noticing.
+        """
+        source = (HOOKS / "capture.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "open_writer(recalls=False)", source,
+            "capture.py must ask for the write-capable handle: without it every fact it "
+            "stores loses the turn it came from, and nothing says so")
+
+
 class SpeakerBlocks(unittest.TestCase):
     """Who said which line, when a message spans several of them."""
 

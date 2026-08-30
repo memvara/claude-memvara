@@ -44,14 +44,21 @@ def log(line: str) -> None:
         pass
 
 
-def open_writer() -> "tuple[Any, Any] | tuple[None, None]":
+def open_writer(*, recalls: bool = True) -> "tuple[Any, Any] | tuple[None, None]":
     """`(store, close)` for whichever backend answers, or `(None, None)`.
 
-    `close` is None for a local store, which has no connection to give back, and the
+    `close` is None for a library handle, which has no connection to give back, and the
     hosted client's `close` otherwise. Callers close after their last write and not
     before: the hosted client connects lazily, so an early return costs nothing.
+
+    `recalls` is passed straight through to `open_store`, and the default is the careful
+    one. Leave it alone unless this handle is *only* written to: `capture.py` is the one
+    caller that qualifies, and the one that needs `sources=`. Everything else here reads
+    -- `session_start` and `recall`'s standing refresh both call `recall()` on what they
+    get back, and handing either a `RemoteMemvara` is the outage this parameter exists
+    downstream of.
     """
-    store = open_store()
+    store = open_store(recalls=recalls)
     if store is not None:
         return store, None
 

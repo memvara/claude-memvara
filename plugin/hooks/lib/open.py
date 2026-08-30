@@ -44,13 +44,22 @@ def _import_memvara(env: Mapping[str, str]) -> Any:
     return memvara
 
 
-def open_store() -> Any | None:
+def open_store(*, recalls: bool = True) -> Any | None:
     """The `Memvara` a hook should read, or `None` to do nothing at all.
 
     `None` is a normal outcome, not an error: no store is configured, the library is not
     installed, the embedder does not match, the credentials expired, or the deployment is
     hosted and belongs to `lib.hosted` instead. Every one of those means this prompt gets
     no memory block *from here*, and the last one means it gets a better one elsewhere.
+
+    `recalls` is what the caller intends to *do* with the handle, and it exists because the
+    answer differs. A caller that will call `recall()` needs `header=` and `budget=`, which
+    the library's hosted client does not serve; a caller that will only write needs
+    `sources=`, which it serves and `lib.hosted` does not. Collapsing the two costs one of
+    them, and the first attempt at this fix collapsed them silently in the writer's
+    direction -- every captured fact stored unlinked, with `capture.log` still reporting
+    `stored=N`. Asked as a question rather than sniffed off the object, for the reason
+    `store_facts` gives at length about `hosted`: what the caller means cannot rot.
     """
     env = dict(os.environ)
     # The client's block loses to a real environment variable. Someone who exports
@@ -66,19 +75,37 @@ def open_store() -> Any | None:
         else:
             return None
 
+    if recalls and env.get("MEMVARA_MODE") == "cloud":
+        # The same refusal as below, reached before paying for it. `import memvara` is
+        # ~95ms and this function runs whenever the daemon is not warm -- the first prompt
+        # of every session, and every prompt after a daemon dies -- so importing the whole
+        # library to then discard it is the one cost here worth avoiding.
+        #
+        # Deliberately the raw string, matching the check above that may have just set it,
+        # rather than a second copy of the library's normalisation. An unnormalised value
+        # like `Cloud` misses this and is caught by the normalised check below, so this can
+        # only ever be an early exit for a case that was already decided, never a decision
+        # of its own.
+        return None
+
     try:
         _import_memvara(env)
         from memvara.server.config import ServerConfig, build_memvara
 
         config = ServerConfig.from_env(env)
-        if config.mode != "local":
-            # Not a local engine, so not ours to hand a hook. `build_memvara` has returned
-            # a `RemoteMemvara` for a cloud config since memvara/memvara@2a3bb48, and a
-            # hook cannot use one: its `recall()` takes no `header=` at all and *refuses*
-            # a `budget=` rather than dropping it -- deliberately, because it cannot
-            # re-derive the local truncation from a server-rendered string. `lib.hosted`
-            # is this repo's client for exactly that deployment and does both, so
-            # answering None is how a caller is sent somewhere that can serve the call.
+        if recalls and config.mode != "local":
+            # Not a local engine, and this caller is going to call `recall()` on it.
+            # `build_memvara` has returned a `RemoteMemvara` for a cloud config since
+            # memvara/memvara@2a3bb48, and a recalling hook cannot use one: its `recall()`
+            # takes no `header=` at all and *refuses* a `budget=` rather than dropping it
+            # -- deliberately, because it cannot re-derive the local truncation from a
+            # server-rendered string. `lib.hosted` is this repo's client for exactly that
+            # deployment and does both, so answering None is how a caller is sent
+            # somewhere that can serve the call.
+            #
+            # Only recalling callers. A writer wants the opposite handle: `RemoteMemvara`
+            # takes the `sources=` that carries a claim back to the turn it came from, and
+            # `lib.hosted` cannot until the server renders episode ids.
             #
             # This is not a new rule; it is the one every docstring here already states
             # ("open_store() answers None on a hosted install"). It stopped being true by
