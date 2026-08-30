@@ -34,8 +34,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from core.envelope import read_event, write  # noqa: E402
+from core.host import Reply, active  # noqa: E402
 from lib.ipc import (  # noqa: E402
-    due_capture_alert, emit_json, payload, plural, status, under_extraction, with_alert,
+    due_capture_alert, payload, plural, status, under_extraction, with_alert,
 )
 from lib.standing import standing_block  # noqa: E402
 from lib.write import open_writer  # noqa: E402
@@ -171,20 +173,21 @@ def main() -> int:
     # reason `recall.py` does it this way: a call site that forgot to wrap would print a
     # valid banner and fail nothing.
     alert = due_capture_alert()
+    host = active()
 
-    def _emit(reply: dict) -> None:
-        if "systemMessage" in reply:
-            reply = {**reply, "systemMessage": with_alert(reply["systemMessage"], alert)}
-        emit_json(reply)
+    def _emit(reply: Reply) -> None:
+        if reply.status:
+            reply = reply._replace(status=with_alert(reply.status, alert))
+        write(host, reply)
 
     # Read before opening the store: the standing block is filtered to this user and this
     # checkout, and `cwd` is how the second half is known. An unreadable payload gives "",
     # which `_mine` treats as "user notes only" -- the safe direction, since the failure it
     # avoids is carrying another project's instructions into this one.
-    cwd = str(payload().get("cwd") or "")
+    cwd = read_event(host, "session_start", payload()).cwd
     store, close = open_writer()
     if store is None:
-        _emit({"systemMessage": status("not configured")})
+        _emit(Reply("session_start", status=status("not configured")))
         return 0
 
     # `open_writer` is named for its first caller, but what it does is resolve whichever
@@ -237,20 +240,16 @@ def main() -> int:
         # every section came back empty rather than unavailable -- otherwise a store that
         # is merely unreachable is reported as one that is empty, and nobody investigates
         # an empty store.
-        _emit({"systemMessage": status(missing or "nothing stored yet")})
+        _emit(Reply("session_start", status=status(missing or "nothing stored yet")))
         return 0
 
     count = sum(1 for line in "\n\n".join(parts).splitlines() if line.startswith("- "))
     opened = (f"session opened with {plural(count)}" if count else "session opened")
     # A count is a claim about what arrived. Saying it while a section is missing is the
     # failure this hook had; naming what is absent is the whole fix.
-    _emit({
-        "systemMessage": status(f"{opened} · {missing}" if missing else opened),
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": "\n\n".join(parts),
-        },
-    })
+    _emit(Reply("session_start",
+                status=status(f"{opened} · {missing}" if missing else opened),
+                context="\n\n".join(parts)))
     return 0
 
 

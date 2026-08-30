@@ -27,6 +27,11 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "plugin"
 HOOKS = PLUGIN / "hooks"
+#: Payloads captured off a real client, byte for byte apart from a redacted home
+#: directory. The point of keeping them is that they are not ours to write: a fixture
+#: composed from what we believe a host's schema to be agrees with our own host record
+#: forever, and goes on agreeing on the day the client renames a key.
+EVIDENCE = ROOT / "test" / "evidence"
 HOSTED = "https://app.memvara.dev/mcp"
 REPO_NAME = "memvara/claude-memvara"
 
@@ -47,6 +52,12 @@ ALLOWED_PLUGIN_FILES = {
     pathlib.Path(".claude-plugin") / "plugin.json",
     pathlib.Path(".mcp.json"),
     pathlib.Path("hooks") / "hooks.json",
+    pathlib.Path("hooks") / "run.py",
+    pathlib.Path("hooks") / "core" / "__init__.py",
+    pathlib.Path("hooks") / "core" / "host.py",
+    pathlib.Path("hooks") / "core" / "envelope.py",
+    pathlib.Path("hooks") / "hosts" / "__init__.py",
+    pathlib.Path("hooks") / "hosts" / "claude.py",
     pathlib.Path("hooks") / "recall.py",
     pathlib.Path("hooks") / "session_start.py",
     pathlib.Path("hooks") / "capture.py",
@@ -513,6 +524,37 @@ class Hooks(unittest.TestCase):
             self.assertIsNotNone(match, command)
             assert match is not None
             self.assertTrue((PLUGIN / match.group(1)).is_file(), command)
+
+    def test_the_event_payload_this_host_actually_sends_is_the_one_the_hook_reads(
+            self) -> None:
+        """Compares the hook against a payload captured FROM the host, not against our
+        assumption about the host. A renamed stdin key is silent: the dedup file is keyed
+        on session, so a miss re-injects every memory every turn while looking healthy.
+
+        The fixture was taken off a real `claude -p` run through a settings-declared
+        `UserPromptSubmit` hook that did nothing but `cat` its stdin to a file. Only the
+        home directory in the two absolute paths is rewritten; every key name, and the
+        shape around it, is what the client sent. That provenance is the whole point --
+        a fixture written from what we believe the schema to be would agree with
+        `hosts/claude.py` forever, including on the day the client renames a key.
+        """
+        raw = (EVIDENCE / "claude" / "UserPromptSubmit.stdin.json").read_bytes()
+        envelope, claude = self._adapter()
+        event = envelope.read_event(claude.HOST, "recall", raw)
+        self.assertTrue(event.prompt, "the prompt did not survive the envelope")
+        self.assertTrue(event.session, "the session id did not survive the envelope")
+        self.assertTrue(event.cwd, "the cwd did not survive the envelope")
+
+    def _adapter(self):
+        """`core.envelope` and `hosts.claude`, imported the way a hook imports them."""
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return (importlib.import_module("core.envelope"),
+                    importlib.import_module("hosts.claude"))
+        finally:
+            sys.path.pop(0)
 
     def test_covers_the_events_that_make_memory_automatic(self) -> None:
         body = _json(HOOKS / "hooks.json")
@@ -2591,7 +2633,8 @@ class Daemon(unittest.TestCase):
         `open.py` may use it freely -- it is only reached on the fallback path, where the
         cost is already lost in a 148ms in-process query.
         """
-        for name in ("lib/ipc.py", "lib/fast.py", "recall.py", "lib/hosted.py"):
+        for name in ("lib/ipc.py", "lib/fast.py", "recall.py", "lib/hosted.py",
+                     "run.py", "core/host.py", "core/envelope.py", "hosts/claude.py"):
             source = (HOOKS / name).read_text(encoding="utf-8")
             self.assertNotIn("from pathlib import", source, name)
 

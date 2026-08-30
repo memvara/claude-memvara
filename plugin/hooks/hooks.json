@@ -1,12 +1,12 @@
 {
-  "description": "Memvara: recall on every prompt, capture when a turn ends. Capture runs async so a 12-14s extraction never holds the turn open; async hook output is discarded by the client, so its record is ~/.memvara/.hooks/capture.log rather than a systemMessage.",
+  "description": "Memvara: recall on every prompt, capture when a turn ends. Every command goes through run.py, which binds the host record in hosts/claude.py before dispatching -- the client's field names, reply keys and event names are data there rather than literals in the hook bodies. Capture runs async so a 12-14s extraction never holds the turn open; async hook output is discarded by the client, so its record is ~/.memvara/.hooks/capture.log rather than a systemMessage.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py\"",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/run.py\" session_start --host claude",
             "timeout": 20
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/recall.py\"",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/run.py\" recall --host claude",
             "timeout": 10
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/capture.py\"",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/run.py\" capture --host claude",
             "async": true,
             "timeout": 120
           }
@@ -41,7 +41,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/approve.py\"",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/run.py\" approve --host claude",
             "timeout": 5
           }
         ]

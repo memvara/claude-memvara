@@ -51,11 +51,18 @@ import sys
 # prompt. The bootstrap is one string join.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from core.envelope import read_event, write  # noqa: E402
+from core.host import Reply, active  # noqa: E402
 from lib.fast import recall as fast_recall  # noqa: E402
 from lib.ipc import (  # noqa: E402
-    due_alert_for_model, due_capture_alert, emit_json, log_line, payload, plural, status,
+    due_alert_for_model, due_capture_alert, log_line, payload, plural, status,
     under_extraction, with_alert,
 )
+
+#: The client this process is answering, resolved once. `run.py` binds it before importing
+#: this module; a bare `python3 recall.py` gets Claude Code, which is what that invocation
+#: has always meant.
+HOST = active()
 
 #: Enough memories to be useful, few enough to stay out of the way. Recall drops whole
 #: notes weakest-first to fit, so this is a ceiling and not a target.
@@ -211,7 +218,11 @@ SKIP_PREFIXES = ("/", "!", "#")
 #: someone editing this needs. Above: the user typed a command and is not waiting on
 #: memory. Here: there is no user, and the cost is a retrieval query against an allowance
 #: that is not per-session.
-MACHINE_PREFIXES = ("<task-notification", "<cross-session-message")
+#:
+#: The tags themselves belong to the client, so they live in its `Host` record and this
+#: name is what the body reads them by. `SKIP_PREFIXES` above is still spelled here, and
+#: it is host-specific too -- the record has no field for it yet.
+MACHINE_PREFIXES = HOST.machine_prompt_prefixes
 
 #: Where the per-session record of what has already been injected lives. Beside the store,
 #: not in the plugin, which is replaced wholesale on update.
@@ -636,9 +647,13 @@ def main() -> int:
         log_line("recall", "skipped=under extraction")
         return 0
 
-    data = payload()
-    prompt = str(data.get("prompt") or "").strip()
-    session = str(data.get("session_id") or "")
+    # `payload()` is the raw stdin object and is the same everywhere; `read_event` is what
+    # knows which keys this client puts a prompt and a session id under. Splitting them
+    # matters because the miss is silent: the dedup file is keyed on session, so a renamed
+    # key re-injects every memory on every turn while every banner still reads healthy.
+    event = read_event(HOST, "recall", payload())
+    prompt = event.prompt.strip()
+    session = event.session
 
     if not prompt or prompt.startswith(SKIP_PREFIXES):
         return 0
@@ -650,20 +665,20 @@ def main() -> int:
         return 0
 
     # Read once, then every reply from here on goes through `_emit` rather than
-    # `emit_json` threaded by hand through each call site -- a first version wrapped five
+    # `write` threaded by hand through each call site -- a first version wrapped five
     # separate sites individually, and only one of the five was ever covered by a test; a
     # sixth site added later without the wrap would have printed a perfectly valid banner
-    # and failed nothing. `_emit` means every `systemMessage` below picks this up whether
+    # and failed nothing. `_emit` means every status line below picks this up whether
     # or not whoever writes the next branch remembers this file relays a capture failure
-    # at all -- named differently from `emit_json` on purpose: shadowing the imported name
+    # at all -- named differently from `write` on purpose: shadowing the imported name
     # with a same-named local function makes every reference to it inside this function
     # local from the top, including the one capturing the original, which raises
     # `UnboundLocalError` before it ever runs.
     alert = due_capture_alert()
 
-    def _emit(reply: dict) -> None:
-        if "systemMessage" in reply:
-            reply = {**reply, "systemMessage": with_alert(reply["systemMessage"], alert)}
+    def _emit(reply: Reply) -> None:
+        if reply.status:
+            reply = reply._replace(status=with_alert(reply.status, alert))
         # Called here, at the point delivery is actually about to happen, rather than once
         # at the top of `main()` -- `due_alert_for_model` persists "the model has now been
         # told" as a side effect of deciding what to say, and everything between the top of
@@ -673,25 +688,21 @@ def main() -> int:
         # earlier, would mark a notice "told" that never actually reached the model -- worse
         # than the repetition this function exists to prevent, because nothing would ever
         # correct it short of the reason changing. Calling it from inside `_emit`, one line
-        # before `emit_json` actually runs, leaves nothing but dict merges in between.
+        # before `write` actually runs, leaves nothing but field merges in between.
         alert_notice = due_alert_for_model()
         if alert_notice:
-            # Merged onto whatever `additionalContext` this branch already carries (recalled
-            # memories, standing preferences) rather than replacing it -- a capture failure
-            # and a successful recall are unrelated events that can both be true on the same
+            # Merged onto whatever context this branch already carries (recalled memories,
+            # standing preferences) rather than replacing it -- a capture failure and a
+            # successful recall are unrelated events that can both be true on the same
             # prompt, and either one arriving first should not cost the other its context.
-            hook_out = dict(reply.get("hookSpecificOutput") or {})
-            existing_ctx = hook_out.get("additionalContext") or ""
-            hook_out.setdefault("hookEventName", "UserPromptSubmit")
-            hook_out["additionalContext"] = (
-                f"{existing_ctx}\n\n{alert_notice}" if existing_ctx else alert_notice)
-            reply = {**reply, "hookSpecificOutput": hook_out}
-        emit_json(reply)
+            reply = reply._replace(context=(
+                f"{reply.context}\n\n{alert_notice}" if reply.context else alert_notice))
+        write(HOST, reply)
 
     seen, carried = _read_state(session)
     if time.monotonic() - start < OVERALL_BUDGET_SEC:
         standing, standing_state = _standing_refresh(
-            session, time.time(), str(data.get("cwd") or ""))
+            session, time.time(), event.cwd)
     else:
         # `("", None)` is exactly what `_standing_refresh` itself returns for "nothing to
         # do" -- see its own interval check -- so skipping the call is indistinguishable
@@ -719,7 +730,7 @@ def main() -> int:
         # indistinguishable from a hook that has stopped working -- which is the failure
         # this file exists to stop repeating -- but reported as what it is rather than as a
         # breakage someone would go looking for.
-        _emit({"systemMessage": status("not configured")})
+        _emit(Reply("recall", status=status("not configured")))
         return 0
     if not ok:
         # Four outcomes had four messages and a fifth was wearing the wrong one. A store
@@ -729,10 +740,10 @@ def main() -> int:
         # whole file is built on.
         detail = _quota_line(why)
         log_line("recall", f"failed reason={why or 'unknown'}")
-        _emit({"systemMessage": status(detail or "recall failed")})
+        _emit(Reply("recall", status=status(detail or "recall failed")))
         return 0
 
-    here = str(data.get("cwd") or "")
+    here = event.cwd
     header, bullets = _split(block)
     bullets = [line for line in bullets if _belongs_here(line, here)]
     known = set(seen)
@@ -783,15 +794,10 @@ def main() -> int:
             # Nothing new to recall, and the standing set has moved: the turn still has to
             # carry it, or a rule written mid-session waits for the next prompt that
             # happens to match something.
-            _emit({
-                "systemMessage": status("standing preferences updated"),
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": standing,
-                },
-            })
+            _emit(Reply("recall", status=status("standing preferences updated"),
+                        context=standing))
             return 0
-        _emit({"systemMessage": note})
+        _emit(Reply("recall", status=note))
         return 0
 
     _write_state(session, seen + [_digest(line) for line in fresh], topic, standing_state)
@@ -814,13 +820,7 @@ def main() -> int:
     log_line("recall", f"recalled={len(fresh)} repeats={repeats} injected={len(block_text)}c "
         f"clipped={sum(1 for s_, f_ in zip(clipped, fresh) if s_ != f_)}")
     _sample(prompt, fresh, anaphoric=anaphoric and bool(carried))
-    _emit({
-        "systemMessage": label,
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": block_text,
-        },
-    })
+    _emit(Reply("recall", status=label, context=block_text))
     return 0
 
 

@@ -38,6 +38,15 @@ Four hooks, so memory happens without being asked for:
 | `Stop` | Keeps the turn that just ended, and mines it for facts |
 | `PreToolUse` | Auto-allows read-only `memory_*` tools; writes still ask |
 
+All four are the same command, `hooks/run.py <hook> --host claude`. What
+this client calls each event, which stdin key carries the prompt, and
+which reply field the terminal actually renders are data in
+`hooks/hosts/claude.py` rather than literals in the four hook bodies —
+so the same bodies can be vendored for another editor by adding one
+record beside it. A run that cannot dispatch at all — an unknown host, a
+hook that client has no event for — exits 0 like every other failure here
+and writes the reason to `~/.memvara/.hooks/hooks.log`.
+
 The hooks try three routes and return the same text from each; only the
 latency differs. A resident daemon answers in ~38 ms. Without one, a
 local install queries in-process in ~148 ms. A hosted install with no

@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping
 
-from .ipc import emit, payload, server_env  # noqa: F401  (re-exported; they live
+from .ipc import emit, server_env  # noqa: F401  (re-exported; they live
 # in ipc so the fast path can use them without importing pathlib)
 
 #: Written by `memvara-mcp login`, read when there is no local store to open.

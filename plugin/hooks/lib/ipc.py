@@ -42,7 +42,8 @@ RUNTIME_DIR = os.path.join(_HOME, ".memvara", ".hooks", "run")
 
 #: Files whose contents decide what a daemon actually does. A change to any of them must
 #: strand the old daemon rather than let it keep serving.
-CODE_FILES = ("daemon.py", "lib/ipc.py", "lib/open.py", "recall.py")
+CODE_FILES = ("daemon.py", "lib/ipc.py", "lib/open.py", "recall.py",
+              "run.py", "core/host.py", "core/envelope.py", "hosts/claude.py")
 
 #: Set in the environment of the `claude -p` child that `capture.py` spawns to mine a turn.
 #: A hook that finds it is running underneath an extraction rather than in front of a
@@ -415,11 +416,26 @@ def socket_path(store_key: str, root: "str | None" = None) -> str:
     return os.path.join(runtime_dir(), f"recall-{digest}.sock")
 
 
+def _host_record():
+    """The bound client, imported lazily so `core.host` is not a hard dependency here.
+
+    `lib.ipc` is the module every hook already imports and the one the daemon imports
+    first; a top-level import of `core.host` would make the import graph a cycle the day
+    anything under `core/` wants an address from here.
+    """
+    from core.host import active
+
+    return active()
+
+
 #: Where MCP clients keep the server block we mine for configuration. Checked in order;
 #: the first one that names a `memvara` server wins.
-_CLIENT_CONFIGS = (
-    os.path.join(_HOME, ".claude.json"),
-    os.path.join(_HOME, ".claude", "settings.json"),
+#:
+#: The paths belong to the client, so they come from its `Host` record. Resolved at import
+#: like the rest of this module's addresses, and against `~` rather than `_HOME` because
+#: the record states them the way a person would write them down.
+_CLIENT_CONFIGS = tuple(
+    os.path.expanduser(path) for path in _host_record().client_configs
 )
 
 
