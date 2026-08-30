@@ -31,6 +31,35 @@ LOG = Path.home() / ".memvara" / ".hooks" / "capture.log"
 #: its own maintenance is worse than no log.
 LOG_MAX_BYTES = 64 * 1024
 
+#: The role every episode this plugin stores goes in under, and the point is that it is
+#: not "user".
+#:
+#: What the hooks store is a transcript excerpt -- a synthetic header, `User:` lines,
+#: `Claude used` lines, and whatever the person pasted in along the way. `role="user"`
+#: says every word of that is the person's own, and the core's deterministic fast path
+#: believes it: the rules bind "I" and "my" to the user and match with `search`, so they
+#: fire on any clause anywhere in the text, quoted or not. `_clauses` even strips the
+#: surrounding quotation marks, so the one signal that a sentence was being cited rather
+#: than said is removed before matching.
+#:
+#: On 2026-08-26 somebody pasted a log quoting the core's own documentation of that fast
+#: path, which names its sentence forms by example -- "my name is X", "I live in X", "I
+#: work at X". Four claims landed at confidence 0.95, and `user name X` superseded a real
+#: name stored since 2026-08-18. Nothing raised. A fast-path write is an ordinary
+#: successful write, and no hook here asked for it.
+#:
+#: Filtering the text instead was considered and is worse. Nothing here can separate prose
+#: somebody typed from prose they pasted -- what did this was ordinary English paragraphs,
+#: no code fence and no indent to key on -- so a heuristic would hold until the next shape
+#: and then fail the same silent way. `FastExtractor` already declines any role but
+#: "user", so saying what the text actually is fixes it exactly and needs no guessing.
+#:
+#: It must be one of "user", "assistant" or "system": `memory_add` validates `role`
+#: against a closed enum and a rejection loses the whole episode rather than one field.
+#: "system" is the honest member of the three -- this text is machine-composed and is
+#: nobody's utterance.
+EPISODE_ROLE = "system"
+
 
 def log(line: str) -> None:
     """Append one line, or give up quietly. Never raises into a hook."""
@@ -181,12 +210,22 @@ def _episode(turn: str) -> Any:
     Deliberately not pre-stored: passing the object rather than its id is what makes the
     claim and its source one transaction, so a crash between them cannot leave a claim
     citing a turn that does not exist.
+
+    `EPISODE_ROLE` for the same reason `_keep_turn` uses it, and one reason more. Writing
+    it is safe today either way -- `remember()` asserts a claim and stores what it cites
+    without running extraction, which was measured rather than assumed. But the copy it
+    leaves behind is permanent and is labelled with whoever said it, and `reextract()`
+    runs the fast path over any stored episode that no claim cites. Erase a claim this
+    hook wrote (`erase()` leaves its sources by default) and its turn has no citations
+    left, the salience gate passes it as a user turn, and the next sweep re-derives
+    exactly the claims this constant exists to stop. One word closes that rather than
+    resting on an argument about another repository's call graph.
     """
     if not turn.strip():
         return None
     try:
         from memvara.types import Episode
 
-        return Episode(content=turn, role="user")
+        return Episode(content=turn, role=EPISODE_ROLE)
     except Exception:
         return None

@@ -3697,6 +3697,25 @@ class PastedText(unittest.TestCase):
     def test_and_none_at_all_from_the_role_the_hook_now_uses(self) -> None:
         self.assertEqual(self._extractor()(self._capture().EPISODE_ROLE), [])
 
+    def test_the_copy_a_fact_cites_carries_the_same_role(self) -> None:
+        """`lib.write._episode` builds a second copy of the same turn, for the local route
+        to hand to `remember()` as its source. `remember()` runs no extraction, so that
+        copy was safe on the day it was written -- but it is permanent, and `reextract()`
+        runs the fast path over any stored episode that no claim cites. Erase a claim this
+        hook wrote and its turn has no citations left, the gate passes it as a user turn,
+        and the next sweep re-derives what this whole change removed.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import write
+        finally:
+            sys.path.pop(0)
+        episode = write._episode(self.PASTED)
+        if episode is None:
+            self.skipTest("the memvara library is not installed in this environment")
+        self.assertEqual(episode.role, write.EPISODE_ROLE)
+        self.assertEqual(episode.content, self.PASTED, "and the turn itself is unchanged")
+
     def _extractor(self):
         try:
             from memvara.schema import PredicateRegistry
