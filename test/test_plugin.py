@@ -301,44 +301,51 @@ class SkillTree(unittest.TestCase):
             self.assertEqual(got, expected, f"{rel} drifted from {sha}")
 
 
-    def test_only_the_release_gate_may_switch_freshness_off(self) -> None:
-        """The escape hatch, pinned to its one caller and its one direction.
+    def test_freshness_is_dropped_on_tags_and_nowhere_else(self) -> None:
+        """The one check that may be skipped, and the exact condition that skips it.
 
-        `MEMVARA_SKIP_FRESHNESS` turns off the only check in this suite that can fail on
-        a commit that was perfectly good when it was written. That makes it exactly the
-        kind of flag that spreads: a red run, a plausible reason, and one more workflow
-        quietly opting out until the vendored skill is frozen again and nothing says so.
+        `MEMVARA_SKIP_FRESHNESS` turns off the only check here that can fail on a commit
+        that was perfectly good when written, so it is the flag most likely to spread: a
+        red run, a plausible reason, one more caller opting out, and the vendored skill
+        is frozen again with nothing saying so.
 
-        So both halves are asserted, and the second is the one that matters. The default
-        must be ON -- a `default: false` would disable freshness for every caller while
-        every one of these strings still appeared in the file -- and `release.yml` must
-        be the ONLY workflow that passes it off. A new workflow copying that line fails
-        here rather than silently joining the exemption.
+        This asserts the *condition*, not merely that some condition exists, because the
+        first version of this change got the condition wrong in the safe-looking
+        direction and no test noticed. It threaded a `workflow_call` input and set the
+        variable from `inputs.check_skill_freshness == false`. Outside `workflow_call`
+        `inputs` is null, GitHub coerces `null == false` to TRUE, and freshness silently
+        stopped running on pull requests and pushes as well. The suite was green, the run
+        said `OK (skipped=1)`, and the YAML-shaped guard that stood here passed happily --
+        it read the file's words and never the semantics.
+
+        Hence a literal `refs/tags/`: a form with no coercion in it, and one this test can
+        actually pin. The runtime half is not assertable from here at all -- only a CI run
+        can show which paths really skipped -- so the log is the other half of this guard.
         """
         workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
         self.assertTrue(workflows, "no workflows found — this guard would pass on an "
                                    "empty directory, which is the shape it exists to stop")
 
-        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        self.assertIn("check_skill_freshness:", ci,
-                      "ci.yml must declare the input the release gate passes")
-        self.assertIn("default: true", ci,
-                      "the default must be ON: a default of false disables freshness "
-                      "everywhere while leaving every mention of it in place")
-
-        opted_out = {path.name for path in workflows
-                     if "check_skill_freshness: false" in path.read_text(encoding="utf-8")}
-        self.assertEqual(
-            opted_out, {"release.yml"},
-            "release.yml is the only workflow allowed to switch freshness off — it is "
-            "the only one that re-runs the suite at a commit that is not current")
-
         setters = {path.name for path in workflows
                    if "MEMVARA_SKIP_FRESHNESS" in path.read_text(encoding="utf-8")}
         self.assertEqual(
             setters, {"ci.yml"},
-            "only ci.yml may set MEMVARA_SKIP_FRESHNESS, and only from that input — a "
-            "workflow exporting it directly bypasses the input and this guard with it")
+            "only ci.yml may set MEMVARA_SKIP_FRESHNESS — a second workflow setting it "
+            "is a second place freshness can be switched off from")
+
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            "MEMVARA_SKIP_FRESHNESS: ${{ startsWith(github.ref, 'refs/tags/') }}", ci,
+            "freshness must be dropped on tag refs and by nothing else. Any other "
+            "expression here — an input, a matrix value, a repository variable — is one "
+            "whose falsy behaviour has to be reasoned about, and that reasoning is what "
+            "was wrong last time")
+
+        self.assertNotIn(
+            "check_skill_freshness", ci + "".join(
+                path.read_text(encoding="utf-8") for path in workflows),
+            "the input form is gone deliberately: `inputs` is null outside workflow_call "
+            "and `null == false` coerces to true, so it disabled the check everywhere")
 
     def test_the_vendored_skill_is_not_behind_the_library(self) -> None:
         """The whole tree, against the library's CURRENT default branch.

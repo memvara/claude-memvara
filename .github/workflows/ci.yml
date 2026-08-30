@@ -7,18 +7,6 @@ on:
     branches: [main]
   workflow_dispatch:
   workflow_call:
-    inputs:
-      check_skill_freshness:
-        description: >
-          Whether to check the vendored skill against the library's CURRENT default
-          branch. True everywhere except the release gate. Freshness is a fact about
-          the world right now, not about the commit under test, so re-running the
-          suite at a frozen commit asks a question that commit cannot answer -- and
-          once the library's skill moves, every past tag's run fails forever. Turning
-          it off for tags keeps release runs reproducible; PRs, pushes to main and the
-          nightly skill-sync all still ask.
-        type: boolean
-        default: true
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -63,7 +51,19 @@ jobs:
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
           MEMVARA_LIBRARY: ${{ github.workspace }}/_library
-          # Only ever "true" when a caller passed the input as false. `inputs` is empty
-          # for pull_request and push, so those resolve to "false" and keep checking.
-          MEMVARA_SKIP_FRESHNESS: ${{ inputs.check_skill_freshness == false }}
+          # Skip the freshness check on a tag, and only on a tag. Freshness compares the
+          # vendored skill against the library's CURRENT default branch, so it is a fact
+          # about the world now rather than about the commit under test: a tag passes the
+          # day it is cut and the same tag re-run after the library's skill moves fails,
+          # having changed nothing. v0.2.5 could never go green at all, and its release
+          # job therefore never built its plugin.zip.
+          #
+          # Read off `github.ref`, which a reusable workflow inherits from the caller, so
+          # a tag build is recognised without release.yml having to say anything. The
+          # first attempt threaded a `workflow_call` input instead and was wrong in the
+          # dangerous direction: `inputs` is null outside workflow_call, GitHub coerces
+          # `null == false` to TRUE, and the check silently stopped running on pull
+          # requests and pushes too. CI went green and the log said `OK (skipped=1)`.
+          # This form has no such subtlety -- refs/tags/ or not.
+          MEMVARA_SKIP_FRESHNESS: ${{ startsWith(github.ref, 'refs/tags/') }}
         run: python3 -m unittest discover -s test -v
