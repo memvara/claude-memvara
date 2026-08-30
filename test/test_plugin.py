@@ -2537,6 +2537,75 @@ class Daemon(unittest.TestCase):
 class Hosted(unittest.TestCase):
     """The stdlib-only path, so a hosted install needs no pip install."""
 
+    #: Cleared for every test in this class, because `credentials()` now reads them and
+    #: most tests here are about the *file*. A developer who exports a real key would
+    #: otherwise have `_fake_credentials` silently overridden -- the file-based tests
+    #: passing or failing on their shell rather than on the code, and the two-different-
+    #: keys test comparing one env key against itself.
+    _ENV = ("MEMVARA_API_KEY", "MEMVARA_SERVER_URL")
+
+    def setUp(self) -> None:
+        self._saved_env = {k: os.environ.pop(k, None) for k in self._ENV}
+
+    def tearDown(self) -> None:
+        for key, was in self._saved_env.items():
+            if was is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = was
+
+    def test_the_environment_logs_a_machine_in_with_no_file(self) -> None:
+        """`MEMVARA_API_KEY` is a supported way to configure this, and was not read here.
+
+        The library resolves it (`memvara/remote/creds.py`), so while its client was the
+        write path on a hosted install, a machine configured this way wrote fine and only
+        recall was dead. Collapsing to one client made this the only place that can read
+        it, and until it did, such a machine was "not logged in" to every hook: no memory
+        block, and `capture.py` logging `failed=no store or login` on every turn.
+        """
+        hosted = self._hosted()
+        original = hosted.CREDENTIALS
+        hosted.CREDENTIALS = os.path.join(
+            tempfile.mkdtemp(prefix="memvara-test-nocreds-"), "absent.json")
+        os.environ["MEMVARA_API_KEY"] = "key-from-env"
+        try:
+            creds = hosted.credentials()
+        finally:
+            hosted.CREDENTIALS = original
+        self.assertIsNotNone(creds, "an exported key is a logged-in machine")
+        self.assertEqual(creds["api_key"], "key-from-env")
+        self.assertEqual(creds["server_url"], hosted.DEFAULT_BASE,
+                         "no URL anywhere means the default, not None")
+
+    def test_the_environment_wins_over_the_file_as_it_does_in_the_library(self) -> None:
+        """Order copied from `memvara/remote/creds.py`, not chosen here.
+
+        A machine that sets both must not reach a different store depending on which
+        client happened to read it, and that is the whole reason to copy rather than pick.
+        """
+        hosted = self._hosted()
+        directory, original = self._fake_credentials(hosted, api_key="key-from-file")
+        os.environ["MEMVARA_API_KEY"] = "key-from-env"
+        try:
+            self.assertEqual(hosted.credentials()["api_key"], "key-from-env")
+        finally:
+            hosted.CREDENTIALS = original
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_the_file_alone_still_logs_a_machine_in(self) -> None:
+        """The positive half. A change that made `credentials()` read only the environment
+        would satisfy both tests above and break every machine that ran `memvara-mcp
+        login`, which is nearly all of them."""
+        hosted = self._hosted()
+        directory, original = self._fake_credentials(hosted, api_key="key-from-file")
+        try:
+            creds = hosted.credentials()
+        finally:
+            hosted.CREDENTIALS = original
+            shutil.rmtree(directory, ignore_errors=True)
+        self.assertEqual(creds["api_key"], "key-from-file")
+        self.assertEqual(creds["server_url"], "https://example.test")
+
     def _hosted(self):
         sys.path.insert(0, str(HOOKS))
         try:

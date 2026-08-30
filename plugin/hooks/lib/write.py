@@ -118,8 +118,12 @@ def store_facts(store: Any, facts: Iterable[Any], turn: str = "",
     hosted `memory_remember` too, so both routes link a fact to the turn it came from —
     the local one by passing a real `Episode`, the hosted one by citing the ids the receipt
     rendered. The schema is still closed, so an argument an older server has not heard of
-    is a hard rejection rather than a silent ignore, which is why the hosted branch asks
-    `accepts` first. `memory_type` both routes take.
+    is a hard rejection rather than a silent ignore -- but the probe that protects against
+    that lives in the client, `HostedRecall.remember`, not in the branch below, which
+    passes `sources` on unconditionally. Said precisely because the imprecise version
+    invites the obvious next move: handing this function some other hosted store with no
+    such gate, and losing the whole write instead of one field. `memory_type` both routes
+    take.
 
     `extractor` now goes over both, and the hosted client asks the server whether it takes
     the argument rather than assuming it does, because a server older than the argument

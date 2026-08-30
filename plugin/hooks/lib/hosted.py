@@ -114,15 +114,36 @@ class HostedError(RuntimeError):
 
 
 def credentials() -> "dict | None":
-    """`{'api_key': ..., 'server_url': ...}` or None when not logged in."""
+    """`{'api_key': ..., 'server_url': ...}` or None when not logged in.
+
+    Two sources, in the library's own order: `MEMVARA_API_KEY` / `MEMVARA_SERVER_URL`
+    first, then the file `memvara-mcp login` writes. Matching `memvara/remote/creds.py`
+    rather than picking an order here is the point -- a machine that sets both should not
+    reach a different store depending on which client happened to read it.
+
+    Reading only the file was survivable while the library's client was the write path on
+    such a machine, because it resolved the variable itself. With one client serving both
+    directions this is the only place left that can, and without it an install configured
+    by environment variable is simply "not logged in" to every hook: no recall, and
+    `capture.py` logging `failed=no store or login` on every turn.
+
+    Each field resolves independently, as it does there, so a key from the environment and
+    a URL from the file compose rather than one shadowing the other wholesale.
+    """
+    data: dict = {}
     try:
         with open(CREDENTIALS, encoding="utf-8") as fh:
-            data = json.load(fh)
+            loaded = json.load(fh)
+        if isinstance(loaded, dict):
+            data = loaded
     except (OSError, ValueError):
+        pass
+    api_key = (os.environ.get("MEMVARA_API_KEY") or "").strip() or data.get("api_key")
+    if not api_key:
         return None
-    if not isinstance(data, dict) or not data.get("api_key"):
-        return None
-    return data
+    server_url = ((os.environ.get("MEMVARA_SERVER_URL") or "").strip()
+                  or data.get("server_url") or DEFAULT_BASE)
+    return {"api_key": api_key, "server_url": server_url}
 
 
 def _context() -> ssl.SSLContext:
