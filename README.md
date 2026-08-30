@@ -61,9 +61,11 @@ local install queries in-process in ~148 ms. A hosted install with no
 The daemon earns more on hosted than on local, because only a resident
 process can hold the TLS connection open: the same request measured
 609 ms on a fresh connection and 177 ms on a warm one. It exits after 30
-minutes idle, and its socket address digests both the store and the hook
-sources, so a second store can never reach it and edited code strands it
-rather than being served stale.
+minutes idle, and its socket address digests the store, the hook sources
+and the coding client it was started for — so a second store can never
+reach it, edited code strands it rather than being served stale, and two
+clients installed side by side get a daemon each instead of sharing
+whichever one bound first.
 
 Two things the hosted path needs that look like nothing when missing.
 It must send a **User-Agent**: Cloudflare refuses the stdlib default with

@@ -2662,6 +2662,66 @@ class Daemon(unittest.TestCase):
         (root / "recall.py").write_text("edited", encoding="utf-8")
         self.assertNotEqual(before, ipc.socket_path("k", root=str(root)))
 
+    def _core_host(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("core.host")
+        finally:
+            sys.path.pop(0)
+
+    def test_socket_address_separates_hosts_over_one_store_and_one_tree(self) -> None:
+        """Two clients must never share a daemon, even over one store and one hook tree.
+
+        The address already digests the store, so one account's memories cannot answer
+        another's prompts, and the hook sources, so edited code is stranded rather than
+        served stale. Vendoring adds a third collision neither of those covers: six sibling
+        repositories ship these same bytes for six different clients, so a Codex daemon and
+        a Cursor daemon on one machine, over one `MEMVARA_DB`, with a byte-identical hook
+        tree, compute the same address and the first to bind serves both.
+
+        What each holds is not interchangeable. The bound `Host` decides which client
+        config files `ipc.server_env` mines the store's env block out of, so two hosts
+        starting from the same environment can legitimately open two different stores --
+        which is the store-separation failure again, arriving through a door the store
+        digest cannot see, because it is computed *after* the host has already chosen where
+        to look.
+
+        Both calls are given the same `root`, so the code digest is identical by
+        construction rather than by assumption. The second assertion is the control: same
+        host, same store, same sources must still be one address, or a difference above
+        would prove nothing about the host id in particular.
+        """
+        ipc, core_host = self._ipc(), self._core_host()
+
+        with tempfile.TemporaryDirectory() as root:
+            for name in ipc.CODE_FILES:
+                target = pathlib.Path(root) / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("the same bytes on every host", encoding="utf-8")
+
+            base = core_host.active()
+            # Restored through the module global rather than through `use()`: `use(base)`
+            # would leave this process pinned to a host it had merely defaulted to, and a
+            # later test asking `active()` would get an answer this one manufactured.
+            was = core_host._ACTIVE
+            try:
+                def address(host_id: str) -> str:
+                    core_host.use(base._replace(id=host_id))
+                    return ipc.socket_path(ipc.store_key(), root=root)
+
+                self.assertNotEqual(
+                    address("codex"), address("cursor"),
+                    "two hosts over one store and one hook tree address the same socket, "
+                    "so whichever daemon binds first serves both clients")
+                self.assertEqual(
+                    address("codex"), address("codex"),
+                    "one host's address must still be stable, or the difference above "
+                    "says nothing about the host id")
+            finally:
+                core_host._ACTIVE = was
+
     def test_missing_daemon_is_not_an_error(self) -> None:
         """`send` collapses every failure to None so the caller falls back.
 
@@ -2769,6 +2829,206 @@ class Daemon(unittest.TestCase):
                          f"the client sends {sorted(sent - read)} and the daemon never "
                          "reads it, so the daemon route silently answers a different "
                          "question from the in-process one")
+
+    # -- byte parity between the routes ----------------------------------------
+    #
+    # The argument-name comparison above is a cheap proxy and stays: it reads two files and
+    # needs no process. What it cannot see is anything that goes wrong *between* the names
+    # -- an argument read under the right key and passed under a different one, a reply
+    # re-encoded, a section assembled in another order. These three tests serve one backend
+    # down every route this plugin has and compare the answers as strings.
+
+    #: The one query every route below is asked, and the one set of arguments it is asked
+    #: with. Named rather than inlined because the guard-on-the-guard test states its
+    #: expected strings from these values independently, and two spellings of "the
+    #: arguments" would let that guard check a call nobody makes.
+    PARITY_QUERY = "what did we decide about the socket name"
+    PARITY_ARGS = {
+        "k": 4,
+        "budget": 321,
+        "header": "## Recalled",
+        "include_episodes": True,
+        "memory_types": ["semantic", "procedural"],
+    }
+
+    #: The backend every route is served by, in source form rather than as a class.
+    #:
+    #: The daemon route runs in a child process, so the two ends cannot share an object.
+    #: What they can share is bytes. Two hand-written copies of "the same" fixture would
+    #: drift the first time one of them was edited, and this test would then be comparing
+    #: two backends rather than two routes -- passing or failing for a reason that has
+    #: nothing to do with the invariant it is named for.
+    #:
+    #: Structurally rich on purpose, and each part of the block is controlled by a
+    #: different argument: `header` is the first line, `memory_types` decides the claim
+    #: rows, `q` is the text inside them, `include_episodes` opens the episodes section,
+    #: and `k` and `budget` are the trailing count. A route that loses an argument
+    #: anywhere therefore loses or changes a *visible* section -- a difference in the
+    #: bytes rather than one nobody can see.
+    FIXTURE_BACKEND = '''
+class Backend:
+    def recall(self, query, k=6, budget=700, header=None,
+               include_episodes=False, memory_types=None):
+        rows = [header or "## Memory", "claims:"]
+        for kind in (memory_types or ["semantic"]):
+            rows.append(f"- [{kind}] {query}")
+        if include_episodes:
+            rows.append("episodes:")
+            rows.append(f"- turn touching {query}")
+        rows.append("standing:")
+        rows.append("- answer in whole sentences")
+        rows.append(f"({k} asked, {budget} budget)")
+        return "\\n".join(rows)
+'''
+
+    def _backend(self):
+        """The fixture, built from the same source string the child process is handed."""
+        namespace: "dict[str, object]" = {}
+        exec(compile(self.FIXTURE_BACKEND, "<parity fixture>", "exec"), namespace)
+        return namespace["Backend"]()
+
+    def _fixture_block(self) -> str:
+        return str(self._backend().recall(self.PARITY_QUERY, **self.PARITY_ARGS))
+
+    def test_the_parity_fixture_is_load_bearing(self) -> None:
+        """A backend that answers `""` makes route parity true for free.
+
+        This is the same shape as the concern `test_a_failed_query_is_not_an_empty_answer`
+        answers one level up: the empty string is what both a working route and a broken
+        one produce, so a comparison between two of them proves nothing. Every route
+        agreeing on nothing at all would be reported as every route agreeing.
+
+        So the block is required to be non-empty and to carry every section any argument
+        controls. The expected strings are written out here rather than read back off the
+        fixture, deliberately: a guard that derives what it expects from the thing it is
+        checking shrinks whenever that thing shrinks, and goes on passing while the fixture
+        under it empties out.
+        """
+        text = self._fixture_block()
+        self.assertTrue(text.strip(),
+                        "an empty block makes every route agree without proving anything")
+        for required in ("## Recalled", "claims:", "[semantic]", "[procedural]",
+                         "episodes:", "standing:", "(4 asked, 321 budget)",
+                         self.PARITY_QUERY):
+            self.assertIn(
+                required, text,
+                f"nothing in the fixture block reflects {required!r}, so no route can be "
+                "caught dropping the argument that produces it")
+
+    def _serve_fixture(self, sock: str, tmp: str):
+        """A real `daemon.py` serving the fixture on a real unix socket. Kill it yourself.
+
+        The child builds `daemon.Daemon` directly rather than going through `daemon.main`,
+        because `main` opens whatever store this machine is configured for and the point
+        here is to compare routes over one known backend. Everything the reply passes
+        through -- `run`, `_serve`, `_answer`, the JSON framing -- is the shipped code.
+        """
+        script = os.path.join(tmp, "serve.py")
+        pathlib.Path(script).write_text(
+            "import sys\n"
+            f"sys.path.insert(0, {str(HOOKS)!r})\n"
+            + self.FIXTURE_BACKEND
+            + "\nimport daemon\n"
+            f"raise SystemExit(daemon.Daemon({sock!r}, Backend()).run())\n",
+            encoding="utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, script], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(0.5)
+            try:
+                probe.connect(sock)
+                return proc
+            except OSError:
+                pass
+            finally:
+                probe.close()
+            if proc.poll() is not None:
+                break
+            time.sleep(0.02)
+        self._stop(proc)
+        self.fail("the fixture daemon never listened: "
+                  f"{(proc.stderr.read() if proc.stderr else b'')!r}")
+
+    @staticmethod
+    def _stop(proc) -> None:
+        """Leave no resident process behind, however the test above ended."""
+        if proc.stderr is not None:
+            proc.stderr.close()
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+    def test_every_route_answers_one_backend_with_the_same_bytes(self) -> None:
+        """The daemon is an optimisation and never a dependency, asserted rather than said.
+
+        Every route must return the same text and differ only in latency. If that ever
+        stopped being true, a background process would be trading a real risk against
+        136ms on somebody's prompt path, and the difference would show up only on the
+        machines where a daemon happened to be up.
+
+        Three routes, one backend, compared as strings with no normalisation of any kind
+        -- no strip, no splitlines, no whitespace collapse. Normalising is how a route that
+        loses a trailing count or reorders a section passes anyway.
+
+        The in-process route is asked with nothing listening at the address. The daemon
+        route is asked twice: once against a process that has never answered anything, and
+        once against the same process warm. Both fallbacks are emptied for those two calls,
+        so a daemon route that quietly fell through to the slow path returns `""` and fails
+        here rather than borrowing the other route's answer and reporting agreement.
+        """
+        fast = self._fast()
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            opener = importlib.import_module("lib.open")
+            hosted = importlib.import_module("lib.hosted")
+        finally:
+            sys.path.pop(0)
+
+        was_address, was_open, was_hosted = (
+            fast.socket_path, opener.open_store, hosted.open_hosted)
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                fast.socket_path = lambda *a, **k: os.path.join(tmp, "recall-nobody.sock")
+                opener.open_store = lambda: self._backend()
+                in_process, in_ok, _ = fast.recall(
+                    self.PARITY_QUERY, spawn=False, **self.PARITY_ARGS)
+
+                sock = os.path.join(tmp, "recall-parity.sock")
+                proc = self._serve_fixture(sock, tmp)
+                try:
+                    fast.socket_path = lambda *a, **k: sock
+                    opener.open_store = lambda: None
+                    hosted.open_hosted = lambda: None
+                    cold, cold_ok, _ = fast.recall(
+                        self.PARITY_QUERY, spawn=False, **self.PARITY_ARGS)
+                    warm, warm_ok, _ = fast.recall(
+                        self.PARITY_QUERY, spawn=False, **self.PARITY_ARGS)
+                finally:
+                    self._stop(proc)
+            finally:
+                fast.socket_path = was_address
+                opener.open_store = was_open
+                hosted.open_hosted = was_hosted
+
+        self.assertEqual((in_ok, cold_ok, warm_ok), (True, True, True),
+                         "a route that could not answer at all is not a route that agrees")
+        self.assertEqual(in_process, cold,
+                         "the in-process route and a cold daemon disagree, so which text "
+                         "a prompt gets depends on whether a daemon happened to be up")
+        self.assertEqual(cold, warm,
+                         "the same daemon answered its first and second request "
+                         "differently")
 
     def test_runtime_directory_is_private(self) -> None:
         # The socket is a read interface to everything the user has ever stored. The
