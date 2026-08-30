@@ -74,6 +74,33 @@ MAX_TURN_CHARS = 20_000
 #: replaced wholesale on update.
 STATE = Path.home() / ".memvara" / ".hooks" / "capture-state.json"
 
+#: The role the kept turn is stored under, and the point is that it is not "user".
+#:
+#: What this hook keeps is a transcript excerpt -- a synthetic header, `User:` lines,
+#: `Claude used` lines, and whatever the person pasted in along the way. `role="user"`
+#: says every word of that is the person's own, and the server's deterministic fast path
+#: believes it: the rules bind "I" and "my" to the user and fire on any clause in the
+#: text, quoted or not. `_clauses` even strips the surrounding quotation marks, so the one
+#: signal that a sentence was being cited rather than said is removed before matching.
+#:
+#: On 2026-08-26 somebody pasted a log quoting the core's own documentation of that fast
+#: path, which names its sentence forms by example -- "my name is X", "I live in X", "I
+#: work at X". Four claims landed at confidence 0.95, and `user name X` superseded a real
+#: name stored since 2026-08-18. Nothing raised. A fast-path write is an ordinary
+#: successful write, and this hook never asked for it.
+#:
+#: Filtering the text instead was considered and is worse. Nothing here can separate prose
+#: somebody typed from prose they pasted -- what did this was ordinary English paragraphs,
+#: no code fence and no indent to key on -- so a heuristic would hold until the next shape
+#: and then fail the same silent way. `FastExtractor` already declines any role but
+#: "user", so saying what the text actually is fixes it exactly and needs no guessing.
+#:
+#: It must be one of "user", "assistant" or "system": `memory_add` validates `role`
+#: against a closed enum and a rejection loses the whole episode rather than one field.
+#: "system" is the honest member of the three -- this text is machine-composed and is
+#: nobody's utterance.
+EPISODE_ROLE = "system"
+
 
 #: Prompts that carry no fact and never will. A turn whose whole typed input is one of
 #: these is the user saying "carry on", and mining it costs a full headless run -- about
@@ -288,10 +315,18 @@ def _keep_turn(store: object, turn: str, cwd: str) -> "tuple[bool, list[str]]":
     actually typed. This keeps the turn as well, so recall has something to return that is
     narrative rather than a slot value.
 
-    It is free where it matters. On a `fast-path-only` server -- which is what the hosted
-    endpoint reports -- `add` commits the episode before the extraction gate is consulted
-    and then returns without calling a model, so this costs one round trip and no tokens.
-    Billing counts net-new claims rather than episodes, so unextracted prose bills zero.
+    It is free where it matters, and it is stored under `EPISODE_ROLE` rather than
+    "user" so that it stays free. On a `fast-path-only` server -- which is what the hosted
+    endpoint reports -- `add` commits the episode and calls no model, so this costs one
+    round trip and no tokens. What it does *not* do is call no extractor: the deterministic
+    fast path runs on every user turn, and for a year this call handed it a whole
+    transcript and let it write claims nobody here had vetted. See `EPISODE_ROLE` for what
+    that cost. The facts this hook means to write are the ones `triples()` reads and
+    `store_facts()` writes, against a fixed vocabulary at confidence 0.7, and now they are
+    the only ones it writes.
+
+    The turn is stored whole. Only the claim about who said it changed, so recall still has
+    the narrative and `memory_why` still has something to show.
 
     Failure is not reported to the user. The claims are the load-bearing half; a missing
     episode degrades recall rather than breaking it, and a second red line in the terminal
@@ -303,7 +338,8 @@ def _keep_turn(store: object, turn: str, cwd: str) -> "tuple[bool, list[str]]":
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     project = project_subject(cwd or None)
     try:
-        receipt = add(f"[session turn · project {project} · {stamp}]\n{turn}", role="user")
+        receipt = add(f"[session turn · project {project} · {stamp}]\n{turn}",
+                      role=EPISODE_ROLE)
         return True, turn_ids(receipt)
     except Exception:
         return False, []

@@ -248,6 +248,17 @@ costs one round trip and no tokens at all: the episode is committed
 before the extraction gate is consulted, and billing counts net-new
 claims rather than episodes.
 
+It goes in as `system` rather than `user`, and the difference is the
+paste. What capture keeps is a transcript excerpt — your prompt, the
+tool lines, and anything you pasted in — and the server's deterministic
+fast path reads any user turn for sentences like "my name is X". Quoting
+does not protect you, because the matcher strips the quotation marks
+first, so pasting a log or a piece of documentation that contains one of
+those forms used to write it down as a fact about you at confidence 0.95
+and supersede the real value. `system` is what the text actually is, and
+it is the role that extractor already declines. The episode is stored
+whole; only the claim about who said it changed.
+
 Then it mines the turn for facts. That half needs a model, and uses the
 one you already pay for: it shells out to `claude -p` against your
 existing Claude Code login, so there is no `ANTHROPIC_API_KEY` and no

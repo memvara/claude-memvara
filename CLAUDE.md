@@ -67,9 +67,19 @@ someone finds a background process they were told would not exist.
 
 Each of these was measured, not reasoned about, and each fails silently.
 
-- **`MEMVARA_LLM=none` means `NullLLM`.** `memory_add` accepts prose, stores nothing, and
-  reports no-fact. Write triples with `memory_remember` instead. Server `memory_stats` says
-  `fast-path-only` when this is the case — check it before assuming a store is empty.
+- **`MEMVARA_LLM=none` means `NullLLM`.** `memory_add` accepts prose and the *model* tier
+  stores nothing from it, so write triples with `memory_remember` instead. Server
+  `memory_stats` says `fast-path-only` when this is the case — check it before assuming a
+  store is empty.
+- **"Stores nothing" is not true of `memory_add`, and reading it that way cost a real
+  name.** The deterministic fast path runs on every `role="user"` turn whatever `MEMVARA_LLM`
+  is, and writes what it matches at confidence 0.95 — high enough to supersede a value the
+  user stated outright. It fires on any clause in the text, and `_clauses` strips the
+  quotation marks before matching, so documentation quoting its own examples ("my name is
+  X", "I work at X") lands as facts about the person who pasted it. That is exactly what
+  happened on 2026-08-26. Prose handed to `memory_add` under a user role is text you are
+  asking a matcher to believe; hand it `role="system"` when it is a transcript, a log or a
+  document rather than something the person said.
 - **Triple writes never register a predicate.** `remember()` bypasses extraction, and
   predicate acquisition lives only on the extraction path. With 23 builtins and a 200-slot
   learned cap, anything you write is MANY (nothing supersedes it) and SLOW (a **730-day**
