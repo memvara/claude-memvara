@@ -48,8 +48,9 @@ def open_store() -> Any | None:
     """The `Memvara` a hook should read, or `None` to do nothing at all.
 
     `None` is a normal outcome, not an error: no store is configured, the library is not
-    installed, the embedder does not match, the credentials expired. Every one of those
-    means this prompt gets no memory block, and nothing else.
+    installed, the embedder does not match, the credentials expired, or the deployment is
+    hosted and belongs to `lib.hosted` instead. Every one of those means this prompt gets
+    no memory block *from here*, and the last one means it gets a better one elsewhere.
     """
     env = dict(os.environ)
     # The client's block loses to a real environment variable. Someone who exports
@@ -69,7 +70,26 @@ def open_store() -> Any | None:
         _import_memvara(env)
         from memvara.server.config import ServerConfig, build_memvara
 
-        return build_memvara(ServerConfig.from_env(env))
+        config = ServerConfig.from_env(env)
+        if config.mode != "local":
+            # Not a local engine, so not ours to hand a hook. `build_memvara` has returned
+            # a `RemoteMemvara` for a cloud config since memvara/memvara@2a3bb48, and a
+            # hook cannot use one: its `recall()` takes no `header=` at all and *refuses*
+            # a `budget=` rather than dropping it -- deliberately, because it cannot
+            # re-derive the local truncation from a server-rendered string. `lib.hosted`
+            # is this repo's client for exactly that deployment and does both, so
+            # answering None is how a caller is sent somewhere that can serve the call.
+            #
+            # This is not a new rule; it is the one every docstring here already states
+            # ("open_store() answers None on a hosted install"). It stopped being true by
+            # accident, upstream, and cost every prompt its memory block for a day while
+            # the fallback chain sat intact and unreached.
+            #
+            # Spelled `!= "local"` rather than `== "cloud"`: a mode added later is far
+            # likelier to be another remote than another engine, and this direction
+            # degrades to the route that works instead of to a silent outage.
+            return None
+        return build_memvara(config)
     except Exception:
         # Deliberately bare. ConfigError, ImportError, EmbedderMismatchError, a corrupt
         # SQLite file and a revoked API key are all the same event from here: no memory

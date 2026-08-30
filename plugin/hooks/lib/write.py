@@ -5,10 +5,13 @@ store that may be local or hosted, a loop that counts failures instead of swallo
 and a log, because a write that fails leaves no other trace.
 
 The store is opened the way recall opens it. `open_store()` answers None on a hosted
-install, which is the normal state rather than a broken one: `MEMVARA_MODE=cloud` cannot
-build an engine, since the REST facade exposes none of the low-level calls the pipeline
-makes. The hosted client is the route in that case, and it raises on a failed write rather
-than returning nothing, which is what lets `store_facts` tell a refusal from a quiet turn.
+install, which is the normal state rather than a broken one -- and since
+memvara/memvara@2a3bb48 it is a *decision* rather than a fact about what can be built:
+`MEMVARA_MODE=cloud` now yields a perfectly good `RemoteMemvara`, and `open_store()`
+declines it anyway, because the library's hosted client refuses the `budget=` its callers
+here pass and takes no `header=`. The hosted client in `lib.hosted` is the route in that
+case, and it raises on a failed write rather than returning nothing, which is what lets
+`store_facts` tell a refusal from a quiet turn.
 """
 
 from __future__ import annotations
