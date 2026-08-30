@@ -44,7 +44,7 @@ def _import_memvara(env: Mapping[str, str]) -> Any:
     return memvara
 
 
-def open_store(*, recalls: bool = True) -> Any | None:
+def open_store() -> Any | None:
     """The `Memvara` a hook should read, or `None` to do nothing at all.
 
     `None` is a normal outcome, not an error: no store is configured, the library is not
@@ -52,14 +52,10 @@ def open_store(*, recalls: bool = True) -> Any | None:
     hosted and belongs to `lib.hosted` instead. Every one of those means this prompt gets
     no memory block *from here*, and the last one means it gets a better one elsewhere.
 
-    `recalls` is what the caller intends to *do* with the handle, and it exists because the
-    answer differs. A caller that will call `recall()` needs `header=` and `budget=`, which
-    the library's hosted client does not serve; a caller that will only write needs
-    `sources=`, which it serves and `lib.hosted` does not. Collapsing the two costs one of
-    them, and the first attempt at this fix collapsed them silently in the writer's
-    direction -- every captured fact stored unlinked, with `capture.log` still reporting
-    `stored=N`. Asked as a question rather than sniffed off the object, for the reason
-    `store_facts` gives at length about `hosted`: what the caller means cannot rot.
+    There is no caller-kind parameter here any more, and the absence is the point: on a
+    hosted deployment `lib.hosted` now serves reads *and* writes, so there is nothing left
+    for a second client to be better at. It briefly took a `recalls` flag, when the MCP
+    surface could not carry `sources=` and the library's client could.
     """
     env = dict(os.environ)
     # The client's block loses to a real environment variable. Someone who exports
@@ -75,7 +71,7 @@ def open_store(*, recalls: bool = True) -> Any | None:
         else:
             return None
 
-    if recalls and env.get("MEMVARA_MODE") == "cloud":
+    if env.get("MEMVARA_MODE") == "cloud":
         # The same refusal as below, reached before paying for it. `import memvara` is
         # ~95ms and this function runs whenever the daemon is not warm -- the first prompt
         # of every session, and every prompt after a daemon dies -- so importing the whole
@@ -93,19 +89,20 @@ def open_store(*, recalls: bool = True) -> Any | None:
         from memvara.server.config import ServerConfig, build_memvara
 
         config = ServerConfig.from_env(env)
-        if recalls and config.mode != "local":
-            # Not a local engine, and this caller is going to call `recall()` on it.
-            # `build_memvara` has returned a `RemoteMemvara` for a cloud config since
-            # memvara/memvara@2a3bb48, and a recalling hook cannot use one: its `recall()`
-            # takes no `header=` at all and *refuses* a `budget=` rather than dropping it
-            # -- deliberately, because it cannot re-derive the local truncation from a
-            # server-rendered string. `lib.hosted` is this repo's client for exactly that
-            # deployment and does both, so answering None is how a caller is sent
-            # somewhere that can serve the call.
+        if config.mode != "local":
+            # Not a local engine, so not ours to hand any hook. `build_memvara` has
+            # returned a `RemoteMemvara` for a cloud config since memvara/memvara@2a3bb48,
+            # and no hook here can use one: its `recall()` takes no `header=` at all and
+            # *refuses* a `budget=` rather than dropping it -- deliberately, because it
+            # cannot re-derive the local truncation from a server-rendered string.
             #
-            # Only recalling callers. A writer wants the opposite handle: `RemoteMemvara`
-            # takes the `sources=` that carries a claim back to the turn it came from, and
-            # `lib.hosted` cannot until the server renders episode ids.
+            # Writers used to want the opposite handle, for the `sources=` that carries a
+            # claim back to the turn it came from. memvara/memvara#76 shipped that across
+            # the MCP transport, so `lib.hosted` carries it too and the exception is gone.
+            # Measured against the live endpoint rather than assumed: `memory_remember`
+            # reports `accepts("sources") is True`, the `memory_add` receipt renders
+            # `turn id(s): ep_...`, and `memory_why` on a claim written this way resolves
+            # to the turn.
             #
             # This is not a new rule; it is the one every docstring here already states
             # ("open_store() answers None on a hosted install"). It stopped being true by
