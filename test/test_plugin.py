@@ -18,6 +18,7 @@ import ssl
 import tempfile
 import socket
 import time
+import types
 import subprocess
 import sys
 import unittest
@@ -2810,6 +2811,202 @@ class Hosted(unittest.TestCase):
             hosted._HOSTED_CACHE.clear()
             hosted._HOSTED_CACHE.update(original_cache)
             shutil.rmtree(directory, ignore_errors=True)
+
+
+class StoreRoute(unittest.TestCase):
+    """Which backend `open_store()` hands a hook, and which one it refuses to.
+
+    `open_store()` answering None is not a failure here, it is the routing decision that
+    puts a hosted install on `lib.hosted` -- the only client in this repo that renders
+    `header=` itself and applies `budget=` to the finished block. The library's hosted
+    client does neither: `RemoteMemvara.recall()` takes no `header=` at all and *refuses*
+    a `budget=` rather than silently dropping it, which is deliberate upstream and named
+    there in `test_recall_refuses_a_budget_rather_than_dropping_it`.
+
+    This class exists for one production outage. When `build_memvara()` learned to return
+    a `RemoteMemvara` under `MEMVARA_MODE=cloud` (memvara/memvara@2a3bb48), `open_store()`
+    began answering with one, route 2 in `lib.fast` started winning, and every prompt in
+    every session printed `recall failed` over a store that was answering perfectly on
+    route 3. Nothing raised and nothing was logged beyond `reason=unknown`: the ValueError
+    was caught exactly where it was designed to be caught. The fallback chain was intact
+    and unused, because the route above it had started succeeding at *existing* while
+    still being unable to serve the call.
+    """
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _library(mode: str, built: object):
+        """Stand in for `memvara.server.config` with a chosen mode and product.
+
+        Faked rather than driven against the real library on purpose. The real one answers
+        whatever this developer's machine is configured for, so a test written against it
+        passes or fails on `~/.memvara/credentials.json` rather than on the code -- and
+        would go green on CI, where there is no config at all, whichever way the branch
+        was written.
+        """
+        config = types.ModuleType("memvara.server.config")
+        config.ServerConfig = type(
+            "ServerConfig", (), {"from_env": staticmethod(
+                lambda env: types.SimpleNamespace(mode=mode))})
+        config.build_memvara = lambda cfg: built
+        server = types.ModuleType("memvara.server")
+        server.config = config
+        library = types.ModuleType("memvara")
+        library.server = server
+
+        names = ("memvara", "memvara.server", "memvara.server.config")
+        saved = {name: sys.modules.get(name) for name in names}
+        sys.modules.update(dict(zip(names, (library, server, config))))
+        try:
+            yield
+        finally:
+            for name, was in saved.items():
+                if was is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = was
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _env(**pairs: str):
+        saved = {key: os.environ.get(key) for key in pairs}
+        os.environ.update(pairs)
+        try:
+            yield
+        finally:
+            for key, was in saved.items():
+                if was is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = was
+
+    def _opener(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import lib.open as opener
+        finally:
+            sys.path.pop(0)
+        return opener
+
+    def test_a_remote_deployment_is_not_handed_to_a_hook(self) -> None:
+        built = object()
+        with self._library("cloud", built), self._env(MEMVARA_MODE="cloud"):
+            self.assertIsNone(
+                self._opener().open_store(),
+                "a non-local config must route to lib.hosted: RemoteMemvara.recall() "
+                "refuses budget= and takes no header=, so handing one to a hook turns "
+                "every prompt into 'recall failed' over a store that answers fine")
+
+    def test_a_local_engine_is_still_handed_over(self) -> None:
+        """Stated positively, because the rule this repo keeps relearning demands it.
+
+        A guard spelled only "cloud answers None" is satisfied by an `open_store()` that
+        answers None for *everything* -- which is the same outage reached by a different
+        route, and would leave local installs silently on the hosted client or on nothing
+        at all. The engine has to be PRESENT.
+        """
+        built = object()
+        with self._library("local", built), self._env(MEMVARA_DB="/nonexistent/x.db"):
+            self.assertIs(
+                self._opener().open_store(), built,
+                "a local engine is the one thing open_store() exists to return")
+
+    def test_a_cloud_config_reaches_the_hosted_client(self) -> None:
+        """The wiring, not the unit -- this is the one that would have caught it.
+
+        Both tests above pass on a repair made in the wrong place. What actually has to
+        hold is that a cloud config ends with `lib.hosted` answering and the prompt
+        getting its block, with the `budget=` and `header=` the hook asked for still
+        applied. Sabotage check: returning `built` from `open_store()` again turns this
+        red on the `ok` slot, which is precisely the production symptom.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import fast
+            import lib.hosted as hosted_mod
+        finally:
+            sys.path.pop(0)
+
+        class Client:
+            def __init__(self) -> None:
+                self.calls: list = []
+
+            def recall(self, query, **kw):
+                self.calls.append(kw)
+                return "the hosted block"
+
+            def close(self) -> None:
+                pass
+
+        client = Client()
+        built = object()
+        was, hosted_mod.open_hosted = hosted_mod.open_hosted, lambda: client
+        try:
+            with self._library("cloud", built), self._env(MEMVARA_MODE="cloud"):
+                text, ok, why = fast.recall("anything", k=4, budget=300, header="H",
+                                            spawn=False)
+        finally:
+            hosted_mod.open_hosted = was
+
+        self.assertEqual((text, ok, why), ("the hosted block", True, ""),
+                         "a reachable hosted store must report ok, not 'recall failed'")
+        self.assertEqual(client.calls[0].get("budget"), 300,
+                         "the budget the hook asked for must survive the route change")
+        self.assertEqual(client.calls[0].get("header"), "H",
+                         "and so must the header, which lib.hosted renders itself")
+
+
+    def test_a_writer_still_gets_the_library_handle(self) -> None:
+        """The half the first attempt at this fix broke, and broke silently.
+
+        `capture.py` is the only caller that purely writes, and it is the only one that
+        wants a `RemoteMemvara` on a hosted install: `store_facts` attaches the turn as
+        `sources=[Episode]` in the same transaction as the claim, which that client takes
+        (`remember(..., sources=...)` in `memvara/remote/api.py`) and `lib.hosted` cannot
+        until the server renders episode ids. Routing the writer to `lib.hosted` as well
+        stored every captured fact unlinked while `capture.log` went on reporting
+        `stored=N` -- no exception, no banner, and `memory_why` answering nothing about
+        any of them a session later.
+        """
+        built = object()
+        with self._library("cloud", built), self._env(MEMVARA_MODE="cloud"):
+            self.assertIs(
+                self._opener().open_store(recalls=False), built,
+                "a write-only caller must keep the library handle, sources= and all")
+
+    def test_the_writer_route_reports_itself_as_local(self) -> None:
+        """`open_writer`'s second slot is what `capture.py` derives `hosted` from.
+
+        `store_facts(hosted=...)` picks the `sources=` branch off it, so a `close` that
+        is not None here is the same outage as the wrong handle, reached one step later.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import write as write_mod
+        finally:
+            sys.path.pop(0)
+        built = object()
+        with self._library("cloud", built), self._env(MEMVARA_MODE="cloud"):
+            store, close = write_mod.open_writer(recalls=False)
+        self.assertIs(store, built)
+        self.assertIsNone(close, "capture.py reads `hosted = close is not None`, and a "
+                                 "library handle is not hosted")
+
+    def test_capture_asks_for_the_writer_route(self) -> None:
+        """The default is the dangerous direction, so the one caller that needs the other
+        one is pinned here.
+
+        `recalls` defaults to True because every other caller reads, which means a writer
+        that simply forgets the argument is demoted in silence -- the exact failure this
+        parameter was added to end, reintroduced by omission. Asserted against `capture.py`
+        itself rather than a list of callers kept somewhere else: a list is a thing that
+        stops covering a file without anyone noticing.
+        """
+        source = (HOOKS / "capture.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "open_writer(recalls=False)", source,
+            "capture.py must ask for the write-capable handle: without it every fact it "
+            "stores loses the turn it came from, and nothing says so")
 
 
 class SpeakerBlocks(unittest.TestCase):

@@ -5,10 +5,13 @@ store that may be local or hosted, a loop that counts failures instead of swallo
 and a log, because a write that fails leaves no other trace.
 
 The store is opened the way recall opens it. `open_store()` answers None on a hosted
-install, which is the normal state rather than a broken one: `MEMVARA_MODE=cloud` cannot
-build an engine, since the REST facade exposes none of the low-level calls the pipeline
-makes. The hosted client is the route in that case, and it raises on a failed write rather
-than returning nothing, which is what lets `store_facts` tell a refusal from a quiet turn.
+install, which is the normal state rather than a broken one -- and since
+memvara/memvara@2a3bb48 it is a *decision* rather than a fact about what can be built:
+`MEMVARA_MODE=cloud` now yields a perfectly good `RemoteMemvara`, and `open_store()`
+declines it anyway, because the library's hosted client refuses the `budget=` its callers
+here pass and takes no `header=`. The hosted client in `lib.hosted` is the route in that
+case, and it raises on a failed write rather than returning nothing, which is what lets
+`store_facts` tell a refusal from a quiet turn.
 """
 
 from __future__ import annotations
@@ -41,14 +44,21 @@ def log(line: str) -> None:
         pass
 
 
-def open_writer() -> "tuple[Any, Any] | tuple[None, None]":
+def open_writer(*, recalls: bool = True) -> "tuple[Any, Any] | tuple[None, None]":
     """`(store, close)` for whichever backend answers, or `(None, None)`.
 
-    `close` is None for a local store, which has no connection to give back, and the
+    `close` is None for a library handle, which has no connection to give back, and the
     hosted client's `close` otherwise. Callers close after their last write and not
     before: the hosted client connects lazily, so an early return costs nothing.
+
+    `recalls` is passed straight through to `open_store`, and the default is the careful
+    one. Leave it alone unless this handle is *only* written to: `capture.py` is the one
+    caller that qualifies, and the one that needs `sources=`. Everything else here reads
+    -- `session_start` and `recall`'s standing refresh both call `recall()` on what they
+    get back, and handing either a `RemoteMemvara` is the outage this parameter exists
+    downstream of.
     """
-    store = open_store()
+    store = open_store(recalls=recalls)
     if store is not None:
         return store, None
 
