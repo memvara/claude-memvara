@@ -272,6 +272,11 @@ Then it mines the turn for facts. That half needs a model, and uses the
 one you already pay for: it shells out to `claude -p` against your
 existing Claude Code login, so there is no `ANTHROPIC_API_KEY` and no
 second bill. It does not go through `MEMVARA_LLM`, which stays `none`.
+If that CLI is not on your `PATH` at all, capture skips the mining step
+rather than falling back to something that would look like it worked:
+`capture.log` says `extraction did not run: no extractor available` and
+the next prompt's status line says the same. Nothing is stored from that
+turn, and nothing pretends otherwise.
 On a hosted install there is no local store to open, so capture writes
 over the same MCP endpoint recall reads; a write the endpoint refuses is
 logged as failed rather than counted as stored.

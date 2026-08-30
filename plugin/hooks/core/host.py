@@ -54,16 +54,54 @@ TranscriptSpec = namedtuple("TranscriptSpec", "format")
 ApproveSpec = namedtuple("ApproveSpec", "matcher separators decision_key reason_key allow")
 
 #: The headless CLI `capture` shells out to in order to mine a turn: the command without
-#: the prompt, which is appended. The recursion sentinel is deliberately absent -- that
-#: environment variable is ours, identical on every host, and lives in `lib.ipc` for the
-#: same reason `READ_ONLY` and `RECALL_MARKERS` do.
-ExtractorSpec = namedtuple("ExtractorSpec", "argv")
+#: the prompt, which is appended, plus where to read the answer out of the envelope it
+#: prints. The recursion sentinel is deliberately absent -- that environment variable is
+#: ours, identical on every host, and lives in `lib.ipc` for the same reason `READ_ONLY`
+#: and `RECALL_MARKERS` do.
+#:
+#: The three keys travel together because they describe one thing: the JSON object one
+#: CLI prints in its `--output-format json` mode. `reply_key` holds what the model said,
+#: `usage_key` what it cost, and `error_key` the flag that turns an exit-0 run into a
+#: failure. Splitting them -- two on the record and one still spelled inline in
+#: `lib/extract.py` -- would mean a port that got its reply key right could still read
+#: every error as a success, which stores nothing and reports nothing.
+ExtractorSpec = namedtuple("ExtractorSpec", "argv reply_key usage_key error_key")
+
+#: The model `claude -p` is asked for. Named once because it is spelled twice: in the
+#: argv below, and as the label `lib.extract` writes to `usage.jsonl`. Two spellings
+#: would let the ledger name a model that was never invoked, which is wrong in the one
+#: file that exists to say what was spent.
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+
+#: The second rung of the extractor chain, available to every host rather than only to
+#: the one that packages Claude Code.
+#:
+#: It lives in `core/` -- the half of this tree that is the same bytes in every plugin
+#: repository -- because it is a fact about one CLI product and not about any host. A
+#: Codex or Cursor user with Claude Code also installed can mine turns with it, and the
+#: `hosts/codex.py` in that repository must not have to carry a copy of this argv to say
+#: so. `hosts/claude.py` names this record as its own extractor rather than restating it,
+#: so the `--settings` guard below is the only spelling of that flag anywhere.
+#:
+#: `--settings '{"hooks":{}}'` clears the hooks a settings file declares. It does NOT
+#: clear the ones a plugin registers -- measured, with a marker file: the child still
+#: fires this plugin's own SessionStart and UserPromptSubmit. So it is one of two guards
+#: against recursion and not the load-bearing one; the sentinel in `lib.ipc` is what
+#: actually stops it, and `ipc.under_extraction` is what stands the read hooks down. Kept
+#: because a settings-declared Stop hook is a real way in.
+CLAUDE_CLI = ExtractorSpec(
+    argv=("claude", "-p", "--settings", '{"hooks":{}}',
+          "--model", CLAUDE_MODEL, "--output-format", "json"),
+    reply_key="result",
+    usage_key="usage",
+    error_key="is_error",
+)
 
 Host = namedtuple(
     "Host",
     "id plugin_root_env events fields envelope context_key status_key "
     "context_token_cap supports_async timeouts client_configs config_format "
-    "transcript tools noise machine_prompt_prefixes reentry_field approve "
+    "transcript tools noise skip_prefixes machine_prompt_prefixes reentry_field approve "
     "extractor extractor_label",
 )
 

@@ -608,6 +608,60 @@ class Hooks(unittest.TestCase):
         # goes out. That asymmetry is the feature.
         self.assertNotIn("hookSpecificOutput", body)
 
+    #: Claude Code's own command escapes: `/` opens a slash command, `!` runs a shell
+    #: line, `#` adds to memory. None of the three is a question to the model.
+    #:
+    #: Restated here rather than read off `Host.skip_prefixes`, and that is the whole
+    #: design of the guard below. The referent is the client's own input syntax, and a test
+    #: cannot ask a terminal UI what its escapes are -- so an independent statement of them
+    #: is the closest thing to one available. A loop over the record instead would have
+    #: shrunk with the record: deleting `!` and `#` from `hosts/claude.py` leaves a test
+    #: that checks one prefix, passes, and reports nothing. Measured, not reasoned about --
+    #: that is exactly what the first version of this did when it was sabotaged.
+    CLAUDE_COMMAND_PREFIXES = ("/", "!", "#")
+
+    def test_every_command_prefix_the_host_declares_is_answered_with_silence(self) -> None:
+        """A slash command is not a question, and recall must not answer it.
+
+        Two halves, because the prefixes moved onto `Host.skip_prefixes` so six sibling
+        repositories can each spell their own editor's escapes. The record must still name
+        all three of this client's, and `recall.py` must still act on them -- a record that
+        is right while the body has stopped reading it is silent in a different direction
+        and just as complete.
+
+        The control prompt is what makes this a guard rather than a way of passing. Stated
+        as "a command prompt prints nothing", it is satisfied by a `recall.py` that has
+        stopped printing at all -- which is the failure it is standing in front of, since
+        the whole reason this hook prints a status line is that a silent one and a broken
+        one used to be the same thing on screen. So the last case asserts a prompt with no
+        prefix still gets its line.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from hosts.claude import HOST
+        finally:
+            sys.path.pop(0)
+
+        self.assertEqual(tuple(HOST.skip_prefixes), self.CLAUDE_COMMAND_PREFIXES)
+        for prefix in self.CLAUDE_COMMAND_PREFIXES:
+            with self.subTest(prefix=prefix):
+                proc = subprocess.run(
+                    ["python3", str(HOOKS / "recall.py")],
+                    input=json.dumps({"prompt": f"{prefix}clear"}),
+                    capture_output=True, text=True, env=self.BARREN, timeout=30,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+
+        with self.subTest(prefix="none"):
+            proc = subprocess.run(
+                ["python3", str(HOOKS / "recall.py")],
+                input=json.dumps({"prompt": "clear"}),
+                capture_output=True, text=True, env=self.BARREN, timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("Memvara", json.loads(proc.stdout)["systemMessage"])
+
     def test_read_hooks_stand_down_inside_an_extraction(self) -> None:
         """`claude -p` runs this plugin's hooks, so the child must be told to stop.
 
@@ -1556,19 +1610,58 @@ class Hooks(unittest.TestCase):
         hook set, finishes, fires Stop, spawns another child. Nothing errors — the machine
         just fills with Claude processes and the bill climbs. Two independent stops are
         asserted because either one alone is a single point of failure.
-        """
-        source = (HOOKS / "lib" / "extract.py").read_text(encoding="utf-8")
-        # 1. The child is launched with an empty hook set.
-        self.assertIn('"--settings", \'{"hooks":{}}\'', source)
-        # 2. And refuses to start if it finds itself already inside an extraction.
-        self.assertIn("SENTINEL", source)
 
+        Stop 1 used to be a grep for the literal in `lib/extract.py`'s source. The argv
+        became data on `ExtractorSpec` when the extractor turned into a per-host chain, so
+        that grep would now be asserting where a string is written rather than what the
+        run is made with -- and a grep moved to `core/host.py` would stay green on the day
+        `_payload` stops asking the record and hardcodes an argv again. What is asserted
+        instead is the argv `subprocess.run` is actually handed, which is the same claim
+        against its referent rather than against a copy of itself, and is red for both
+        mistakes: dropping the flag from the record, and ignoring the record.
+        """
         sys.path.insert(0, str(HOOKS))
         try:
+            from lib import extract as extract_mod
             from lib.extract import SENTINEL, _payload
         finally:
             sys.path.pop(0)
 
+        # 1. The child is launched with an empty hook set.
+        seen: list[list[str]] = []
+
+        class _Fine:
+            returncode = 0
+            stdout = json.dumps({"is_error": False, "result": "", "usage": {}})
+            stderr = ""
+
+        def _record(argv: "list[str]", **_k: object) -> "_Fine":
+            seen.append(list(argv))
+            return _Fine()
+
+        original_run, original_log = extract_mod.subprocess.run, extract_mod.log
+        original_clear = extract_mod.clear_capture_alert
+        extract_mod.subprocess.run = _record  # type: ignore[assignment]
+        extract_mod.log = lambda _line: None  # type: ignore[assignment]
+        extract_mod.clear_capture_alert = lambda: None  # type: ignore[assignment]
+        outside = os.environ.pop(SENTINEL, None)
+        try:
+            _payload("a turn", "a prompt")
+        finally:
+            extract_mod.subprocess.run = original_run  # type: ignore[assignment]
+            extract_mod.log = original_log  # type: ignore[assignment]
+            extract_mod.clear_capture_alert = original_clear  # type: ignore[assignment]
+            if outside is not None:
+                os.environ[SENTINEL] = outside
+
+        self.assertTrue(seen, "no extraction was attempted at all")
+        for argv in seen:
+            self.assertIn("--settings", argv, argv)
+            self.assertEqual(argv[argv.index("--settings") + 1], '{"hooks":{}}', argv)
+
+        # 2. And refuses to start if it finds itself already inside an extraction. Stated
+        # against the running code rather than the source for the same reason as above:
+        # the constant being spelled somewhere is not the guard, the standing down is.
         original = os.environ.get(SENTINEL)
         os.environ[SENTINEL] = "1"
         try:
@@ -1703,6 +1796,67 @@ class Hooks(unittest.TestCase):
             extract_mod.raise_capture_alert = original_raise  # type: ignore[assignment]
 
         self.assertEqual(raised, [said])
+
+    def test_a_host_with_no_extractor_says_so_rather_than_storing_nothing(self) -> None:
+        """Returning ("", {}) quietly is the 34-hour outage this module's own docstring
+        records: extraction stopped and 117 turns logged facts=0, with nothing anywhere
+        saying the extractor had not run at all.
+
+        This is the state a port reaches first. Six sibling repositories are about to
+        vendor these hooks for editors whose users have never installed Claude Code, so
+        "the host's own CLI is absent and `claude` is not on this machine either" is not
+        a remote failure -- it is the default on every one of them until that host's
+        `ExtractorSpec` names something real. The chain is allowed to run out of rungs;
+        what it may not do is run out of rungs silently, because a store nobody is
+        writing to looks identical, from every direction, to one with nothing to write.
+
+        Both channels are asserted because either alone is the defect that cost the 34
+        hours: `capture.log` is what a person finds when they go looking, and the alert
+        is what tells them to look -- `recall.py` relays it onto the next prompt's
+        status line.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import extract as extract_mod
+        finally:
+            sys.path.pop(0)
+
+        def _missing(*_a: object, **_k: object) -> None:
+            raise FileNotFoundError(2, "No such file or directory")
+
+        logged: list[str] = []
+        raised: list[str] = []
+        original_run, original_log = extract_mod.subprocess.run, extract_mod.log
+        original_raise = extract_mod.raise_capture_alert
+        extract_mod.subprocess.run = _missing  # type: ignore[assignment]
+        extract_mod.log = logged.append  # type: ignore[assignment]
+        extract_mod.raise_capture_alert = raised.append  # type: ignore[assignment]
+        original_env = os.environ.pop(extract_mod.SENTINEL, None)
+        try:
+            result, usage = extract_mod._payload("a turn", "a prompt")
+        finally:
+            extract_mod.subprocess.run = original_run  # type: ignore[assignment]
+            extract_mod.log = original_log  # type: ignore[assignment]
+            extract_mod.raise_capture_alert = original_raise  # type: ignore[assignment]
+            if original_env is not None:
+                os.environ[extract_mod.SENTINEL] = original_env
+
+        self.assertEqual((result, usage), ("", {}))
+        # Every rung that was tried and found absent says which one it was. A chain that
+        # skipped a rung and a chain that never had one are otherwise the same silence,
+        # and only one of them is fixed by installing something.
+        self.assertTrue(
+            any("claude" in line and "not installed" in line for line in logged),
+            f"no line names the rung that was missing: {logged}",
+        )
+        self.assertTrue(
+            any("no extractor available" in line for line in logged),
+            f"the log does not say extraction never ran: {logged}",
+        )
+        self.assertEqual(
+            raised, ["no extractor available"],
+            "the terminal was never told; only capture.log was, which nobody reads",
+        )
 
     def test_the_recursion_guard_does_not_raise_an_alert(self) -> None:
         """The child stands down on every single extraction; that is not a failure.

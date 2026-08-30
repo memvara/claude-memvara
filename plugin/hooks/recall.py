@@ -193,13 +193,18 @@ OVERALL_BUDGET_SEC = 7.5
 #: Prompts that are not questions to the model: a slash command, a bash escape, a comment.
 #: Silence is right for these -- the user typed a command and is not waiting on memory.
 #:
+#: The prefixes themselves belong to the client -- every editor spells its own command
+#: escape, and one that reads `#` as a heading rather than a comment would go silent on
+#: every prompt that opened with one -- so they live in its `Host` record and this name is
+#: what the body reads them by.
+#:
 #: There is deliberately no minimum length rule beside this. One was written and taken back
 #: out: it skipped short follow-ups on the theory that whatever they would have matched was
 #: injected earlier and is still in context, which is true often enough to be tempting and
 #: wrong exactly when it matters -- an early short question in a fresh session would get
 #: nothing, and get it silently. Deduplication already solves the repetition this was aimed
 #: at, and solves it by measuring rather than guessing.
-SKIP_PREFIXES = ("/", "!", "#")
+SKIP_PREFIXES = HOST.skip_prefixes
 
 #: Envelopes the *client* submits through this event, which no person typed.
 #:
@@ -214,14 +219,14 @@ SKIP_PREFIXES = ("/", "!", "#")
 #: inferred: these are the two observed, and a third should be added when it is seen and
 #: not before -- guessing at tag names would silence prompts nobody has evidence of.
 #:
-#: Kept separate from `SKIP_PREFIXES` because the reason differs, and the reasons are what
-#: someone editing this needs. Above: the user typed a command and is not waiting on
-#: memory. Here: there is no user, and the cost is a retrieval query against an allowance
-#: that is not per-session.
+#: Kept as a second name rather than folded into `SKIP_PREFIXES`, even though both now come
+#: off the same record and both end in a bare `return 0`, because the reasons differ and the
+#: reasons are what someone editing this needs. Above: the user typed a command and is not
+#: waiting on memory. Here: there is no user at all, and the cost is a retrieval query
+#: against an allowance that is not per-session -- which is also why only this one logs.
 #:
 #: The tags themselves belong to the client, so they live in its `Host` record and this
-#: name is what the body reads them by. `SKIP_PREFIXES` above is still spelled here, and
-#: it is host-specific too -- the record has no field for it yet.
+#: name is what the body reads them by.
 MACHINE_PREFIXES = HOST.machine_prompt_prefixes
 
 #: Where the per-session record of what has already been injected lives. Beside the store,

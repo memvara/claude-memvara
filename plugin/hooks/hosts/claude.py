@@ -10,7 +10,7 @@ from __future__ import annotations
 
 # Absolute, not relative: every entry point puts `plugin/hooks/` on `sys.path` and
 # imports both `core` and `hosts` as top-level packages from there.
-from core.host import ApproveSpec, ExtractorSpec, Host, TranscriptSpec
+from core.host import CLAUDE_CLI, ApproveSpec, Host, TranscriptSpec
 
 HOST = Host(
     id="claude",
@@ -57,6 +57,12 @@ HOST = Host(
     #: everywhere.
     noise=("<command-message>", "<command-name>", "<system-reminder>",
            "<local-command-stdout>"),
+    #: Prompts that are not questions to the model: a slash command, a bash escape, a
+    #: comment. Silence is right for these -- the user typed a command and is not waiting
+    #: on memory. Every client spells its own command prefixes, which is the whole reason
+    #: these are here rather than in `recall.py`; see that file for why they stay separate
+    #: from `machine_prompt_prefixes` below.
+    skip_prefixes=("/", "!", "#"),
     #: A finished background task and a message from another session arrive through the
     #: prompt event wrapped in these. Answering one spends a retrieval query on a task id.
     machine_prompt_prefixes=("<task-notification", "<cross-session-message"),
@@ -72,14 +78,13 @@ HOST = Host(
         reason_key="permissionDecisionReason",
         allow="allow",
     ),
-    #: Declared, not yet read: `lib/extract.py` still builds this argv itself, and
-    #: `test_extraction_cannot_recurse` pins the `--settings` literal in that file. The
-    #: two must be reconciled by whichever change teaches `lib/extract.py` to ask the host
-    #: -- until then `lib/extract.py` is the live copy and this one is a description of it.
-    extractor=ExtractorSpec(
-        argv=("claude", "-p", "--settings", '{"hooks":{}}',
-              "--model", "claude-haiku-4-5-20251001", "--output-format", "json"),
-    ),
+    #: The first rung of `lib.extract`'s chain, and on this host the same command as the
+    #: second: Claude Code's own CLI is what a Claude Code user has. Named from `core/`
+    #: rather than restated here so there is one spelling of that argv in the tree -- a
+    #: second copy is how the recursion guard's `--settings` flag would come to be present
+    #: in the record and absent from the command actually run. `lib.extract` drops the
+    #: duplicate rung, so this host tries one CLI and not the same one twice.
+    extractor=CLAUDE_CLI,
     #: Written into every claim this plugin stores and rendered back by `memory_why`.
     #: Changing it for tidiness re-labels history.
     extractor_label="claude-code-hook",
