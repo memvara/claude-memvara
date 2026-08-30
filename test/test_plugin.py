@@ -3597,6 +3597,142 @@ class TurnCitation(unittest.TestCase):
                                      "the local route hands over an Episode, not an id")
 
 
+class PastedText(unittest.TestCase):
+    """What somebody pastes into a prompt is not something they said about themselves.
+
+    The `Stop` hook keeps each turn as an episode, so recall has something narrative to
+    return and so a fact can cite the turn it came from. What it keeps is a transcript
+    excerpt: a synthetic header, `User:` lines, `Claude used` lines, and whatever was
+    pasted in along the way. Storing that under `role="user"` told the server every word
+    of it was the person's own, and the server's deterministic fast path took it at that
+    word.
+
+    That cost real data. On 2026-08-26 a person pasted a log quoting the core's own
+    documentation of the fast path, which names its sentence forms by example -- "my name
+    is X", "I live in X", "I work at X", "I'm allergic to X". Four claims landed at
+    confidence 0.95, and `user name X` superseded a real name that had been stored and
+    correct since 2026-08-18. Nothing raised and nothing logged, because a fast-path write
+    is an ordinary successful write.
+
+    The fix is deliberately not a filter on what looks like a paste. Nothing here can tell
+    prose somebody typed from prose they pasted -- the text that did this was ordinary
+    English paragraphs, with no code fence and no indent to key on -- so a heuristic would
+    hold until the next shape and then fail the same silent way. The turn goes in under a
+    role that is not `user`, which is true of it and is the gate `FastExtractor` already
+    honours.
+
+    The hook still writes facts. `triples()` reads the turn with a model and
+    `store_facts()` writes what comes back against a fixed vocabulary at confidence 0.7.
+    That path is unchanged and remains the only one that mints a claim here, which is what
+    the docstring on `_keep_turn` claimed all along.
+    """
+
+    #: The shape that did it, cut down. Ordinary prose quoting example sentences.
+    PASTED = (
+        "User: I see this error continuously coming in the logs in oci box:\n"
+        "What still works: remember(), and the deterministic fast path, which recognises\n"
+        'a fixed set of high-precision sentence forms on user turns ("my name is X",\n'
+        '"I live in X", "I work at X", "I\'m allergic to X", ...).\n'
+    )
+
+    def _capture(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("capture")
+        finally:
+            sys.path.pop(0)
+
+    def _kept(self, turn: str) -> dict:
+        """Drive the real `_keep_turn` against a store that only records the call."""
+        seen: dict = {}
+
+        class Store:
+            def add(self, text, role="user"):
+                seen["text"], seen["role"] = text, role
+                return "added 0, ended 0, retired 0, already-known 0, no-fact 1"
+
+        landed, ids = self._capture()._keep_turn(Store(), turn, "/tmp/a-project")
+        seen["landed"] = landed
+        return seen
+
+    def test_the_turn_is_not_offered_to_the_store_as_the_users_own_words(self) -> None:
+        seen = self._kept(self.PASTED)
+        self.assertTrue(seen["landed"], "the episode must still be stored")
+        self.assertNotEqual(
+            seen["role"], "user",
+            "a transcript excerpt stored as a user utterance is what let a pasted log "
+            "supersede this person's real name")
+
+    def test_the_role_is_one_every_server_already_accepts(self) -> None:
+        """`memory_add` validates `role` against a closed enum, and validation is a hard
+        rejection rather than a dropped field -- so an invented role would lose the whole
+        episode on the hosted route. The three have been the enum since the core was
+        renamed, which is older than any server anyone is running.
+        """
+        self.assertIn(self._capture().EPISODE_ROLE, {"assistant", "system"})
+
+    def test_the_text_itself_is_stored_whole(self) -> None:
+        """The episode is the narrative half of this hook and the reason `memory_why` can
+        answer at all. Nothing is stripped out of it -- only the claim about who said it
+        changed.
+        """
+        seen = self._kept(self.PASTED)
+        self.assertIn("my name is X", seen["text"], "the paste is still there")
+        self.assertIn("session turn", seen["text"], "and the header the hook adds")
+
+    def test_the_core_reads_four_facts_out_of_this_paste_from_a_user_turn(self) -> None:
+        """The half that keeps the test above from being a preference about a string.
+
+        If the core ever stops gating extraction on the role, this pair goes red rather
+        than the hook going quietly back to writing garbage.
+        """
+        extract = self._extractor()
+        got = extract("user")
+        self.assertEqual(
+            sorted(got), ["allergic_to", "lives_in", "name", "works_at"],
+            "the defect must still reproduce, or the test below proves nothing")
+
+    def test_and_none_at_all_from_the_role_the_hook_now_uses(self) -> None:
+        self.assertEqual(self._extractor()(self._capture().EPISODE_ROLE), [])
+
+    def test_the_copy_a_fact_cites_carries_the_same_role(self) -> None:
+        """`lib.write._episode` builds a second copy of the same turn, for the local route
+        to hand to `remember()` as its source. `remember()` runs no extraction, so that
+        copy was safe on the day it was written -- but it is permanent, and `reextract()`
+        runs the fast path over any stored episode that no claim cites. Erase a claim this
+        hook wrote and its turn has no citations left, the gate passes it as a user turn,
+        and the next sweep re-derives what this whole change removed.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import write
+        finally:
+            sys.path.pop(0)
+        episode = write._episode(self.PASTED)
+        if episode is None:
+            self.skipTest("the memvara library is not installed in this environment")
+        self.assertEqual(episode.role, write.EPISODE_ROLE)
+        self.assertEqual(episode.content, self.PASTED, "and the turn itself is unchanged")
+
+    def _extractor(self):
+        try:
+            from memvara.schema import PredicateRegistry
+            from memvara.types import Episode
+            from memvara.write.fast import FastExtractor
+        except ImportError:  # hosted install: no library here, and none needed
+            self.skipTest("the memvara library is not installed in this environment")
+
+        fast = FastExtractor(PredicateRegistry())
+
+        def extract(role: str) -> "list[str]":
+            episode = Episode(content=self.PASTED, role=role)
+            return [claim.predicate for claim in fast.extract(episode)]
+
+        return extract
+
+
 class Provenance(unittest.TestCase):
     """Who derived a fact, and whether a reader can tell.
 

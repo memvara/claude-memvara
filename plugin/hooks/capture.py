@@ -60,7 +60,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.extract import project_subject, triples  # noqa: E402
 from lib.open import payload  # noqa: E402
 from lib.transcript import last_turn_with_injections  # noqa: E402
-from lib.write import log, open_writer, store_facts, turn_ids  # noqa: E402
+from lib.write import (EPISODE_ROLE, log, open_writer, store_facts,  # noqa: E402
+                       turn_ids)
 
 #: How much of the tail to parse looking for the turn boundary. One turn is far smaller
 #: than this; the margin is for a turn with a lot of tool traffic in it.
@@ -73,6 +74,7 @@ MAX_TURN_CHARS = 20_000
 #: Where the per-transcript sizes live. Beside the store, not in the plugin, which is
 #: replaced wholesale on update.
 STATE = Path.home() / ".memvara" / ".hooks" / "capture-state.json"
+
 
 
 #: Prompts that carry no fact and never will. A turn whose whole typed input is one of
@@ -288,10 +290,25 @@ def _keep_turn(store: object, turn: str, cwd: str) -> "tuple[bool, list[str]]":
     actually typed. This keeps the turn as well, so recall has something to return that is
     narrative rather than a slot value.
 
-    It is free where it matters. On a `fast-path-only` server -- which is what the hosted
-    endpoint reports -- `add` commits the episode before the extraction gate is consulted
-    and then returns without calling a model, so this costs one round trip and no tokens.
-    Billing counts net-new claims rather than episodes, so unextracted prose bills zero.
+    It is free where it matters, and it is stored under `EPISODE_ROLE` rather than
+    "user" so that it stays free. On a `fast-path-only` server -- which is what the hosted
+    endpoint reports -- `add` commits the episode and calls no model, so this costs one
+    round trip and no tokens. What it does *not* do is call no extractor: the deterministic
+    fast path runs on every user turn whatever the model configuration is. From 28acf2c
+    (2026-08-24) until this change, six days, that made every captured turn a second write
+    path nobody here had vetted -- and `bb47d77` had already done it for a day on
+    2026-08-21. See `lib.write.EPISODE_ROLE` for what it cost.
+
+    The history is worth one more line, because the fix was once in this file and left.
+    `6657332` removed the `store.add()` call on 2026-08-21 with a comment saying "under
+    NullLLM prose is accepted and silently stores nothing" -- right that no model reads it,
+    wrong that nothing is written, and the call came back three days later on the strength
+    of that belief. The facts this hook means to write are the ones `triples()` reads and
+    `store_facts()` writes, against a fixed vocabulary at confidence 0.7, and now they are
+    the only ones it writes.
+
+    The turn is stored whole. Only the claim about who said it changed, so recall still has
+    the narrative and `memory_why` still has something to show.
 
     Failure is not reported to the user. The claims are the load-bearing half; a missing
     episode degrades recall rather than breaking it, and a second red line in the terminal
@@ -303,7 +320,8 @@ def _keep_turn(store: object, turn: str, cwd: str) -> "tuple[bool, list[str]]":
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     project = project_subject(cwd or None)
     try:
-        receipt = add(f"[session turn · project {project} · {stamp}]\n{turn}", role="user")
+        receipt = add(f"[session turn · project {project} · {stamp}]\n{turn}",
+                      role=EPISODE_ROLE)
         return True, turn_ids(receipt)
     except Exception:
         return False, []
