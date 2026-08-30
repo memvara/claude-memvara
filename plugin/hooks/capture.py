@@ -247,12 +247,7 @@ def main() -> int:
         log(f"turn={len(turn)}c skipped={why}")
         return 0
 
-    # `recalls=False`: this hook only ever writes, and it is the sole caller that wants
-    # the library handle on a hosted install. `store_facts` attaches the turn as
-    # `sources=[Episode]` in the same transaction as the claim, which `RemoteMemvara`
-    # takes and `lib.hosted` cannot until the server renders episode ids -- so asking for
-    # a recalling handle here would store every captured fact unlinked, and say `stored`.
-    store, close = open_writer(recalls=False)
+    store, close = open_writer()
     if store is None:
         log(f"turn={len(turn)}c stored=0 failed=no store or login")
         return 0

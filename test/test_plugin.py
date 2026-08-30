@@ -2956,57 +2956,49 @@ class StoreRoute(unittest.TestCase):
                          "and so must the header, which lib.hosted renders itself")
 
 
-    def test_a_writer_still_gets_the_library_handle(self) -> None:
-        """The half the first attempt at this fix broke, and broke silently.
+    def test_the_reader_and_the_writer_get_the_same_hosted_client(self) -> None:
+        """One client, asserted as sameness rather than as an absence.
 
-        `capture.py` is the only caller that purely writes, and it is the only one that
-        wants a `RemoteMemvara` on a hosted install: `store_facts` attaches the turn as
-        `sources=[Episode]` in the same transaction as the claim, which that client takes
-        (`remember(..., sources=...)` in `memvara/remote/api.py`) and `lib.hosted` cannot
-        until the server renders episode ids. Routing the writer to `lib.hosted` as well
-        stored every captured fact unlinked while `capture.log` went on reporting
-        `stored=N` -- no exception, no banner, and `memory_why` answering nothing about
-        any of them a session later.
-        """
-        built = object()
-        with self._library("cloud", built), self._env(MEMVARA_MODE="cloud"):
-            self.assertIs(
-                self._opener().open_store(recalls=False), built,
-                "a write-only caller must keep the library handle, sources= and all")
+        The point of dropping `recalls` is not that a flag went away, it is that a hosted
+        deployment now has exactly one backend for both directions. memvara/memvara#76 put
+        `sources=` on the MCP surface, so `lib.hosted` carries the turn a fact came from
+        and the library's remote client has nothing left here to be better at -- measured
+        against the live endpoint, not assumed: `memory_remember` reports
+        `accepts("sources") is True`, an `add` receipt renders `turn id(s): ep_...`, and
+        `memory_why` on a claim written that way resolves to the turn.
 
-    def test_the_writer_route_reports_itself_as_local(self) -> None:
-        """`open_writer`'s second slot is what `capture.py` derives `hosted` from.
-
-        `store_facts(hosted=...)` picks the `sources=` branch off it, so a `close` that
-        is not None here is the same outage as the wrong handle, reached one step later.
+        Spelled as "both routes land on the same object" on purpose. A guard spelled
+        "nothing imports RemoteMemvara" is satisfied by a file that has stopped importing
+        anything at all, which is the shape this repository keeps having to relearn.
         """
         sys.path.insert(0, str(HOOKS))
         try:
             from lib import write as write_mod
+            import lib.hosted as hosted_mod
         finally:
             sys.path.pop(0)
+
+        class Client:
+            def close(self) -> None:
+                pass
+
+        client = Client()
         built = object()
-        with self._library("cloud", built), self._env(MEMVARA_MODE="cloud"):
-            store, close = write_mod.open_writer(recalls=False)
-        self.assertIs(store, built)
-        self.assertIsNone(close, "capture.py reads `hosted = close is not None`, and a "
-                                 "library handle is not hosted")
+        was, hosted_mod.open_hosted = hosted_mod.open_hosted, lambda: client
+        try:
+            with self._library("cloud", built), self._env(MEMVARA_MODE="cloud"):
+                self.assertIsNone(
+                    self._opener().open_store(),
+                    "the reader must not get the library's remote client")
+                store, close = write_mod.open_writer()
+        finally:
+            hosted_mod.open_hosted = was
 
-    def test_capture_asks_for_the_writer_route(self) -> None:
-        """The default is the dangerous direction, so the one caller that needs the other
-        one is pinned here.
-
-        `recalls` defaults to True because every other caller reads, which means a writer
-        that simply forgets the argument is demoted in silence -- the exact failure this
-        parameter was added to end, reintroduced by omission. Asserted against `capture.py`
-        itself rather than a list of callers kept somewhere else: a list is a thing that
-        stops covering a file without anyone noticing.
-        """
-        source = (HOOKS / "capture.py").read_text(encoding="utf-8")
-        self.assertIn(
-            "open_writer(recalls=False)", source,
-            "capture.py must ask for the write-capable handle: without it every fact it "
-            "stores loses the turn it came from, and nothing says so")
+        self.assertIs(store, client,
+                      "and the writer must land on that same hosted client")
+        self.assertIsNotNone(
+            close, "which capture.py reads as hosted=True -- the branch that cites the "
+                   "episode ids the receipt rendered")
 
 
 class SpeakerBlocks(unittest.TestCase):
@@ -3429,7 +3421,12 @@ class TurnCitation(unittest.TestCase):
         self.assertEqual(seen.get("sources"), ["ep_a1b2c3d4e5f6"])
 
     def test_no_ids_means_the_write_still_happens(self) -> None:
-        """On today's endpoint there are no ids, and a fact must still be stored."""
+        """An older server renders no ids, and a fact must still be stored.
+
+        This was "today's endpoint" until memvara/memvara#76 shipped there. The branch it
+        guards is still live -- a server behind that change answers `accepts` False -- so
+        the test stays and only the claim about which servers those are has changed.
+        """
         seen = {}
 
         class Server:

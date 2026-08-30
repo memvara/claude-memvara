@@ -44,21 +44,18 @@ def log(line: str) -> None:
         pass
 
 
-def open_writer(*, recalls: bool = True) -> "tuple[Any, Any] | tuple[None, None]":
+def open_writer() -> "tuple[Any, Any] | tuple[None, None]":
     """`(store, close)` for whichever backend answers, or `(None, None)`.
 
-    `close` is None for a library handle, which has no connection to give back, and the
+    `close` is None for a local engine, which has no connection to give back, and the
     hosted client's `close` otherwise. Callers close after their last write and not
     before: the hosted client connects lazily, so an early return costs nothing.
 
-    `recalls` is passed straight through to `open_store`, and the default is the careful
-    one. Leave it alone unless this handle is *only* written to: `capture.py` is the one
-    caller that qualifies, and the one that needs `sources=`. Everything else here reads
-    -- `session_start` and `recall`'s standing refresh both call `recall()` on what they
-    get back, and handing either a `RemoteMemvara` is the outage this parameter exists
-    downstream of.
+    Every caller gets the same backend again. For one release readers and writers wanted
+    different ones, because the MCP surface could not carry `sources=`; memvara#76 shipped
+    and the fork closed.
     """
-    store = open_store(recalls=recalls)
+    store = open_store()
     if store is not None:
         return store, None
 
@@ -85,9 +82,11 @@ def turn_ids(receipt: object) -> "list[str]":
     the hosted client returns the server's rendered text and the ids are the only route
     from a stored turn back to a claim that came out of it.
 
-    Empty is the ordinary answer on today's endpoint. memvara/memvara#76 is what renders
-    the line at all and is unreleased, so until it ships this finds nothing and every
-    caller carries on writing facts without sources -- which is exactly what happens now.
+    Empty was the ordinary answer until memvara/memvara#76, which renders the line at all.
+    It has shipped to the hosted endpoint: an `add` there now returns
+    `turn id(s): ep_... — pass these to memory_remember.sources`, and a claim written from
+    them resolves under `memory_why`. Still empty against an older server, which is why
+    `store_facts` treats no ids as a reason to write the fact anyway rather than a failure.
     """
     return _TURN_ID.findall(receipt) if isinstance(receipt, str) else []
 
@@ -115,10 +114,12 @@ def store_facts(store: Any, facts: Iterable[Any], turn: str = "",
     reports. A hook mining a transcript is not that, and an audit that cannot tell the two
     apart cannot review either.
 
-    `sources` is library-only. The hosted `memory_remember` tool does not take it and its
-    schema is closed, so sending one is a hard rejection rather than a silent ignore; on a
-    hosted install `capture.py` stores the turn as its own episode instead — searchable, if
-    not linked. `memory_type` both routes take.
+    `sources` was library-only, and is not any more: memvara/memvara#76 put it on the
+    hosted `memory_remember` too, so both routes link a fact to the turn it came from —
+    the local one by passing a real `Episode`, the hosted one by citing the ids the receipt
+    rendered. The schema is still closed, so an argument an older server has not heard of
+    is a hard rejection rather than a silent ignore, which is why the hosted branch asks
+    `accepts` first. `memory_type` both routes take.
 
     `extractor` now goes over both, and the hosted client asks the server whether it takes
     the argument rather than assuming it does, because a server older than the argument
