@@ -7,6 +7,18 @@ on:
     branches: [main]
   workflow_dispatch:
   workflow_call:
+    inputs:
+      check_skill_freshness:
+        description: >
+          Whether to check the vendored skill against the library's CURRENT default
+          branch. True everywhere except the release gate. Freshness is a fact about
+          the world right now, not about the commit under test, so re-running the
+          suite at a frozen commit asks a question that commit cannot answer -- and
+          once the library's skill moves, every past tag's run fails forever. Turning
+          it off for tags keeps release runs reproducible; PRs, pushes to main and the
+          nightly skill-sync all still ask.
+        type: boolean
+        default: true
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -51,4 +63,7 @@ jobs:
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
           MEMVARA_LIBRARY: ${{ github.workspace }}/_library
+          # Only ever "true" when a caller passed the input as false. `inputs` is empty
+          # for pull_request and push, so those resolve to "false" and keep checking.
+          MEMVARA_SKIP_FRESHNESS: ${{ inputs.check_skill_freshness == false }}
         run: python3 -m unittest discover -s test -v

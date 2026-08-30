@@ -11,6 +11,14 @@ permissions:
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml
+    # The whole suite still runs -- a tag must not skip it -- minus the one check that
+    # asks about the world rather than about this commit. v0.2.5 is why: tagged a day
+    # late, its run re-checked a day-old tree against today's library and could never
+    # pass, so the release job never produced its plugin.zip. That would eventually hit
+    # every tag here, since re-running any past release fails the moment the library's
+    # skill moves.
+    with:
+      check_skill_freshness: false
 
   release:
     needs: ci

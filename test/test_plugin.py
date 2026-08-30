@@ -301,6 +301,45 @@ class SkillTree(unittest.TestCase):
             self.assertEqual(got, expected, f"{rel} drifted from {sha}")
 
 
+    def test_only_the_release_gate_may_switch_freshness_off(self) -> None:
+        """The escape hatch, pinned to its one caller and its one direction.
+
+        `MEMVARA_SKIP_FRESHNESS` turns off the only check in this suite that can fail on
+        a commit that was perfectly good when it was written. That makes it exactly the
+        kind of flag that spreads: a red run, a plausible reason, and one more workflow
+        quietly opting out until the vendored skill is frozen again and nothing says so.
+
+        So both halves are asserted, and the second is the one that matters. The default
+        must be ON -- a `default: false` would disable freshness for every caller while
+        every one of these strings still appeared in the file -- and `release.yml` must
+        be the ONLY workflow that passes it off. A new workflow copying that line fails
+        here rather than silently joining the exemption.
+        """
+        workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+        self.assertTrue(workflows, "no workflows found — this guard would pass on an "
+                                   "empty directory, which is the shape it exists to stop")
+
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("check_skill_freshness:", ci,
+                      "ci.yml must declare the input the release gate passes")
+        self.assertIn("default: true", ci,
+                      "the default must be ON: a default of false disables freshness "
+                      "everywhere while leaving every mention of it in place")
+
+        opted_out = {path.name for path in workflows
+                     if "check_skill_freshness: false" in path.read_text(encoding="utf-8")}
+        self.assertEqual(
+            opted_out, {"release.yml"},
+            "release.yml is the only workflow allowed to switch freshness off — it is "
+            "the only one that re-runs the suite at a commit that is not current")
+
+        setters = {path.name for path in workflows
+                   if "MEMVARA_SKIP_FRESHNESS" in path.read_text(encoding="utf-8")}
+        self.assertEqual(
+            setters, {"ci.yml"},
+            "only ci.yml may set MEMVARA_SKIP_FRESHNESS, and only from that input — a "
+            "workflow exporting it directly bypasses the input and this guard with it")
+
     def test_the_vendored_skill_is_not_behind_the_library(self) -> None:
         """The whole tree, against the library's CURRENT default branch.
 
@@ -321,6 +360,22 @@ class SkillTree(unittest.TestCase):
         visible in the run output; a pass is not, and a check that silently succeeds when
         it could not look is the failure it exists to prevent, one level up.
         """
+        if os.environ.get("MEMVARA_SKIP_FRESHNESS") == "true":
+            # Set only by the release gate, which re-runs this suite at a frozen tag.
+            # Freshness is a fact about the world now, not about that commit: a tag cut
+            # today passes and the same tag re-run after the library's skill moves fails,
+            # having changed nothing. v0.2.5 hit the sharp end -- tagged a day late, its
+            # release run could never go green, so the release job never built its
+            # plugin.zip and the artifact had to be attached by hand.
+            #
+            # Skipping here does not stop anything being checked. PRs and pushes to main
+            # both run with this unset, and `skill-sync.yml` asks nightly. What is given
+            # up is only the second answer to a question already answered on main minutes
+            # earlier, by a run whose commit was actually the current one.
+            raise unittest.SkipTest(
+                "freshness not re-checked in the release gate: it is a property of the "
+                "library right now, not of the tagged commit (MEMVARA_SKIP_FRESHNESS)")
+
         try:
             head = _library_head()
             upstream = _library_skill_files(head)
