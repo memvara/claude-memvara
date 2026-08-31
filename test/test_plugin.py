@@ -785,6 +785,41 @@ class Hooks(unittest.TestCase):
             set(body["hooks"]),
         )
 
+    def test_a_half_copied_tree_still_cannot_fail_a_prompt(self) -> None:
+        """The entry point exits 0 even when the tree it dispatches into is broken.
+
+        `run.py` logs through `lib.ipc`, imported at call time, on three paths outside its
+        try and once inside the handler that exists so a body's failure cannot reach the
+        client. With `lib/ipc.py` absent -- an interrupted vendor, a sync that stopped
+        between files -- the logging raised and the handler raised with it, so a hook
+        whose whole contract is "never fail a prompt" exited 1 with a traceback. Under
+        Claude Code a non-zero UserPromptSubmit hook blocks the turn, so the failure was
+        not a missing memory but a stopped conversation.
+
+        Both invocations are checked because they fail through different paths: the first
+        never reaches the try, the second dies inside the handler.
+        """
+        import shutil
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as scratch:
+            tree = pathlib.Path(scratch) / "hooks"
+            shutil.copytree(HOOKS, tree)
+            (tree / "lib" / "ipc.py").unlink()
+            for argv, why in ((["bogus", "--host", "claude"], "before the try"),
+                              (["recall", "--host", "claude"], "inside the handler")):
+                with self.subTest(path=why):
+                    done = subprocess.run(
+                        ["python3", str(tree / "run.py"), *argv],
+                        input='{"prompt":"hi","session_id":"s","cwd":"/tmp"}',
+                        capture_output=True, text=True, env=self.BARREN, timeout=60)
+                    self.assertEqual(
+                        done.returncode, 0,
+                        f"run.py exited {done.returncode} {why}; a non-zero hook blocks "
+                        f"the turn: {done.stderr[:300]}")
+                    self.assertNotIn("Traceback", done.stderr)
+
     def test_hooks_succeed_with_nothing_configured(self) -> None:
         """No store, no login, no transcript: exit 0 and never a traceback.
 
