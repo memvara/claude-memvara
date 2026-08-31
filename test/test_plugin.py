@@ -6179,3 +6179,483 @@ class CredentialProbe(unittest.TestCase):
         self.assertEqual(
             len({from_env["source"], from_file["source"], from_host["source"]}), 3,
             "three sources that report the same string answer nobody's question")
+
+
+#: `POST /api/auth/device/authorize` on the live endpoint, 2026-08-31. The opaque halves
+#: are the only edit: the recorded `device_code` was a real secret and is replaced with a
+#: string of the same shape, chosen to be distinctive enough that a scan for it means
+#: something.
+_AUTHORIZE = "/api/auth/device/authorize"
+_TOKEN = "/api/auth/device/token"
+_DEVICE_AUTHORIZED = {
+    "device_code": "dev_2f1c9b8a7e6d5c4b3a29180706f5e4d3",
+    "user_code": "AGKP-V5HT",
+    "verification_uri": "https://app.memvara.dev/device",
+    "verification_uri_complete": "https://app.memvara.dev/device?code=AGKP-V5HT",
+    "expires_in": 900,
+    "interval": 5,
+}
+
+#: `POST /api/auth/device/token` is the one route on that surface that does NOT use the
+#: `{"error": {"code", "message", "detail"}}` envelope: RFC 8628 §3.5 fixes the shape a
+#: device-flow client parses, and the API answers the RFC's shape rather than its own.
+#: Four outcomes, all at HTTP 400, and `approved` at 200 in the ordinary envelope.
+_TOKEN_PENDING = (400, {"error": "authorization_pending"})
+_TOKEN_SLOW_DOWN = (400, {"error": "slow_down"})
+_TOKEN_DENIED = (400, {"error": "access_denied"})
+_TOKEN_APPROVED = (200, {"status": "approved", "api_key": "mv_recorded_plaintext",
+                         "privilege": "write", "project": "recorded-project"})
+
+#: Measured against `https://app.memvara.dev`, 2026-08-31, with `curl`. Both are the
+#: object envelope -- only the token route breaks it -- and the two statuses are
+#: different, which the plan this task came from did not say.
+#:
+#: A slug is refused by the route itself:
+_AUTHORIZE_SLUG_REFUSED = (400, {"error": {
+    "code": "bad_request",
+    "message": "project must be a project id (uuid). A slug cannot be resolved here: "
+               "this route has no session, and a slug is only unique within one "
+               "organization.",
+    "detail": None}})
+#: ...and a request naming no project at all is refused by the schema, before the route
+#: runs, because `project` is still a required field on a deployment that has not taken
+#: the change letting the approver choose. **422, not 400.**
+_AUTHORIZE_NO_PROJECT_REFUSED = (422, {"error": {
+    "code": "invalid_request",
+    "message": "the request path, body or query string does not match the schema. "
+               "`detail.problems[].loc` names which of the three, and where in it",
+    "detail": {"problems": [{"type": "missing", "loc": ["body", "project"],
+                             "msg": "Field required", "input": {}}]}}})
+
+#: A project id as the console shows it. Written out rather than generated: the whole
+#: point of the argument check is that this exact shape is the only one accepted.
+_PROJECT_ID = "3c04449a-3d99-4c0e-9f0a-1b2c3d4e5f60"
+
+
+class DeviceFlow(unittest.TestCase):
+    """RFC 8628 from the plugin, with no browser, no CLI and nothing from PyPI.
+
+    Every expected value here is written out in this file rather than read from the
+    module under test. A guard that asks the implementation what to expect shrinks
+    exactly when the implementation shrinks, and passes under the sabotage it was written
+    to catch -- which happened on this programme on 2026-08-30.
+    """
+
+    def setUp(self) -> None:
+        self._env = {name: os.environ.get(name) for name in
+                     ("HOME", "MEMVARA_API_KEY", "MEMVARA_SERVER_URL")}
+        self._home = tempfile.mkdtemp(prefix="memvara-device-home-")
+        os.environ["HOME"] = self._home
+        os.environ.pop("MEMVARA_API_KEY", None)
+        os.environ.pop("MEMVARA_SERVER_URL", None)
+        self.calls: "list[tuple[str, str, object, str | None]]" = []
+        self.slept: "list[float]" = []
+        self.opened: "list[str]" = []
+
+    def tearDown(self) -> None:
+        for name, value in self._env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        shutil.rmtree(self._home, ignore_errors=True)
+
+    @property
+    def home(self) -> pathlib.Path:
+        return pathlib.Path(self._home)
+
+    def _auth(self):
+        """The module, with its clock and its browser replaced.
+
+        Both replacements are safety, not convenience. A real `time.sleep` would make a
+        poll test wait the interval the server asks for, five seconds at a time; a real
+        `webbrowser.open` would open a browser window on whoever ran the suite.
+        """
+        sys.path.insert(0, str(PLUGIN))
+        try:
+            import importlib
+
+            module = importlib.import_module("auth.memvara_auth")
+        finally:
+            sys.path.pop(0)
+        self.addCleanup(module.close)
+
+        clock = {"now": 0.0}
+
+        def _sleep(seconds):
+            self.slept.append(float(seconds))
+            clock["now"] += float(seconds)
+            # A poll loop with no deadline does not fail this suite, it hangs it -- which
+            # is how a broken bound reaches CI as a stuck job rather than a red one.
+            # Measured: sabotaging the deadline away wedged the runner for ten minutes.
+            # An hour of simulated time is four times the ceiling any grant may have.
+            if clock["now"] > 3600.0:
+                raise AssertionError(
+                    "the poll loop passed an hour of simulated time without stopping; "
+                    "it has no working bound")
+
+        self.addCleanup(setattr, module, "time", module.time)
+        module.time = types.SimpleNamespace(sleep=_sleep,
+                                            monotonic=lambda: clock["now"])
+        self.addCleanup(setattr, module, "webbrowser", module.webbrowser)
+        module.webbrowser = types.SimpleNamespace(open=self.opened.append)
+        return module
+
+    def _replies(self, module, script) -> None:
+        """Replace the one network primitive with recorded replies, keyed by path.
+
+        A value may be one `(status, body)` pair, a list of them consumed in order with
+        the last repeating, or an exception to raise. A path the script does not name
+        fails the test by name rather than by `KeyError`: "the flow called something it
+        should not have" is the finding, and it should read like one.
+        """
+        original = module.request
+        self.addCleanup(setattr, module, "request", original)
+        queues = {path: (list(reply) if isinstance(reply, list) else [reply])
+                  for path, reply in script.items()}
+        calls = self.calls
+
+        def fake(method, path, *, body=None, auth=None, timeout=10.0):
+            calls.append((method, path, body, auth))
+            if path not in queues:
+                raise AssertionError(
+                    f"the flow called {method} {path}, which this test did not expect it "
+                    "to call at all")
+            queue = queues[path]
+            reply = queue[0] if len(queue) == 1 else queue.pop(0)
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+
+        module.request = fake
+
+    def _files_written(self) -> "list[str]":
+        return sorted(str(path.relative_to(self.home))
+                      for path in self.home.rglob("*") if path.is_file())
+
+    def test_the_device_code_never_reaches_stdout_or_a_log(self) -> None:
+        """`device_code` is the one secret this flow's unauthenticated half ever holds,
+        and the API returns it exactly once. `user_code` is the half meant for a human:
+        it is shown, typed, and pre-filled into a URL on purpose.
+
+        Both halves are asserted. A test that only checks the secret is absent passes on
+        a flow that prints nothing at all -- and a device flow that prints nothing is
+        unusable on the headless machine it exists for, so silence must fail here too.
+
+        Every byte the run emitted is scanned: standard output, the URL handed to the
+        browser, and every file left under `$HOME` afterwards.
+        """
+        module = self._auth()
+        secret = _DEVICE_AUTHORIZED["device_code"]
+        out = io.StringIO()
+        self._replies(module, {_AUTHORIZE: (201, _DEVICE_AUTHORIZED),
+                               _TOKEN: [_TOKEN_PENDING, _TOKEN_APPROVED]})
+
+        self.assertEqual(module.authenticate(out=out), 0,
+                         "an approved grant is a successful login")
+
+        printed = out.getvalue()
+        self.assertNotIn(secret, printed, "the device code was printed to the terminal")
+        self.assertIn("AGKP-V5HT", printed,
+                      "the user code is what the person at the keyboard needs, and a "
+                      "flow that does not show it cannot be completed by hand")
+        self.assertIn("https://app.memvara.dev/device?code=AGKP-V5HT", printed,
+                      "the verification URI must be printed as well as opened -- a "
+                      "headless machine has no browser to open it in")
+
+        self.assertEqual(self.opened,
+                         ["https://app.memvara.dev/device?code=AGKP-V5HT"],
+                         "the browser is handed the verification URI, and only that")
+        for url in self.opened:
+            self.assertNotIn(secret, url)
+
+        self.assertEqual(self._files_written(), [".memvara/credentials.json"],
+                         "this flow writes exactly one file and leaves no temporary "
+                         "behind; anything else here is a second writer or a leak")
+        written = (self.home / ".memvara" / "credentials.json")
+        text = written.read_text(encoding="utf-8")
+        self.assertNotIn(secret, text, "the device code was written to disk")
+        self.assertIn("mv_recorded_plaintext", text,
+                      "the minted key is the thing this file exists to hold")
+        self.assertEqual(oct(written.stat().st_mode & 0o777), "0o600",
+                         "a credential readable by anyone on the machine is a credential "
+                         "shared with everyone on it")
+
+    def test_a_slow_down_response_widens_the_interval(self) -> None:
+        """RFC 8628 §3.5: `slow_down` means wait longer, by at least five seconds, and
+        keep waiting longer. A client that treats it as one more `authorization_pending`
+        polls at the same rate into a bucket that is already refusing it, and the flow
+        never completes for a reason the user cannot see.
+
+        The interval the server names is honoured too, and is checked with a grant whose
+        interval is *not* the default -- otherwise an implementation that ignores the
+        field entirely and hard-codes five seconds passes.
+        """
+        module = self._auth()
+        self._replies(module, {_TOKEN: [_TOKEN_PENDING, _TOKEN_PENDING, _TOKEN_SLOW_DOWN,
+                                        _TOKEN_PENDING, _TOKEN_APPROVED]})
+
+        minted = module.poll(_DEVICE_AUTHORIZED)
+        self.assertEqual(minted["api_key"], "mv_recorded_plaintext")
+
+        self.assertEqual(len(self.slept), 5,
+                         f"one wait per poll, five polls: {self.slept}")
+        self.assertEqual(self.slept[:3], [5.0, 5.0, 5.0],
+                         "the grant asked for five seconds and was answered normally "
+                         "three times")
+        self.assertGreaterEqual(
+            self.slept[3], self.slept[2] + 5.0,
+            "RFC 8628 §3.5 widens the interval by at least five seconds on slow_down; "
+            f"this client went from {self.slept[2]} to {self.slept[3]}")
+        self.assertEqual(self.slept[4], self.slept[3],
+                         "the widened interval is the new interval, not a single longer "
+                         "wait that then springs back")
+
+        self.slept.clear()
+        self.calls.clear()
+        self._replies(module, {_TOKEN: [_TOKEN_PENDING, _TOKEN_APPROVED]})
+        module.poll(dict(_DEVICE_AUTHORIZED, interval=7))
+        self.assertEqual(self.slept, [7.0, 7.0],
+                         "the server names the interval and this client waited "
+                         f"{self.slept} instead")
+
+    def test_a_poll_that_nobody_approves_stops_rather_than_running_forever(self) -> None:
+        """A grant has a life and the loop must not outlast it. Two bounds, because
+        either alone leaves a hole: the grant's own `expires_in`, and a ceiling of 900
+        seconds for a deployment that answers with a life longer than any human will wait
+        at a terminal.
+
+        A denial stops immediately and says so, rather than being retried until the
+        deadline -- `access_denied` is a one-way door on the server, so polling it again
+        can only ever produce the same word.
+        """
+        module = self._auth()
+
+        self._replies(module, {_TOKEN: _TOKEN_PENDING})
+        with self.assertRaises(module.AuthError) as short:
+            module.poll(dict(_DEVICE_AUTHORIZED, expires_in=30))
+        self.assertLessEqual(sum(self.slept), 35.0,
+                             f"a 30-second grant polled for {sum(self.slept)} seconds")
+        self.assertTrue(str(short.exception).strip(), "a timeout owes the user a sentence")
+
+        self.slept.clear()
+        self._replies(module, {_TOKEN: _TOKEN_PENDING})
+        with self.assertRaises(module.AuthError):
+            module.poll(dict(_DEVICE_AUTHORIZED, expires_in=999999))
+        self.assertLessEqual(sum(self.slept), 905.0,
+                             "a deployment naming an absurd lifetime must not hold the "
+                             f"terminal for {sum(self.slept)} seconds")
+
+        self.slept.clear()
+        self.calls.clear()
+        self._replies(module, {_TOKEN: [_TOKEN_PENDING, _TOKEN_DENIED, _TOKEN_APPROVED]})
+        with self.assertRaises(module.AuthError) as denied:
+            module.poll(_DEVICE_AUTHORIZED)
+        self.assertEqual(len(self.calls), 2,
+                         "a denied grant was polled again after being denied")
+        self.assertIn("deni", str(denied.exception).lower(),
+                      "a denial must say it was denied, not time out silently: "
+                      f"{denied.exception}")
+
+    def test_the_flow_imports_nothing_outside_the_standard_library(self) -> None:
+        """The plugin installs with no pip step and must keep doing so. `certifi` is the
+        one exception and is optional: python.org's macOS build loads no roots at all, so
+        `certifi` is used when it is importable and the default context otherwise --
+        which means its import has to live inside a `try`, or the module it rescues stops
+        importing on every machine that lacks it.
+
+        Asked of the import graph rather than of the text. A substring scan for a package
+        name matches this module's own prose explaining why it does not use that package,
+        which is the first thing the file does; that mistake was made once already on
+        this programme, on 2026-08-30.
+
+        Both halves. The set of non-stdlib imports being empty is satisfied by a file
+        with no imports in it at all, so the modules this flow actually needs are named
+        and required to be present.
+        """
+        tree = ast.parse((AUTH / "memvara_auth.py").read_text(encoding="utf-8"))
+        imported: "set[str]" = set()
+        guarded: "set[str]" = set()
+
+        def _names(node) -> "set[str]":
+            if isinstance(node, ast.Import):
+                return {alias.name for alias in node.names}
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                return {node.module}
+            return set()
+
+        for node in ast.walk(tree):
+            imported |= _names(node)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Try):
+                for inner in ast.walk(node):
+                    if inner is not node:
+                        guarded |= _names(inner)
+
+        roots = {name.split(".")[0] for name in imported}
+        outside = roots - set(sys.stdlib_module_names) - {"certifi"}
+        self.assertEqual(
+            outside, set(),
+            f"this module must import nothing but the standard library: {sorted(outside)}")
+
+        for needed in ("http.client", "json", "os", "ssl", "tempfile", "time",
+                       "webbrowser"):
+            self.assertIn(needed, imported,
+                          f"{needed} is what this flow runs on; a file that has stopped "
+                          "importing it has stopped doing the thing it is imported for")
+        self.assertNotIn("urllib.request", imported,
+                         "urlopen cannot hold a connection open, and this flow makes one "
+                         "call every five seconds for up to fifteen minutes")
+
+        self.assertIn("certifi", roots,
+                      "certifi is what makes verification work on python.org's macOS "
+                      "build, where the default context loads zero roots")
+        self.assertIn("certifi", {name.split(".")[0] for name in guarded},
+                      "certifi is imported outside a try, so this module now stops "
+                      "importing on any machine that does not have it -- which is every "
+                      "machine that installed this plugin without a pip step")
+
+    def test_an_undeployed_deployment_names_the_project_id_form(self) -> None:
+        """A deployment that has not taken the change letting the approver choose the
+        project refuses a request that names none. It does so two different ways --
+        measured live, 2026-08-31 -- and the command has to survive both:
+
+            400  the route's own refusal, `project must be a project id (uuid)`
+            422  the schema's, because `project` is still a required field
+
+        Either way the user needs the same sentence, and it has to name the form that
+        works today rather than quoting a validation error at them. This check is
+        permanent, not scaffolding: a self-hosted deployment can lag the console forever.
+
+        The last third is the half that keeps the message honest -- an unrelated refusal
+        must NOT claim the project-id form fixes it, or the advice is noise on every
+        outage.
+        """
+        module = self._auth()
+        for label, reply in (("422 from the schema", _AUTHORIZE_NO_PROJECT_REFUSED),
+                             ("400 from the route", _AUTHORIZE_SLUG_REFUSED)):
+            with self.subTest(refusal=label):
+                out = io.StringIO()
+                self._replies(module, {_AUTHORIZE: reply})
+                code = module.authenticate(out=out)
+                text = out.getvalue()
+                self.assertNotEqual(code, 0, "a refused login is not a successful one")
+                self.assertIn("/memvara authenticate <project-id>", text,
+                              f"a {label} left the user with nothing to do next: {text}")
+                self.assertNotIn("Traceback", text)
+                self.assertEqual(self._files_written(), [],
+                                 "a login that never happened wrote something")
+
+        out = io.StringIO()
+        self._replies(module, {_AUTHORIZE: (503, {"error": {
+            "code": "unavailable", "message": "the store is not accepting writes"}})})
+        self.assertNotEqual(module.authenticate(out=out), 0)
+        self.assertNotIn("<project-id>", out.getvalue(),
+                         "a deployment that is merely down was told to name a project "
+                         "id, which will not help and will be tried anyway")
+
+    def test_a_project_argument_must_be_a_dashed_uuid(self) -> None:
+        """The endpoint refuses anything else with a 400 whose text a user cannot act on,
+        so the refusal happens here, locally, naming the form that works.
+
+        A tenant id -- `prj_` and thirty-two hex characters -- is close enough to a UUID
+        to be pasted by mistake, and reshaping one into a UUID does work. It is refused
+        anyway: guessing at an id format on someone's behalf turns a clear 400 into a
+        credential minted against the wrong project, and that is not an error anyone ever
+        sees.
+
+        The accepted half matters as much: a well-formed id is sent through untouched,
+        because normalising it here would be the same guess in a smaller coat.
+        """
+        module = self._auth()
+        for bad in ("prj_3c04449a3d994c0e9f0a1b2c3d4e5f60",
+                    "3c04449a3d994c0e9f0a1b2c3d4e5f60",
+                    "my-project",
+                    "3c04449a-3d99-4c0e-9f0a-1b2c3d4e5f6",
+                    ""):
+            with self.subTest(project=bad):
+                self.calls = []
+                out = io.StringIO()
+                self._replies(module, {})
+                code = module.authenticate(bad, out=out)
+                text = out.getvalue()
+                self.assertNotEqual(code, 0, f"{bad!r} was accepted as a project id")
+                self.assertEqual(self.calls, [],
+                                 "the argument was sent to the endpoint to be refused "
+                                 "there, which spends a round trip to say the same thing "
+                                 "less clearly")
+                self.assertRegex(
+                    text,
+                    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                    r"-[0-9a-fA-F]{12}",
+                    "the refusal must show the form that works, not merely say no: "
+                    f"{text}")
+                self.assertEqual(self._files_written(), [])
+
+        self.calls = []
+        self._replies(module, {_AUTHORIZE: (201, _DEVICE_AUTHORIZED),
+                               _TOKEN: _TOKEN_APPROVED})
+        self.assertEqual(module.authenticate(_PROJECT_ID, out=io.StringIO()), 0)
+        bodies = [body for _method, path, body, _auth in self.calls if path == _AUTHORIZE]
+        self.assertEqual(bodies, [{"project": _PROJECT_ID}],
+                         "a well-formed project id must reach the endpoint exactly as "
+                         f"the user typed it: {bodies}")
+
+        self.calls = []
+        self._replies(module, {_AUTHORIZE: (201, _DEVICE_AUTHORIZED),
+                               _TOKEN: _TOKEN_APPROVED})
+        self.assertEqual(module.authenticate(out=io.StringIO()), 0)
+        bodies = [body for _method, path, body, _auth in self.calls if path == _AUTHORIZE]
+        self.assertEqual(bodies, [{}],
+                         "with no argument the request must carry no project at all, so "
+                         "the approver is the one who chooses it")
+
+    def test_a_crash_mid_write_cannot_truncate_a_working_credential(self) -> None:
+        """The file being replaced is the only copy of a key the API will never show
+        again. A plain `open(path, "w")` truncates it on the first byte, so a failure
+        anywhere after that leaves the machine holding half a credential and no way back.
+
+        Written to a temporary file and moved into place instead, which the filesystem
+        does atomically: either the old key or the new one, never neither.
+        """
+        module = self._auth()
+        credentials = self.home / ".memvara" / "credentials.json"
+        credentials.parent.mkdir(parents=True, exist_ok=True)
+        credentials.write_text(json.dumps({"api_key": "mv_the_one_that_works"}),
+                               encoding="utf-8")
+        os.chmod(credentials, 0o600)
+
+        def _explode(*_args, **_kwargs):
+            raise RuntimeError("the disk went away mid-write")
+
+        # Replaced on the module rather than in `json` itself, so nothing else running in
+        # this process is affected -- and the failure lands where a real one would, after
+        # the destination has been opened and before anything has been committed to it.
+        real_json = module.json
+        self.addCleanup(setattr, module, "json", real_json)
+        module.json = types.SimpleNamespace(
+            dump=_explode, dumps=json.dumps, load=json.load, loads=json.loads)
+        with self.assertRaises(RuntimeError):
+            module.write_credentials({"api_key": "mv_the_new_one"})
+        module.json = real_json
+
+        # Read as bytes before parsing: a truncated file raises a JSON error, and an
+        # error is a worse finding than a sentence saying the key is gone.
+        survived = credentials.read_text(encoding="utf-8")
+        self.assertTrue(
+            survived.strip(),
+            "the working credential was truncated by a write that then failed, so this "
+            "machine now holds neither the old key nor the new one")
+        self.assertEqual(
+            json.loads(survived)["api_key"], "mv_the_one_that_works",
+            "the working credential was overwritten by a write that then failed")
+        self.assertEqual(self._files_written(), [".memvara/credentials.json"],
+                         "the failed write left a temporary file behind")
+
+        path = module.write_credentials({"api_key": "mv_the_new_one"})
+        self.assertEqual(pathlib.Path(path), credentials)
+        self.assertEqual(
+            json.loads(credentials.read_text(encoding="utf-8"))["api_key"],
+            "mv_the_new_one")
+        self.assertEqual(oct(credentials.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(self._files_written(), [".memvara/credentials.json"])
