@@ -6,7 +6,7 @@ argument-hint: "[project-id]"
 Run this and show the user everything it prints:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/auth/memvara_auth.py" login $ARGUMENTS
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/memory/scripts/memvara_auth.py" login $ARGUMENTS
 ```
 
 Give the Bash call a timeout of 600000ms, for the same reason `/memvara:authenticate` does.
