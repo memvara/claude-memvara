@@ -1,8 +1,14 @@
-"""Turn transcript text into triples using the user's own Claude Code login.
+"""Turn transcript text into triples using a headless CLI the user is already logged into.
 
 The obvious way to extract facts is an API key and a direct call to a model. This
 deliberately does not do that, because the key is a second bill for a model the user is
 already paying for. `claude -p` runs headless against the login they already have.
+
+Which CLI that is, is the host's business rather than this module's. `_chain` tries the
+host's own (`Host.extractor`) and then `claude -p`, and stops -- there is no third rung
+that hands the prose to the server, because `memory_add` on an `MEMVARA_LLM=none`
+deployment accepts it and the model tier stores nothing from it. A fallback that returns
+success and writes nothing is worse than no fallback at all.
 
 What it costs instead is overhead. A headless run boots a whole Claude Code session, so
 roughly 21k tokens of *its* system prompt are read before a word of the transcript is —
@@ -14,9 +20,10 @@ little.
 Two guards matter more than the cost:
 
 * **Recursion.** A `Stop` hook that spawns Claude gives that child a `Stop` hook too. The
-  child is launched with an empty hook set, and the environment sentinel is a second
-  independent stop in case a future client reads hooks from somewhere this does not
-  override.
+  child is launched with an empty hook set -- spelled on the `ExtractorSpec` in
+  `core/host.py` now that the argv is data, not here -- and the environment sentinel is a
+  second independent stop in case a future client reads hooks from somewhere this does
+  not override.
 * **Silence.** Every failure here returns no facts, which is right: a capture that cannot
   run must not fabricate one. It used to mean the failure itself went unseen too, and that
   half is a defect rather than a design -- see `_fail` below.
@@ -32,6 +39,8 @@ import unicodedata
 
 from typing import NamedTuple, Sequence
 
+from core.host import CLAUDE_CLI, CLAUDE_MODEL, ExtractorSpec, active
+
 from .ipc import CAPTURE_SENTINEL, clear_capture_alert, raise_capture_alert
 from .transcript import user_lines
 from .usage import record_extraction
@@ -46,8 +55,15 @@ from .write import log
 #: path that runs on every prompt. One string, one definition, two import costs.
 SENTINEL = CAPTURE_SENTINEL
 
-#: Cheapest model that reliably returns well-formed triples for this job.
-MODEL = "claude-haiku-4-5-20251001"
+#: Cheapest model that reliably returns well-formed triples for this job, and the label
+#: `usage.jsonl` records a run under.
+#:
+#: Read off `CLAUDE_CLI` rather than spelled again here: the same string is an argument in
+#: that record's argv, and a ledger naming a model the run never invoked is wrong in the
+#: one file whose whole job is to say what was spent. It stays the Claude label even when
+#: another rung answers -- the ledger has no field for a per-rung model, and inventing one
+#: would change what `record_extraction` means for every row already written.
+MODEL = CLAUDE_MODEL
 
 #: Generous: the measured call was 12.2s, and a batched span is larger. The `Stop` hook
 #: entry in hooks.json must allow more than this or the kill lands in the wrong place.
@@ -313,7 +329,8 @@ def _decode(stdout: str) -> "dict | None":
     return body if isinstance(body, dict) else None
 
 
-def _reason(proc: "subprocess.CompletedProcess", body: "dict | None") -> str:
+def _reason(proc: "subprocess.CompletedProcess", body: "dict | None",
+            spec: "ExtractorSpec") -> str:
     """Why a run failed, in the words the CLI used.
 
     The reason is in **stdout**, and it is there even when the process exits non-zero: an
@@ -329,7 +346,7 @@ def _reason(proc: "subprocess.CompletedProcess", body: "dict | None") -> str:
     same reason, and so could not contradict it either.
     """
     if isinstance(body, dict):
-        said = str(body.get("result") or "").strip()
+        said = str(body.get(spec.reply_key) or "").strip()
         if said:
             return said[:REASON_CHARS]
     lines = (proc.stderr or "").strip().splitlines()
@@ -356,50 +373,48 @@ def _fail(log_line: str, reason: str) -> None:
     raise_capture_alert(reason)
 
 
-def _payload(text: str, prompt: str) -> "tuple[str, dict]":
-    """The model's reply and what it cost, or `('', {})` if the run failed.
+def _chain() -> "list[ExtractorSpec]":
+    """The CLIs to try, in order: this host's own, then `claude -p`.
 
-    Cost is returned rather than discarded because here is the only place it exists.
-    `--output-format json` puts usage on the envelope beside `result`; reading `result`
-    alone, as this first did, throws the token counts away with the process.
+    Two rungs rather than one because the host that packages these hooks is no longer
+    necessarily the host that can mine a turn. A Codex or Cursor user may have their own
+    headless CLI, may have Claude Code installed beside it, or may have neither, and the
+    three cases are genuinely different answers rather than three spellings of "broken".
+
+    There is deliberately no third rung that hands the prose to the server. `memory_add`
+    would accept it and the model tier would store nothing from it on an
+    `MEMVARA_LLM=none` deployment -- a fallback that looks like it worked, writes nothing,
+    and logs a success, which is the exact shape of every defect in this repository's
+    history. Better to have no extractor and say so.
+
+    Deduplicated on the program name, not on the whole argv: on Claude Code both rungs are
+    the same CLI, and trying it twice would double a 12-14s job and log the same failure
+    two ways. `argv[0]` rather than the tuple because two records naming `claude` with
+    different flags are still one thing that is either installed or not.
     """
-    if os.environ.get(SENTINEL):
-        return "", {}
+    chain: "list[ExtractorSpec]" = []
+    for spec in (active().extractor, CLAUDE_CLI):
+        if spec is None or not spec.argv:
+            # `extractor = None` is a host that declares it has no CLI of its own. An
+            # absent rung, not a broken one -- the loop simply moves to the next.
+            continue
+        if any(other.argv[0] == spec.argv[0] for other in chain):
+            continue
+        chain.append(spec)
+    return chain
 
-    env = dict(os.environ)
-    env[SENTINEL] = "1"
 
-    try:
-        proc = subprocess.run(
-            [
-                "claude", "-p",
-                # Clears the hooks a settings file declares. It does NOT clear the ones a
-                # plugin registers -- measured, with a marker file: the child still fires
-                # this plugin's own SessionStart and UserPromptSubmit. So this is one of
-                # two guards and not the load-bearing one; SENTINEL is what actually stops
-                # the recursion, and `ipc.under_extraction` is what stands the read hooks
-                # down. Kept because a settings-declared Stop hook is a real way in.
-                "--settings", '{"hooks":{}}',
-                "--model", MODEL,
-                "--output-format", "json",
-                prompt + text,
-            ],
-            capture_output=True, text=True, timeout=TIMEOUT_SEC, env=env,
-        )
-    except subprocess.TimeoutExpired:
-        # Named rather than formatted. `TimeoutExpired.__str__` opens with the whole argv,
-        # so `{exc}` clipped to REASON_CHARS logs the command and truncates away the words
-        # "timed out" -- argv in the one line whose job is to say what went wrong.
-        reason = f"no reply within {TIMEOUT_SEC}s"
-        _fail(f"extraction did not run: {reason}", reason)
-        return "", {}
-    except (OSError, subprocess.SubprocessError) as exc:
-        reason = f"{type(exc).__name__}: {exc}"[:REASON_CHARS]
-        _fail(f"extraction did not run: {reason}", reason)
-        return "", {}
+def _envelope(proc: "subprocess.CompletedProcess", spec: "ExtractorSpec",
+              label: str) -> "tuple[str, dict]":
+    """Read one finished run's envelope: its reply and what it cost, or `('', usage)`.
 
+    Split out of `_payload` when the chain arrived, because `_payload` now owns the loop
+    and this owns the one thing that does not change between rungs -- the order the
+    envelope is read in. That order is the 34-hour defect: usage before any early return,
+    and the reason parsed out of stdout before the return code is allowed to end things.
+    """
     body = _decode(proc.stdout)
-    usage = (body or {}).get("usage")
+    usage = (body or {}).get(spec.usage_key)
     usage = usage if isinstance(usage, dict) else {}
 
     # Usage is read before any of the ways this returns empty. A failed run still burned
@@ -407,24 +422,81 @@ def _payload(text: str, prompt: str) -> "tuple[str, dict]":
     # failures the invisible ones -- which is what the return-code path used to do, where
     # it discarded the envelope's usage along with its reply.
     if proc.returncode != 0:
-        reason = _reason(proc, body)
-        _fail(f"extraction did not run: {reason}", reason)
+        reason = _reason(proc, body, spec)
+        _fail(f"extraction did not run via {label}: {reason}", reason)
         return "", usage
     if body is None:
-        reason = "claude -p returned something that is not JSON"
-        _fail(f"extraction did not run: {reason}", reason)
+        reason = f"{label} returned something that is not JSON"
+        _fail(f"extraction did not run via {label}: {reason}", reason)
         return "", {}
-    if body.get("is_error"):
-        reason = _reason(proc, body)
-        _fail(f"extraction failed: {reason}", reason)
+    if body.get(spec.error_key):
+        reason = _reason(proc, body, spec)
+        _fail(f"extraction failed via {label}: {reason}", reason)
         return "", usage
 
-    # The one exit that means `claude -p` actually answered. Whatever it said about the
+    # The one exit that means the extractor actually answered. Whatever it said about the
     # turn -- facts, or none -- the extractor itself is working, and any earlier alert is
     # exactly as stale as an error message left on screen after the thing it described was
     # fixed.
+    log(f"extraction ran via {label}")
     clear_capture_alert()
-    return str(body.get("result") or ""), usage
+    return str(body.get(spec.reply_key) or ""), usage
+
+
+def _payload(text: str, prompt: str) -> "tuple[str, dict]":
+    """The model's reply and what it cost, or `('', {})` if no rung of the chain answered.
+
+    Cost is returned rather than discarded because here is the only place it exists.
+    `--output-format json` puts usage on the envelope beside the reply; reading the reply
+    alone, as this first did, throws the token counts away with the process.
+
+    A rung whose CLI is not installed is skipped and the next one tried; a rung that ran
+    and failed is the answer, and the chain stops there. The distinction is deliberate:
+    "not installed" is a fact about the machine that the next rung may not share, while a
+    timeout or an expired login is a failure that has already cost the user a slow process
+    and would cost them a second one for nothing.
+    """
+    if os.environ.get(SENTINEL):
+        return "", {}
+
+    env = dict(os.environ)
+    env[SENTINEL] = "1"
+
+    for spec in _chain():
+        label = spec.argv[0]
+        try:
+            proc = subprocess.run(
+                list(spec.argv) + [prompt + text],
+                capture_output=True, text=True, timeout=TIMEOUT_SEC, env=env,
+            )
+        except FileNotFoundError:
+            # Logged rather than passed over in silence: a rung that was skipped and a
+            # rung that never existed are the same absence from the store's side, and only
+            # one of them is fixed by installing something.
+            log(f"extraction skipped: {label} is not installed")
+            continue
+        except subprocess.TimeoutExpired:
+            # Named rather than formatted. `TimeoutExpired.__str__` opens with the whole
+            # argv, so `{exc}` clipped to REASON_CHARS logs the command and truncates away
+            # the words "timed out" -- argv in the one line whose job is to say what went
+            # wrong.
+            reason = f"no reply within {TIMEOUT_SEC}s"
+            _fail(f"extraction did not run via {label}: {reason}", reason)
+            return "", {}
+        except (OSError, subprocess.SubprocessError) as exc:
+            reason = f"{type(exc).__name__}: {exc}"[:REASON_CHARS]
+            _fail(f"extraction did not run via {label}: {reason}", reason)
+            return "", {}
+
+        return _envelope(proc, spec, label)
+
+    # Every rung was absent. This is a legitimate state on a host whose users have never
+    # installed Claude Code, and it still goes through `_fail`: a capture that cannot run
+    # must return no facts, and it must not do it quietly. `facts=0` on 117 consecutive
+    # turns is what a silent return looks like from outside.
+    reason = "no extractor available"
+    _fail(f"extraction did not run: {reason}", reason)
+    return "", {}
 
 
 def _facts(result: str) -> "list[dict]":

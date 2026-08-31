@@ -38,6 +38,21 @@ Four hooks, so memory happens without being asked for:
 | `Stop` | Keeps the turn that just ended, and mines it for facts |
 | `PreToolUse` | Auto-allows read-only `memory_*` tools; writes still ask |
 
+All four are the same command, `hooks/run.py <hook> --host claude`. What
+this client calls each event, which stdin key carries the prompt, and
+which reply field the terminal actually renders are data in
+`hooks/hosts/claude.py` rather than literals in the four hook bodies —
+so the same bodies can be vendored for another editor by adding one
+record beside it. A run that cannot dispatch at all — an unknown host, a
+hook that client has no event for — exits 0 like every other failure here
+and writes the reason to `~/.memvara/.hooks/hooks.log`.
+
+Those bodies are vendored, not written here: `plugin/hooks/` is a copy of the
+same directory in [memvara/memvara](https://github.com/memvara/memvara), pinned
+by `hooks.lock`. `hooks/hooks.json` is the one file that is not copied — it is
+generated from `hooks/hosts/claude.py`, because each editor's install surface
+registers its own client.
+
 The hooks try three routes and return the same text from each; only the
 latency differs. A resident daemon answers in ~38 ms. Without one, a
 local install queries in-process in ~148 ms. A hosted install with no
@@ -52,9 +67,11 @@ local install queries in-process in ~148 ms. A hosted install with no
 The daemon earns more on hosted than on local, because only a resident
 process can hold the TLS connection open: the same request measured
 609 ms on a fresh connection and 177 ms on a warm one. It exits after 30
-minutes idle, and its socket address digests both the store and the hook
-sources, so a second store can never reach it and edited code strands it
-rather than being served stale.
+minutes idle, and its socket address digests the store, the hook sources
+and the coding client it was started for — so a second store can never
+reach it, edited code strands it rather than being served stale, and two
+clients installed side by side get a daemon each instead of sharing
+whichever one bound first.
 
 Two things the hosted path needs that look like nothing when missing.
 It must send a **User-Agent**: Cloudflare refuses the stdlib default with
@@ -263,6 +280,11 @@ Then it mines the turn for facts. That half needs a model, and uses the
 one you already pay for: it shells out to `claude -p` against your
 existing Claude Code login, so there is no `ANTHROPIC_API_KEY` and no
 second bill. It does not go through `MEMVARA_LLM`, which stays `none`.
+If that CLI is not on your `PATH` at all, capture skips the mining step
+rather than falling back to something that would look like it worked:
+`capture.log` says `extraction did not run: no extractor available` and
+the next prompt's status line says the same. Nothing is stored from that
+turn, and nothing pretends otherwise.
 On a hosted install there is no local store to open, so capture writes
 over the same MCP endpoint recall reads; a write the endpoint refuses is
 logged as failed rather than counted as stored.
@@ -529,5 +551,7 @@ claude plugin install memvara@claude-memvara
 
 ## License
 
-Apache-2.0. The skill is vendored from [memvara/memvara](https://github.com/memvara/memvara);
-a test fails if the copy drifts.
+Apache-2.0. The skill and the hook tree are both vendored from
+[memvara/memvara](https://github.com/memvara/memvara), pinned by `skill.lock`
+and `hooks.lock`; tests fail if either copy drifts, or if either falls behind
+the library.

@@ -3,8 +3,8 @@
 The socket's *name* does most of the safety work here, so it is worth saying why it is
 built the way it is.
 
-It contains a digest of two things: the store the daemon opened, and the source code it
-opened it with.
+It contains a digest of three things: the store the daemon opened, the source code it
+opened it with, and the host it was opened for.
 
 * **The store**, because a daemon is a warm handle on one specific database. A second
   project pointing at a different `MEMVARA_DB` must not reach it — it would be answering
@@ -16,6 +16,11 @@ opened it with.
   different socket: the new client starts a new daemon, and the old one idles out and
   exits on its own. No version negotiation, no restart command to remember, no way to be
   silently served by stale code.
+* **The host**, because these bytes are vendored into a plugin repository per coding
+  client. Two of them installed side by side share a machine, and can share a store and a
+  hook tree byte for byte, so without this the first daemon to bind serves both clients
+  -- and since the bound host is what decides which config files `server_env` reads, the
+  two need not even have resolved the same store to have collided on one address.
 
 The directory is `0700` and the socket `0600`. A unix socket carrying recall output is a
 read interface to everything the user has ever stored, and the default umask would have
@@ -42,7 +47,8 @@ RUNTIME_DIR = os.path.join(_HOME, ".memvara", ".hooks", "run")
 
 #: Files whose contents decide what a daemon actually does. A change to any of them must
 #: strand the old daemon rather than let it keep serving.
-CODE_FILES = ("daemon.py", "lib/ipc.py", "lib/open.py", "recall.py")
+CODE_FILES = ("daemon.py", "lib/ipc.py", "lib/open.py", "recall.py",
+              "run.py", "core/host.py", "core/envelope.py", "hosts/claude.py")
 
 #: Set in the environment of the `claude -p` child that `capture.py` spawns to mine a turn.
 #: A hook that finds it is running underneath an extraction rather than in front of a
@@ -405,7 +411,13 @@ def _code_digest(root: str) -> str:
 
 
 def socket_path(store_key: str, root: "str | None" = None) -> str:
-    """Where the daemon for this store, running this code, listens."""
+    """Where the daemon for this store and host, running this code, listens.
+
+    The host arrives inside `store_key`, which is where the rest of the store's identity
+    already comes from; this function only truncates. The truncation stays at 16 hex
+    characters because macOS caps a unix socket path near 104 bytes, and a readable name
+    would not fit.
+    """
     here = root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     digest = hashlib.sha256(
         f"{store_key}\0{_code_digest(here)}".encode()
@@ -415,11 +427,26 @@ def socket_path(store_key: str, root: "str | None" = None) -> str:
     return os.path.join(runtime_dir(), f"recall-{digest}.sock")
 
 
+def _host_record():
+    """The bound client, imported lazily so `core.host` is not a hard dependency here.
+
+    `lib.ipc` is the module every hook already imports and the one the daemon imports
+    first; a top-level import of `core.host` would make the import graph a cycle the day
+    anything under `core/` wants an address from here.
+    """
+    from core.host import active
+
+    return active()
+
+
 #: Where MCP clients keep the server block we mine for configuration. Checked in order;
 #: the first one that names a `memvara` server wins.
-_CLIENT_CONFIGS = (
-    os.path.join(_HOME, ".claude.json"),
-    os.path.join(_HOME, ".claude", "settings.json"),
+#:
+#: The paths belong to the client, so they come from its `Host` record. Resolved at import
+#: like the rest of this module's addresses, and against `~` rather than `_HOME` because
+#: the record states them the way a person would write them down.
+_CLIENT_CONFIGS = tuple(
+    os.path.expanduser(path) for path in _host_record().client_configs
 )
 
 
@@ -456,6 +483,15 @@ def store_key() -> str:
 
     Derived from configuration rather than from a live handle, because the client must
     compute the same address as the daemon *before* paying to open anything.
+
+    The bound host is part of that identity, and not only for tidiness. Six sibling
+    repositories vendor these bytes for six different clients, so without it a Codex
+    daemon and a Cursor daemon on one machine, over one `MEMVARA_DB`, with a
+    byte-identical hook tree, compute one address and the first to bind serves both. The
+    host is also what `server_env` reads the env block *out of* -- so two hosts starting
+    from the same environment can resolve two different stores, which is the
+    store-separation failure again, arriving through a door the rest of this key cannot
+    see because it is computed after the host has already chosen where to look.
     """
     env = {**server_env(), **{k: v for k, v in os.environ.items() if k.startswith("MEMVARA_")}}
     db = env.get("MEMVARA_DB") or ""
@@ -477,6 +513,7 @@ def store_key() -> str:
             hosted = ""
 
     return "\0".join([
+        _host_record().id,
         db,
         hosted,
         env.get("MEMVARA_MODE", ""),
