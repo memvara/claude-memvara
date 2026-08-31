@@ -5977,6 +5977,44 @@ class CredentialProbe(unittest.TestCase):
                           "rather than assume a TTL")
         self.assertIs(results["authenticated"]["read_only"], False)
 
+    def test_only_a_401_is_read_as_a_verdict_on_the_credential(self) -> None:
+        """A refusal that is not a 401 says nothing about the key, whatever words it uses.
+
+        `expired` and `revoked` are claims about the credential, and only a 401 is the
+        deployment making one. The wording checks matched on any status, so a 403 saying
+        "writes are disabled on this plan" reported a live credential as revoked and sent
+        the user into a device flow that could not help them -- the same error the
+        `absent` fallback below is guarded against, arriving from the other side and
+        worse, because here the key is fine.
+
+        The bodies are refusals a deployment can plausibly send, each carrying a word this
+        function looks for, none of them about the key.
+        """
+        module = self._auth()
+        cases = (
+            (403, "writes are disabled on this plan"),
+            (503, "this project is disabled for maintenance"),
+            (500, "the cache expired at 03:00, retry"),
+        )
+        for status, message in cases:
+            with self.subTest(status=status, message=message):
+                self._replies(module, {
+                    module.HEALTH_PATH: (200, {"status": "ok"}),
+                    module.WHOAMI_PATH: (status, {"error": {
+                        "code": "refused", "message": message, "detail": None}}),
+                })
+                # Restored, because `_auth()` hands back the module `sys.modules` already
+                # holds -- so a stub left on it is inherited by every later test in this
+                # process. Left unrestored, this one silently rewrote what
+                # `test_the_probe_names_where_the_credential_came_from` was reading.
+                self.addCleanup(setattr, module, "credential", module.credential)
+                module.credential = lambda: ("mv_live_and_working", module.ENV_KEY)
+                state = module.probe()["state"]
+                self.assertEqual(
+                    state, "unknown",
+                    f"HTTP {status} carrying {message!r} was read as {state!r}; only a "
+                    "401 is the deployment making a claim about the credential")
+
     def test_a_network_failure_is_not_reported_as_a_credential_failure(self) -> None:
         """`/v1/health` takes no credential, so it separates "the deployment is down"
         from "your key is bad". Without it every outage reads as a login problem and the

@@ -402,6 +402,18 @@ def probe(*, timeout: float = TIMEOUT_SEC) -> dict:
 
     message = _message(body)
     lowered = message.lower()
+    if status != 401:
+        # Before the wording checks, not after. `expired` and `revoked` are claims about
+        # the credential, and only a 401 is the deployment making one. Every other refusal
+        # is about the request or the deployment, and its prose is not this function's to
+        # read as a verdict on the key -- "writes are disabled on this plan" is a 403 that
+        # matched "disabled" and reported a live credential as revoked, which sends a user
+        # into a device flow that cannot help them. Same error as the `absent` one guarded
+        # against below, arriving from the other side and worse, because the key is fine.
+        return _result("unknown",
+                       f"{base} refused the credential from {source} with HTTP {status}: "
+                       f"{message or 'no reason given'}.",
+                       source)
     if "expired at" in lowered:
         instant = message.split("expired at", 1)[1].strip() or "an unstated time"
         return _result("expired",
@@ -413,11 +425,6 @@ def probe(*, timeout: float = TIMEOUT_SEC) -> dict:
                        f"the credential from {source} has been disabled. It did not "
                        "expire -- someone revoked it, and re-authenticating mints a new "
                        "one rather than restoring this one.",
-                       source)
-    if status != 401:
-        return _result("unknown",
-                       f"{base} refused the credential from {source} with HTTP {status}: "
-                       f"{message or 'no reason given'}.",
                        source)
     # Everything else the deployment refuses is a credential it does not accept: wrong,
     # not missing. Never `absent` -- telling a user with a bad key that they have no key
