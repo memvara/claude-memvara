@@ -57,8 +57,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from core.envelope import read_event  # noqa: E402
+from core.host import active  # noqa: E402
 from lib.extract import project_subject, triples  # noqa: E402
-from lib.open import payload  # noqa: E402
+from lib.ipc import payload  # noqa: E402
 from lib.transcript import last_turn_with_injections  # noqa: E402
 from lib.write import (EPISODE_ROLE, log, open_writer, store_facts,  # noqa: E402
                        turn_ids)
@@ -212,15 +214,19 @@ def _turn(transcript: Path) -> "tuple[str, list[str]]":
 
 
 def main() -> int:
-    data = payload()
-    if data.get("stop_hook_active"):
+    host = active()
+    if host.transcript is None:
+        # This client hands a hook nothing to read back, so there is no turn to mine.
+        log("skipped=host keeps no transcript")
+        return 0
+    event = read_event(host, "capture", payload())
+    if event.reentrant:
         # Re-entry from a hook-triggered continuation. Mining here would double-count.
         return 0
 
-    raw_path = data.get("transcript_path")
-    if not raw_path:
+    if not event.transcript_path:
         return 0
-    transcript = Path(str(raw_path)).expanduser()
+    transcript = Path(event.transcript_path).expanduser()
     if not transcript.is_file():
         return 0
 
@@ -255,8 +261,8 @@ def main() -> int:
         return 0
 
     try:
-        kept, turn_of = _keep_turn(store, turn, str(data.get("cwd") or ""))
-        facts = triples(turn, str(data.get("cwd") or "") or None, injected=injected)
+        kept, turn_of = _keep_turn(store, turn, event.cwd)
+        facts = triples(turn, event.cwd or None, injected=injected)
         if not facts:
             log(f"turn={len(turn)}c facts=0 episode={'yes' if kept else 'no'}")
             return 0

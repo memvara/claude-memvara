@@ -1,0 +1,100 @@
+# Open a PR when memvara/memvara's plugin/hooks/ tree moves. Does not push to main.
+#
+# The sibling of skill-sync.yml, and deliberately a separate workflow: the two trees are
+# pinned by two locks and move on their own schedules, so one job syncing both would open
+# a PR that mixes a skill edit with a hook edit and force a reviewer to read them together.
+name: Hooks sync
+
+on:
+  schedule:
+    - cron: "41 7 * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [hooks-changed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch library hooks
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/memvara/memvara.git /tmp/memvara
+          src=/tmp/memvara/plugin/hooks
+          if [ ! -f "$src/run.py" ]; then
+            echo "library default branch has no hook tree yet; skip"
+            echo "changed=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # THIS REPOSITORY'S OWN, and the two things sync must not flatten. Seven plugin
+          # repositories vendor the same tree and each one registers a different client:
+          # copying a `host=` line or a `hooks.json` from the library, or from a sibling,
+          # would turn six install surfaces into a seventh copy of this one. Read the host
+          # out of the lock that is already here, and regenerate the manifest from it.
+          host=$(awk -F= '/^host=/{print $2}' hooks.lock)
+          if [ -z "$host" ]; then
+            echo "hooks.lock names no host; refusing to guess" >&2
+            exit 1
+          fi
+
+          # A plain copy: the canonical path and the vendored path are the same string, so
+          # there is nothing to rewrite and no transform to get wrong. `rm -rf` first, or a
+          # file deleted upstream would survive here forever and the drift gate would fail
+          # on a file set nobody could explain.
+          rm -rf plugin/hooks
+          cp -R "$src" plugin/hooks
+          python3 plugin/hooks/tools/generate.py "$host"
+
+          # Rewritten in full rather than patched, so a hand edit here cannot survive a
+          # sync -- except `host`, which is read above from the file being replaced. The
+          # bytes must match the committed lock exactly or every night opens a PR that
+          # changes nothing; `test_the_sync_workflow_rewrites_the_lock_it_already_has`
+          # compares them.
+          sha=$(git -C /tmp/memvara rev-parse HEAD)
+          cat > hooks.lock <<LOCK
+          # The library commit whose plugin/hooks/ tree this plugin vendors.
+          # CI diffs plugin/hooks against that SHA byte for byte, with no transforms at all --
+          # unlike skill.lock, which allows exactly one line.
+          # host= names the record in hooks/hosts/ that hooks/hooks.json is generated from. It is
+          # this repository's own: hooks-sync.yml reads it and writes it back, never overwrites it.
+          repo=memvara/memvara
+          sha=$sha
+          path=plugin/hooks
+          host=$host
+          LOCK
+
+          if git diff --quiet -- plugin/hooks hooks.lock; then
+            echo "changed=false" >> "$GITHUB_ENV"
+          else
+            echo "changed=true" >> "$GITHUB_ENV"
+            echo "sha=$sha" >> "$GITHUB_ENV"
+          fi
+
+      - name: Open PR
+        if: env.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          # A PAT when the org has provisioned one, GITHUB_TOKEN otherwise. This org pins
+          # every repository to read-only workflow permissions with "Allow GitHub Actions
+          # to create and approve pull requests" off, and under GITHUB_TOKEN the last step
+          # dies with "GitHub Actions is not permitted to create or approve pull requests"
+          # -- which is how skill-sync.yml failed every night for four days into a log
+          # nobody reads. Same secret, same fallback, for the same reason.
+          token: ${{ secrets.PLUGIN_SYNC_TOKEN || github.token }}
+          commit-message: "chore: sync hooks from memvara/memvara@${{ env.sha }}"
+          title: "chore: sync hooks from memvara/memvara@${{ env.sha }}"
+          body: |
+            Vendored hook tree drifted from [memvara/memvara](https://github.com/memvara/memvara) `${{ env.sha }}`.
+            This PR copies `plugin/hooks/` across byte for byte, regenerates
+            `plugin/hooks/hooks.json` from the host `hooks.lock` names, and updates
+            `hooks.lock` — keeping this repository's own `host=` line.
+            CI still has to pass before merge.
+          branch: sync/hooks-${{ env.sha }}
+          delete-branch: true

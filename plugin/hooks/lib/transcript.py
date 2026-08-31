@@ -15,8 +15,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from core.host import active
+
+#: The client whose transcript this module reads. Resolved once, at import: `run.py`
+#: binds the host before importing any hook body, and a body is what pulls this in.
+_HOST = active()
+
 #: Tools whose *use* is a durable event (a file changed, a command ran).
-INCLUDE_TOOLS = frozenset({"Edit", "Write", "Bash", "NotebookEdit"})
+INCLUDE_TOOLS = _HOST.tools
 
 #: Prefixes of tool names that are this plugin talking to itself.
 SKIP_TOOL_PREFIXES = ("mcp__",)
@@ -24,40 +30,33 @@ SKIP_TOOL_PREFIXES = ("mcp__",)
 MAX_TOOL_ARG = 120
 MAX_TOOL_RESULT = 240
 
-#: Text that is this plugin talking to itself. Anything carrying one of these is dropped
-#: whole rather than mined.
-#:
-#: The last two are the SessionStart block, and they matter more than they look. Capture
-#: mines the turn it just watched; SessionStart injects a block of already-stored memories
-#: into the very first turn of a session. Without these markers that block is read back as
-#: conversation, re-extracted, and written again under whatever predicate the model picks
-#: this time -- a feedback loop that manufactures duplicates of facts already in the store,
-#: and one that gets worse every session rather than settling.
-#:
-#: It has never fired, because SessionStart produced no output at all on a hosted install
-#: until 0.1.4. Fixing that hook without adding these two lines in the same commit would
-#: have turned a dead hook into an actively harmful one.
-NOISE = (
-    "<command-message>",
-    "<command-name>",
-    "<system-reminder>",
-    "<local-command-stdout>",
-    "Recalled from Memvara",
-    "Memvara — what is already known about this user",
-    "Memvara — how this user wants work done",
-    "Memvara scope:",
-)
-
-
-#: The subset of NOISE that marks a block *this plugin injected into the turn*. It is the
-#: only record of what was put in front of the model before it replied, which is what
+#: The markers that name a block *this plugin injected into the turn*. It is the only
+#: record of what was put in front of the model before it replied, which is what
 #: `injected_memories` reads it back for: a memory the model was shown and then restated is
 #: not a new observation, and mining it writes the store's own output back into the store.
+#:
+#: Ours, so the same on every client: they are the headers this plugin writes. Only the
+#: host's own markup varies, and that lives in `Host.noise`.
 RECALL_MARKERS = (
     "Recalled from Memvara",
     "Memvara — what is already known about this user",
     "Memvara — how this user wants work done",
 )
+
+#: Everything dropped whole rather than mined: the host's own markup, plus the blocks this
+#: plugin injected itself.
+#:
+#: The SessionStart headers in `RECALL_MARKERS` matter more than they look. Capture mines
+#: the turn it just watched; SessionStart injects a block of already-stored memories into
+#: the very first turn of a session. Without these markers that block is read back as
+#: conversation, re-extracted, and written again under whatever predicate the model picks
+#: this time -- a feedback loop that manufactures duplicates of facts already in the store,
+#: and one that gets worse every session rather than settling.
+#:
+#: It has never fired, because SessionStart produced no output at all on a hosted install
+#: until 0.1.4. Fixing that hook without adding those lines in the same commit would have
+#: turned a dead hook into an actively harmful one.
+NOISE = _HOST.noise + RECALL_MARKERS + ("Memvara scope:",)
 
 
 def _injected_lines(text: str) -> list[str]:

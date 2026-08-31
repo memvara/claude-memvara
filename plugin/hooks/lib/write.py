@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from core.host import active
+
 from .open import open_store
 
 #: Beside the store, not in the plugin: the plugin directory is replaced wholesale on
@@ -180,7 +182,10 @@ def store_facts(store: Any, facts: Iterable[Any], turn: str = "",
         kwargs: dict = {"confidence": 0.7}
         if memory_type:
             kwargs["memory_type"] = memory_type
-        kwargs["extractor"] = "claude-code-hook"
+        # The label the host writes under. It is stored on every claim and rendered back
+        # by `memory_why`, so it is a fact about recorded history rather than a string to
+        # tidy: changing it re-labels everything written before the change.
+        kwargs["extractor"] = active().extractor_label
         if not hosted:
             episode = _episode(turn)
             if episode is not None:

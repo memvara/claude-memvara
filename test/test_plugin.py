@@ -27,6 +27,11 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "plugin"
 HOOKS = PLUGIN / "hooks"
+#: Payloads captured off a real client, byte for byte apart from a redacted home
+#: directory. The point of keeping them is that they are not ours to write: a fixture
+#: composed from what we believe a host's schema to be agrees with our own host record
+#: forever, and goes on agreeing on the day the client renames a key.
+EVIDENCE = ROOT / "test" / "evidence"
 HOSTED = "https://app.memvara.dev/mcp"
 REPO_NAME = "memvara/claude-memvara"
 
@@ -40,29 +45,63 @@ LIBRARY_SKILL_NAME = "memvara"
 LIBRARY_SKILL_PATH = "memvara/skills/memvara"
 SKILL = PLUGIN / "skills" / SKILL_NAME
 
+#: The hook tree is vendored from `plugin/hooks/` in memvara/memvara, which is where it
+#: is written now. It sits at the library's TOP level rather than inside the `memvara`
+#: package because `pyproject.toml` says `packages = ["memvara"]`: anything under that
+#: directory is swept into the wheel, so `memvara/hooks/` would ship an importable
+#: `memvara.hooks.lib` to every `pip install memvara` user. Top level keeps it in the
+#: sdist, out of the wheel, and -- because the canonical path and the vendored path are
+#: then the same three characters -- makes sync a plain copy and this gate a plain
+#: subtree byte compare, with no path rewriting anywhere to get wrong.
+LIBRARY_HOOKS_PATH = "plugin/hooks"
+
+#: The one file under `hooks/` that is NOT vendored. It is generated here, from the host
+#: record `hooks.lock` names, by the library's `plugin/hooks/tools/generate.py`. Six
+#: plugin repositories vendor the same tree and each one registers a different host, so a
+#: canonical copy of this file would be one repository's manifest shipped to all of them.
+#: That is the whole of the exception -- every other byte still has to match the library,
+#: and `test_the_registration_file_is_what_the_generator_produces` covers this one
+#: against the generator instead of leaving it uncovered.
+GENERATED_REGISTRATION = "hooks.json"
+
 #: Hook scripts are executable content the client runs on every prompt, so the allowlist
 #: names them one by one. A file appearing under `hooks/` that nobody listed here is the
-#: failure this gate exists to catch.
+#: failure this gate exists to catch. Paths are relative to `hooks/`, POSIX-spelled,
+#: because that is how the library addresses them too.
+ALLOWED_HOOK_FILES = {
+    "hooks.json",
+    "run.py",
+    "core/__init__.py",
+    "core/host.py",
+    "core/envelope.py",
+    "hosts/__init__.py",
+    "hosts/claude.py",
+    "tools/__init__.py",
+    "tools/generate.py",
+    "recall.py",
+    "session_start.py",
+    "capture.py",
+    "lib/__init__.py",
+    "lib/open.py",
+    "lib/extract.py",
+    "lib/usage.py",
+    "daemon.py",
+    "lib/ipc.py",
+    "lib/fast.py",
+    "lib/hosted.py",
+    "approve.py",
+    "lib/transcript.py",
+    "lib/standing.py",
+    "lib/write.py",
+}
+
+#: The hook half is derived rather than restated. Two hand-maintained lists of the same
+#: files drift, and the one that drifts is the one nobody is looking at -- this
+#: repository has already shipped a guard that stopped covering a file and stayed green.
 ALLOWED_PLUGIN_FILES = {
     pathlib.Path(".claude-plugin") / "plugin.json",
     pathlib.Path(".mcp.json"),
-    pathlib.Path("hooks") / "hooks.json",
-    pathlib.Path("hooks") / "recall.py",
-    pathlib.Path("hooks") / "session_start.py",
-    pathlib.Path("hooks") / "capture.py",
-    pathlib.Path("hooks") / "lib" / "__init__.py",
-    pathlib.Path("hooks") / "lib" / "open.py",
-    pathlib.Path("hooks") / "lib" / "extract.py",
-    pathlib.Path("hooks") / "lib" / "usage.py",
-    pathlib.Path("hooks") / "daemon.py",
-    pathlib.Path("hooks") / "lib" / "ipc.py",
-    pathlib.Path("hooks") / "lib" / "fast.py",
-    pathlib.Path("hooks") / "lib" / "hosted.py",
-    pathlib.Path("hooks") / "approve.py",
-    pathlib.Path("hooks") / "lib" / "transcript.py",
-    pathlib.Path("hooks") / "lib" / "standing.py",
-    pathlib.Path("hooks") / "lib" / "write.py",
-}
+} | {pathlib.Path("hooks", *rel.split("/")) for rel in ALLOWED_HOOK_FILES}
 
 
 def _json(path: pathlib.Path) -> object:
@@ -142,13 +181,18 @@ def _library_head() -> str:
 
 def _library_skill_files(sha: str) -> "set[str]":
     """Every path under the packaged skill at `sha`, relative to it."""
+    return _library_files(sha, LIBRARY_SKILL_PATH)
+
+
+def _library_files(sha: str, path: str) -> "set[str]":
+    """Every path under `path` at `sha`, relative to `path`."""
     root = os.environ.get("MEMVARA_LIBRARY")
-    prefix = f"{LIBRARY_SKILL_PATH}/"
+    prefix = f"{path}/"
     if root:
         try:
             out = subprocess.check_output(
                 ["git", "-C", root, "ls-tree", "-r", "--name-only", sha,
-                 LIBRARY_SKILL_PATH], stderr=subprocess.DEVNULL).decode()
+                 path], stderr=subprocess.DEVNULL).decode()
         except subprocess.CalledProcessError:
             # Not an object in this checkout -- see `_library_bytes`. Ask GitHub instead of
             # reporting the library unreachable, which would SKIP the check on the one run
@@ -166,9 +210,9 @@ def _library_skill_files(sha: str) -> "set[str]":
             if entry.get("type") == "blob" and entry["path"].startswith(prefix)}
 
 
-def _lock() -> dict[str, str]:
+def _lock(name: str = "skill.lock") -> dict[str, str]:
     out: dict[str, str] = {}
-    for line in (ROOT / "skill.lock").read_text(encoding="utf-8").splitlines():
+    for line in (ROOT / name).read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -414,6 +458,192 @@ class SkillTree(unittest.TestCase):
             "sync it, or check why skill-sync.yml has not")
 
 
+class HookTree(unittest.TestCase):
+    """The vendored hook tree, against the library that now owns it.
+
+    The skill established this shape and the hooks reuse it with one difference that is
+    worth stating plainly: there are NO sanctioned transforms here at all. The skill
+    allows exactly one -- a frontmatter rename -- and every allowance is a hole someone
+    later widens. The hook tree's canonical path in the library is `plugin/hooks`, the
+    same three characters it has here, so nothing needs rewriting on the way across and
+    the comparison is a plain byte compare of a subtree.
+
+    Two guards, and they are not the same guard twice. The first compares the copy
+    against the sha the copy itself names, which proves this repository is self-consistent
+    and nothing else: a lock and a tree frozen together agree with each other forever, and
+    that is precisely how the vendored *skill* shipped five commits behind for four days
+    while every check here was green. The second compares against the library's CURRENT
+    default branch, which is the one that can notice. It skips -- loudly, with the reason
+    in the message -- when the library cannot be reached, because a check that passes when
+    it could not look is the failure one level up.
+    """
+
+    def _ours(self) -> "set[str]":
+        """Every vendored file, relative to `hooks/`, POSIX-spelled.
+
+        `__pycache__` is dropped: running a hook writes bytecode next to it, it is
+        gitignored and never committed, and failing on it would fail on every machine
+        that has used the plugin once.
+        """
+        return {path.relative_to(HOOKS).as_posix() for path in HOOKS.rglob("*")
+                if path.is_file() and "__pycache__" not in path.parts}
+
+    def _vendored(self) -> "set[str]":
+        return self._ours() - {GENERATED_REGISTRATION}
+
+    def test_the_vendored_hook_bytes_match_the_library_at_the_pinned_sha(self) -> None:
+        """Byte for byte, every file, at `hooks.lock`'s sha. No exceptions but the
+        generated registration file, which has its own guard below."""
+        lock = _lock("hooks.lock")
+        self.assertEqual(lock["repo"], "memvara/memvara")
+        self.assertEqual(lock["path"], LIBRARY_HOOKS_PATH)
+        self.assertEqual(lock["host"], "claude")
+        sha = lock["sha"]
+        self.assertEqual(len(sha), 40, f"hooks.lock sha is not a full sha: {sha!r}")
+
+        ours = self._vendored()
+        self.assertTrue(ours, "no vendored hook files found — this guard would pass on "
+                              "an empty tree, which is the shape it exists to stop")
+        upstream = _library_files(sha, LIBRARY_HOOKS_PATH)
+        self.assertEqual(
+            ours, upstream,
+            f"the vendored hook file set differs from memvara/memvara@{sha[:7]}")
+
+        drifted = []
+        for rel in sorted(ours):
+            if (HOOKS / rel).read_bytes() != _library_bytes(
+                    sha, f"{LIBRARY_HOOKS_PATH}/{rel}"):
+                drifted.append(rel)
+        self.assertEqual(drifted, [], f"vendored hooks drifted from {sha[:7]}: {drifted}")
+
+    def test_the_vendored_hooks_are_not_behind_the_library(self) -> None:
+        """The whole tree, and the file SET, against the library's CURRENT default branch.
+
+        The set matters as much as the bytes: a new module upstream is drift that a
+        per-file comparison of the files we already have would never see.
+        """
+        if os.environ.get("MEMVARA_SKIP_FRESHNESS") == "true":
+            # The same flag the skill's freshness check reads, deliberately, rather than a
+            # second lever. Freshness is a fact about the library right now and not about
+            # the commit under test, so a tag that passed the day it was cut fails when
+            # re-run after the library moves, having changed nothing. One opt-out that
+            # `test_freshness_is_dropped_on_tags_and_nowhere_else` already pins is safer
+            # than two, one of which nobody is watching.
+            raise unittest.SkipTest(
+                "freshness not re-checked in the release gate: it is a property of the "
+                "library right now, not of the tagged commit (MEMVARA_SKIP_FRESHNESS)")
+
+        try:
+            head = _library_head()
+            upstream = _library_files(head, LIBRARY_HOOKS_PATH)
+        except LibraryUnreachable as exc:
+            raise unittest.SkipTest(
+                f"library unreachable, hook drift NOT checked: {exc}") from exc
+
+        self.assertTrue(upstream, "the library reported an empty hook tree")
+        self.assertEqual(
+            self._vendored(), upstream,
+            f"the vendored hook file set differs from the library at {head[:7]} — "
+            "re-vendor plugin/hooks and update hooks.lock")
+
+        drifted = []
+        for rel in sorted(upstream):
+            if (HOOKS / rel).read_bytes() != _library_bytes(
+                    head, f"{LIBRARY_HOOKS_PATH}/{rel}"):
+                drifted.append(rel)
+        self.assertEqual(
+            drifted, [],
+            f"vendored hooks are behind memvara/memvara@{head[:7]}: {drifted} — "
+            "re-vendor, or check why hooks-sync.yml has not")
+
+    def test_the_hook_file_set_is_named_here_one_by_one(self) -> None:
+        """A file the client will execute that nobody listed is the thing to catch."""
+        extra = self._ours() - ALLOWED_HOOK_FILES
+        self.assertFalse(
+            extra, f"unlisted hook files: {sorted(extra)} — add them to "
+                   "ALLOWED_HOOK_FILES deliberately, having read them")
+
+    def test_the_allowlist_names_nothing_that_is_no_longer_in_the_tree(self) -> None:
+        """The other direction, and the one that is easy to leave out.
+
+        A hand-maintained list of what is covered is itself unguarded: a file deleted
+        upstream leaves its entry behind, the entry covers nothing, and from outside a
+        list that has stopped covering a file looks exactly like a list that covers
+        everything. Removing a file from `AgentSetup.tsx`'s guard in a sibling repository
+        produced fifteen passing tests and no failure at all.
+        """
+        missing = ALLOWED_HOOK_FILES - self._ours()
+        self.assertFalse(
+            missing, f"ALLOWED_HOOK_FILES names files that are not in the tree: "
+                     f"{sorted(missing)}")
+
+    def test_the_sync_workflow_rewrites_the_lock_it_already_has(self) -> None:
+        """`hooks-sync.yml` must write back exactly the lock that is committed here.
+
+        The workflow replaces `hooks.lock` wholesale on every run. One stray character
+        between the heredoc there and the file here and the diff is never empty, so the
+        nightly job opens a pull request that changes nothing, every night, forever --
+        and the honest daily PR is what everybody then stops reading.
+
+        `host` is the half that must NOT come from the workflow. Seven repositories vendor
+        one tree and each registers a different client, so a literal host in the heredoc
+        would flatten six install surfaces into a copy of this one on the first sync. It
+        is read out of the file being replaced, and this asserts the heredoc interpolates
+        it rather than naming it.
+        """
+        source = (ROOT / ".github" / "workflows" / "hooks-sync.yml").read_text(
+            encoding="utf-8")
+        opener = "cat > hooks.lock <<LOCK\n"
+        self.assertIn(opener, source, "hooks-sync.yml no longer writes hooks.lock")
+        indent = " " * (source.index(opener) - source.rindex("\n", 0, source.index(opener))
+                        - 1)
+        body, _, rest = source.split(opener, 1)[1].partition(f"{indent}LOCK\n")
+        self.assertTrue(rest, "the hooks.lock heredoc is not terminated")
+
+        lines = []
+        for line in body.splitlines(True):
+            self.assertTrue(line.startswith(indent), f"ragged heredoc line: {line!r}")
+            lines.append(line[len(indent):])
+        written = "".join(lines)
+
+        self.assertIn("host=$host\n", written,
+                      "the heredoc must interpolate this repository's own host, not "
+                      "name one — a literal there flattens every sibling repo into this "
+                      "one on the first sync")
+        self.assertIn('host=$(awk -F= \'/^host=/{print $2}\' hooks.lock)', source,
+                      "the host must be read back out of the lock being replaced")
+
+        lock = _lock("hooks.lock")
+        written = written.replace("$sha", lock["sha"]).replace("$host", lock["host"])
+        self.assertEqual(
+            written, (ROOT / "hooks.lock").read_text(encoding="utf-8"),
+            "hooks-sync.yml would rewrite hooks.lock differently from how it is "
+            "committed, so every scheduled run would open a PR that changes nothing")
+
+    def test_the_registration_file_is_what_the_generator_produces(self) -> None:
+        """`hooks.json` is the one unvendored file, so it is checked against its source.
+
+        Its source is not a copy of itself in the library -- that is the comparison this
+        repository keeps getting wrong -- but the generator plus the host record
+        `hooks.lock` names. A hand edit here, or a host record that stops agreeing with
+        the manifest built from it, fails.
+        """
+        lock = _lock("hooks.lock")
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            generate = importlib.import_module("tools.generate")
+            host = importlib.import_module(f"hosts.{lock['host']}").HOST
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(
+            generate.registration(host),
+            (HOOKS / GENERATED_REGISTRATION).read_bytes(),
+            f"{GENERATED_REGISTRATION} is not what tools/generate.py builds from "
+            f"hosts/{lock['host']}.py — regenerate it rather than editing it by hand")
+
+
 class SharedInstructions(unittest.TestCase):
     """CLAUDE.md is shared across every plugin repo, and nothing used to carry it.
 
@@ -514,6 +744,37 @@ class Hooks(unittest.TestCase):
             assert match is not None
             self.assertTrue((PLUGIN / match.group(1)).is_file(), command)
 
+    def test_the_event_payload_this_host_actually_sends_is_the_one_the_hook_reads(
+            self) -> None:
+        """Compares the hook against a payload captured FROM the host, not against our
+        assumption about the host. A renamed stdin key is silent: the dedup file is keyed
+        on session, so a miss re-injects every memory every turn while looking healthy.
+
+        The fixture was taken off a real `claude -p` run through a settings-declared
+        `UserPromptSubmit` hook that did nothing but `cat` its stdin to a file. Only the
+        home directory in the two absolute paths is rewritten; every key name, and the
+        shape around it, is what the client sent. That provenance is the whole point --
+        a fixture written from what we believe the schema to be would agree with
+        `hosts/claude.py` forever, including on the day the client renames a key.
+        """
+        raw = (EVIDENCE / "claude" / "UserPromptSubmit.stdin.json").read_bytes()
+        envelope, claude = self._adapter()
+        event = envelope.read_event(claude.HOST, "recall", raw)
+        self.assertTrue(event.prompt, "the prompt did not survive the envelope")
+        self.assertTrue(event.session, "the session id did not survive the envelope")
+        self.assertTrue(event.cwd, "the cwd did not survive the envelope")
+
+    def _adapter(self):
+        """`core.envelope` and `hosts.claude`, imported the way a hook imports them."""
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return (importlib.import_module("core.envelope"),
+                    importlib.import_module("hosts.claude"))
+        finally:
+            sys.path.pop(0)
+
     def test_covers_the_events_that_make_memory_automatic(self) -> None:
         body = _json(HOOKS / "hooks.json")
         assert isinstance(body, dict)
@@ -523,6 +784,41 @@ class Hooks(unittest.TestCase):
             {"UserPromptSubmit", "SessionStart", "Stop", "PreToolUse"},
             set(body["hooks"]),
         )
+
+    def test_a_half_copied_tree_still_cannot_fail_a_prompt(self) -> None:
+        """The entry point exits 0 even when the tree it dispatches into is broken.
+
+        `run.py` logs through `lib.ipc`, imported at call time, on three paths outside its
+        try and once inside the handler that exists so a body's failure cannot reach the
+        client. With `lib/ipc.py` absent -- an interrupted vendor, a sync that stopped
+        between files -- the logging raised and the handler raised with it, so a hook
+        whose whole contract is "never fail a prompt" exited 1 with a traceback. Under
+        Claude Code a non-zero UserPromptSubmit hook blocks the turn, so the failure was
+        not a missing memory but a stopped conversation.
+
+        Both invocations are checked because they fail through different paths: the first
+        never reaches the try, the second dies inside the handler.
+        """
+        import shutil
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as scratch:
+            tree = pathlib.Path(scratch) / "hooks"
+            shutil.copytree(HOOKS, tree)
+            (tree / "lib" / "ipc.py").unlink()
+            for argv, why in ((["bogus", "--host", "claude"], "before the try"),
+                              (["recall", "--host", "claude"], "inside the handler")):
+                with self.subTest(path=why):
+                    done = subprocess.run(
+                        ["python3", str(tree / "run.py"), *argv],
+                        input='{"prompt":"hi","session_id":"s","cwd":"/tmp"}',
+                        capture_output=True, text=True, env=self.BARREN, timeout=60)
+                    self.assertEqual(
+                        done.returncode, 0,
+                        f"run.py exited {done.returncode} {why}; a non-zero hook blocks "
+                        f"the turn: {done.stderr[:300]}")
+                    self.assertNotIn("Traceback", done.stderr)
 
     def test_hooks_succeed_with_nothing_configured(self) -> None:
         """No store, no login, no transcript: exit 0 and never a traceback.
@@ -565,6 +861,60 @@ class Hooks(unittest.TestCase):
         # Nothing was configured, so there is no context to add -- but the report still
         # goes out. That asymmetry is the feature.
         self.assertNotIn("hookSpecificOutput", body)
+
+    #: Claude Code's own command escapes: `/` opens a slash command, `!` runs a shell
+    #: line, `#` adds to memory. None of the three is a question to the model.
+    #:
+    #: Restated here rather than read off `Host.skip_prefixes`, and that is the whole
+    #: design of the guard below. The referent is the client's own input syntax, and a test
+    #: cannot ask a terminal UI what its escapes are -- so an independent statement of them
+    #: is the closest thing to one available. A loop over the record instead would have
+    #: shrunk with the record: deleting `!` and `#` from `hosts/claude.py` leaves a test
+    #: that checks one prefix, passes, and reports nothing. Measured, not reasoned about --
+    #: that is exactly what the first version of this did when it was sabotaged.
+    CLAUDE_COMMAND_PREFIXES = ("/", "!", "#")
+
+    def test_every_command_prefix_the_host_declares_is_answered_with_silence(self) -> None:
+        """A slash command is not a question, and recall must not answer it.
+
+        Two halves, because the prefixes moved onto `Host.skip_prefixes` so six sibling
+        repositories can each spell their own editor's escapes. The record must still name
+        all three of this client's, and `recall.py` must still act on them -- a record that
+        is right while the body has stopped reading it is silent in a different direction
+        and just as complete.
+
+        The control prompt is what makes this a guard rather than a way of passing. Stated
+        as "a command prompt prints nothing", it is satisfied by a `recall.py` that has
+        stopped printing at all -- which is the failure it is standing in front of, since
+        the whole reason this hook prints a status line is that a silent one and a broken
+        one used to be the same thing on screen. So the last case asserts a prompt with no
+        prefix still gets its line.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from hosts.claude import HOST
+        finally:
+            sys.path.pop(0)
+
+        self.assertEqual(tuple(HOST.skip_prefixes), self.CLAUDE_COMMAND_PREFIXES)
+        for prefix in self.CLAUDE_COMMAND_PREFIXES:
+            with self.subTest(prefix=prefix):
+                proc = subprocess.run(
+                    ["python3", str(HOOKS / "recall.py")],
+                    input=json.dumps({"prompt": f"{prefix}clear"}),
+                    capture_output=True, text=True, env=self.BARREN, timeout=30,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip(), "", proc.stdout)
+
+        with self.subTest(prefix="none"):
+            proc = subprocess.run(
+                ["python3", str(HOOKS / "recall.py")],
+                input=json.dumps({"prompt": "clear"}),
+                capture_output=True, text=True, env=self.BARREN, timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("Memvara", json.loads(proc.stdout)["systemMessage"])
 
     def test_read_hooks_stand_down_inside_an_extraction(self) -> None:
         """`claude -p` runs this plugin's hooks, so the child must be told to stop.
@@ -1514,19 +1864,58 @@ class Hooks(unittest.TestCase):
         hook set, finishes, fires Stop, spawns another child. Nothing errors — the machine
         just fills with Claude processes and the bill climbs. Two independent stops are
         asserted because either one alone is a single point of failure.
-        """
-        source = (HOOKS / "lib" / "extract.py").read_text(encoding="utf-8")
-        # 1. The child is launched with an empty hook set.
-        self.assertIn('"--settings", \'{"hooks":{}}\'', source)
-        # 2. And refuses to start if it finds itself already inside an extraction.
-        self.assertIn("SENTINEL", source)
 
+        Stop 1 used to be a grep for the literal in `lib/extract.py`'s source. The argv
+        became data on `ExtractorSpec` when the extractor turned into a per-host chain, so
+        that grep would now be asserting where a string is written rather than what the
+        run is made with -- and a grep moved to `core/host.py` would stay green on the day
+        `_payload` stops asking the record and hardcodes an argv again. What is asserted
+        instead is the argv `subprocess.run` is actually handed, which is the same claim
+        against its referent rather than against a copy of itself, and is red for both
+        mistakes: dropping the flag from the record, and ignoring the record.
+        """
         sys.path.insert(0, str(HOOKS))
         try:
+            from lib import extract as extract_mod
             from lib.extract import SENTINEL, _payload
         finally:
             sys.path.pop(0)
 
+        # 1. The child is launched with an empty hook set.
+        seen: list[list[str]] = []
+
+        class _Fine:
+            returncode = 0
+            stdout = json.dumps({"is_error": False, "result": "", "usage": {}})
+            stderr = ""
+
+        def _record(argv: "list[str]", **_k: object) -> "_Fine":
+            seen.append(list(argv))
+            return _Fine()
+
+        original_run, original_log = extract_mod.subprocess.run, extract_mod.log
+        original_clear = extract_mod.clear_capture_alert
+        extract_mod.subprocess.run = _record  # type: ignore[assignment]
+        extract_mod.log = lambda _line: None  # type: ignore[assignment]
+        extract_mod.clear_capture_alert = lambda: None  # type: ignore[assignment]
+        outside = os.environ.pop(SENTINEL, None)
+        try:
+            _payload("a turn", "a prompt")
+        finally:
+            extract_mod.subprocess.run = original_run  # type: ignore[assignment]
+            extract_mod.log = original_log  # type: ignore[assignment]
+            extract_mod.clear_capture_alert = original_clear  # type: ignore[assignment]
+            if outside is not None:
+                os.environ[SENTINEL] = outside
+
+        self.assertTrue(seen, "no extraction was attempted at all")
+        for argv in seen:
+            self.assertIn("--settings", argv, argv)
+            self.assertEqual(argv[argv.index("--settings") + 1], '{"hooks":{}}', argv)
+
+        # 2. And refuses to start if it finds itself already inside an extraction. Stated
+        # against the running code rather than the source for the same reason as above:
+        # the constant being spelled somewhere is not the guard, the standing down is.
         original = os.environ.get(SENTINEL)
         os.environ[SENTINEL] = "1"
         try:
@@ -1661,6 +2050,67 @@ class Hooks(unittest.TestCase):
             extract_mod.raise_capture_alert = original_raise  # type: ignore[assignment]
 
         self.assertEqual(raised, [said])
+
+    def test_a_host_with_no_extractor_says_so_rather_than_storing_nothing(self) -> None:
+        """Returning ("", {}) quietly is the 34-hour outage this module's own docstring
+        records: extraction stopped and 117 turns logged facts=0, with nothing anywhere
+        saying the extractor had not run at all.
+
+        This is the state a port reaches first. Six sibling repositories are about to
+        vendor these hooks for editors whose users have never installed Claude Code, so
+        "the host's own CLI is absent and `claude` is not on this machine either" is not
+        a remote failure -- it is the default on every one of them until that host's
+        `ExtractorSpec` names something real. The chain is allowed to run out of rungs;
+        what it may not do is run out of rungs silently, because a store nobody is
+        writing to looks identical, from every direction, to one with nothing to write.
+
+        Both channels are asserted because either alone is the defect that cost the 34
+        hours: `capture.log` is what a person finds when they go looking, and the alert
+        is what tells them to look -- `recall.py` relays it onto the next prompt's
+        status line.
+        """
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import extract as extract_mod
+        finally:
+            sys.path.pop(0)
+
+        def _missing(*_a: object, **_k: object) -> None:
+            raise FileNotFoundError(2, "No such file or directory")
+
+        logged: list[str] = []
+        raised: list[str] = []
+        original_run, original_log = extract_mod.subprocess.run, extract_mod.log
+        original_raise = extract_mod.raise_capture_alert
+        extract_mod.subprocess.run = _missing  # type: ignore[assignment]
+        extract_mod.log = logged.append  # type: ignore[assignment]
+        extract_mod.raise_capture_alert = raised.append  # type: ignore[assignment]
+        original_env = os.environ.pop(extract_mod.SENTINEL, None)
+        try:
+            result, usage = extract_mod._payload("a turn", "a prompt")
+        finally:
+            extract_mod.subprocess.run = original_run  # type: ignore[assignment]
+            extract_mod.log = original_log  # type: ignore[assignment]
+            extract_mod.raise_capture_alert = original_raise  # type: ignore[assignment]
+            if original_env is not None:
+                os.environ[extract_mod.SENTINEL] = original_env
+
+        self.assertEqual((result, usage), ("", {}))
+        # Every rung that was tried and found absent says which one it was. A chain that
+        # skipped a rung and a chain that never had one are otherwise the same silence,
+        # and only one of them is fixed by installing something.
+        self.assertTrue(
+            any("claude" in line and "not installed" in line for line in logged),
+            f"no line names the rung that was missing: {logged}",
+        )
+        self.assertTrue(
+            any("no extractor available" in line for line in logged),
+            f"the log does not say extraction never ran: {logged}",
+        )
+        self.assertEqual(
+            raised, ["no extractor available"],
+            "the terminal was never told; only capture.log was, which nobody reads",
+        )
 
     def test_the_recursion_guard_does_not_raise_an_alert(self) -> None:
         """The child stands down on every single extraction; that is not a failure.
@@ -2466,6 +2916,66 @@ class Daemon(unittest.TestCase):
         (root / "recall.py").write_text("edited", encoding="utf-8")
         self.assertNotEqual(before, ipc.socket_path("k", root=str(root)))
 
+    def _core_host(self):
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            return importlib.import_module("core.host")
+        finally:
+            sys.path.pop(0)
+
+    def test_socket_address_separates_hosts_over_one_store_and_one_tree(self) -> None:
+        """Two clients must never share a daemon, even over one store and one hook tree.
+
+        The address already digests the store, so one account's memories cannot answer
+        another's prompts, and the hook sources, so edited code is stranded rather than
+        served stale. Vendoring adds a third collision neither of those covers: six sibling
+        repositories ship these same bytes for six different clients, so a Codex daemon and
+        a Cursor daemon on one machine, over one `MEMVARA_DB`, with a byte-identical hook
+        tree, compute the same address and the first to bind serves both.
+
+        What each holds is not interchangeable. The bound `Host` decides which client
+        config files `ipc.server_env` mines the store's env block out of, so two hosts
+        starting from the same environment can legitimately open two different stores --
+        which is the store-separation failure again, arriving through a door the store
+        digest cannot see, because it is computed *after* the host has already chosen where
+        to look.
+
+        Both calls are given the same `root`, so the code digest is identical by
+        construction rather than by assumption. The second assertion is the control: same
+        host, same store, same sources must still be one address, or a difference above
+        would prove nothing about the host id in particular.
+        """
+        ipc, core_host = self._ipc(), self._core_host()
+
+        with tempfile.TemporaryDirectory() as root:
+            for name in ipc.CODE_FILES:
+                target = pathlib.Path(root) / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("the same bytes on every host", encoding="utf-8")
+
+            base = core_host.active()
+            # Restored through the module global rather than through `use()`: `use(base)`
+            # would leave this process pinned to a host it had merely defaulted to, and a
+            # later test asking `active()` would get an answer this one manufactured.
+            was = core_host._ACTIVE
+            try:
+                def address(host_id: str) -> str:
+                    core_host.use(base._replace(id=host_id))
+                    return ipc.socket_path(ipc.store_key(), root=root)
+
+                self.assertNotEqual(
+                    address("codex"), address("cursor"),
+                    "two hosts over one store and one hook tree address the same socket, "
+                    "so whichever daemon binds first serves both clients")
+                self.assertEqual(
+                    address("codex"), address("codex"),
+                    "one host's address must still be stable, or the difference above "
+                    "says nothing about the host id")
+            finally:
+                core_host._ACTIVE = was
+
     def test_missing_daemon_is_not_an_error(self) -> None:
         """`send` collapses every failure to None so the caller falls back.
 
@@ -2574,6 +3084,206 @@ class Daemon(unittest.TestCase):
                          "reads it, so the daemon route silently answers a different "
                          "question from the in-process one")
 
+    # -- byte parity between the routes ----------------------------------------
+    #
+    # The argument-name comparison above is a cheap proxy and stays: it reads two files and
+    # needs no process. What it cannot see is anything that goes wrong *between* the names
+    # -- an argument read under the right key and passed under a different one, a reply
+    # re-encoded, a section assembled in another order. These three tests serve one backend
+    # down every route this plugin has and compare the answers as strings.
+
+    #: The one query every route below is asked, and the one set of arguments it is asked
+    #: with. Named rather than inlined because the guard-on-the-guard test states its
+    #: expected strings from these values independently, and two spellings of "the
+    #: arguments" would let that guard check a call nobody makes.
+    PARITY_QUERY = "what did we decide about the socket name"
+    PARITY_ARGS = {
+        "k": 4,
+        "budget": 321,
+        "header": "## Recalled",
+        "include_episodes": True,
+        "memory_types": ["semantic", "procedural"],
+    }
+
+    #: The backend every route is served by, in source form rather than as a class.
+    #:
+    #: The daemon route runs in a child process, so the two ends cannot share an object.
+    #: What they can share is bytes. Two hand-written copies of "the same" fixture would
+    #: drift the first time one of them was edited, and this test would then be comparing
+    #: two backends rather than two routes -- passing or failing for a reason that has
+    #: nothing to do with the invariant it is named for.
+    #:
+    #: Structurally rich on purpose, and each part of the block is controlled by a
+    #: different argument: `header` is the first line, `memory_types` decides the claim
+    #: rows, `q` is the text inside them, `include_episodes` opens the episodes section,
+    #: and `k` and `budget` are the trailing count. A route that loses an argument
+    #: anywhere therefore loses or changes a *visible* section -- a difference in the
+    #: bytes rather than one nobody can see.
+    FIXTURE_BACKEND = '''
+class Backend:
+    def recall(self, query, k=6, budget=700, header=None,
+               include_episodes=False, memory_types=None):
+        rows = [header or "## Memory", "claims:"]
+        for kind in (memory_types or ["semantic"]):
+            rows.append(f"- [{kind}] {query}")
+        if include_episodes:
+            rows.append("episodes:")
+            rows.append(f"- turn touching {query}")
+        rows.append("standing:")
+        rows.append("- answer in whole sentences")
+        rows.append(f"({k} asked, {budget} budget)")
+        return "\\n".join(rows)
+'''
+
+    def _backend(self):
+        """The fixture, built from the same source string the child process is handed."""
+        namespace: "dict[str, object]" = {}
+        exec(compile(self.FIXTURE_BACKEND, "<parity fixture>", "exec"), namespace)
+        return namespace["Backend"]()
+
+    def _fixture_block(self) -> str:
+        return str(self._backend().recall(self.PARITY_QUERY, **self.PARITY_ARGS))
+
+    def test_the_parity_fixture_is_load_bearing(self) -> None:
+        """A backend that answers `""` makes route parity true for free.
+
+        This is the same shape as the concern `test_a_failed_query_is_not_an_empty_answer`
+        answers one level up: the empty string is what both a working route and a broken
+        one produce, so a comparison between two of them proves nothing. Every route
+        agreeing on nothing at all would be reported as every route agreeing.
+
+        So the block is required to be non-empty and to carry every section any argument
+        controls. The expected strings are written out here rather than read back off the
+        fixture, deliberately: a guard that derives what it expects from the thing it is
+        checking shrinks whenever that thing shrinks, and goes on passing while the fixture
+        under it empties out.
+        """
+        text = self._fixture_block()
+        self.assertTrue(text.strip(),
+                        "an empty block makes every route agree without proving anything")
+        for required in ("## Recalled", "claims:", "[semantic]", "[procedural]",
+                         "episodes:", "standing:", "(4 asked, 321 budget)",
+                         self.PARITY_QUERY):
+            self.assertIn(
+                required, text,
+                f"nothing in the fixture block reflects {required!r}, so no route can be "
+                "caught dropping the argument that produces it")
+
+    def _serve_fixture(self, sock: str, tmp: str):
+        """A real `daemon.py` serving the fixture on a real unix socket. Kill it yourself.
+
+        The child builds `daemon.Daemon` directly rather than going through `daemon.main`,
+        because `main` opens whatever store this machine is configured for and the point
+        here is to compare routes over one known backend. Everything the reply passes
+        through -- `run`, `_serve`, `_answer`, the JSON framing -- is the shipped code.
+        """
+        script = os.path.join(tmp, "serve.py")
+        pathlib.Path(script).write_text(
+            "import sys\n"
+            f"sys.path.insert(0, {str(HOOKS)!r})\n"
+            + self.FIXTURE_BACKEND
+            + "\nimport daemon\n"
+            f"raise SystemExit(daemon.Daemon({sock!r}, Backend()).run())\n",
+            encoding="utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, script], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(0.5)
+            try:
+                probe.connect(sock)
+                return proc
+            except OSError:
+                pass
+            finally:
+                probe.close()
+            if proc.poll() is not None:
+                break
+            time.sleep(0.02)
+        self._stop(proc)
+        self.fail("the fixture daemon never listened: "
+                  f"{(proc.stderr.read() if proc.stderr else b'')!r}")
+
+    @staticmethod
+    def _stop(proc) -> None:
+        """Leave no resident process behind, however the test above ended."""
+        if proc.stderr is not None:
+            proc.stderr.close()
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+    def test_every_route_answers_one_backend_with_the_same_bytes(self) -> None:
+        """The daemon is an optimisation and never a dependency, asserted rather than said.
+
+        Every route must return the same text and differ only in latency. If that ever
+        stopped being true, a background process would be trading a real risk against
+        136ms on somebody's prompt path, and the difference would show up only on the
+        machines where a daemon happened to be up.
+
+        Three routes, one backend, compared as strings with no normalisation of any kind
+        -- no strip, no splitlines, no whitespace collapse. Normalising is how a route that
+        loses a trailing count or reorders a section passes anyway.
+
+        The in-process route is asked with nothing listening at the address. The daemon
+        route is asked twice: once against a process that has never answered anything, and
+        once against the same process warm. Both fallbacks are emptied for those two calls,
+        so a daemon route that quietly fell through to the slow path returns `""` and fails
+        here rather than borrowing the other route's answer and reporting agreement.
+        """
+        fast = self._fast()
+        sys.path.insert(0, str(HOOKS))
+        try:
+            import importlib
+
+            opener = importlib.import_module("lib.open")
+            hosted = importlib.import_module("lib.hosted")
+        finally:
+            sys.path.pop(0)
+
+        was_address, was_open, was_hosted = (
+            fast.socket_path, opener.open_store, hosted.open_hosted)
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                fast.socket_path = lambda *a, **k: os.path.join(tmp, "recall-nobody.sock")
+                opener.open_store = lambda: self._backend()
+                in_process, in_ok, _ = fast.recall(
+                    self.PARITY_QUERY, spawn=False, **self.PARITY_ARGS)
+
+                sock = os.path.join(tmp, "recall-parity.sock")
+                proc = self._serve_fixture(sock, tmp)
+                try:
+                    fast.socket_path = lambda *a, **k: sock
+                    opener.open_store = lambda: None
+                    hosted.open_hosted = lambda: None
+                    cold, cold_ok, _ = fast.recall(
+                        self.PARITY_QUERY, spawn=False, **self.PARITY_ARGS)
+                    warm, warm_ok, _ = fast.recall(
+                        self.PARITY_QUERY, spawn=False, **self.PARITY_ARGS)
+                finally:
+                    self._stop(proc)
+            finally:
+                fast.socket_path = was_address
+                opener.open_store = was_open
+                hosted.open_hosted = was_hosted
+
+        self.assertEqual((in_ok, cold_ok, warm_ok), (True, True, True),
+                         "a route that could not answer at all is not a route that agrees")
+        self.assertEqual(in_process, cold,
+                         "the in-process route and a cold daemon disagree, so which text "
+                         "a prompt gets depends on whether a daemon happened to be up")
+        self.assertEqual(cold, warm,
+                         "the same daemon answered its first and second request "
+                         "differently")
+
     def test_runtime_directory_is_private(self) -> None:
         # The socket is a read interface to everything the user has ever stored. The
         # default umask would leave it readable by every account on the machine.
@@ -2591,7 +3301,8 @@ class Daemon(unittest.TestCase):
         `open.py` may use it freely -- it is only reached on the fallback path, where the
         cost is already lost in a 148ms in-process query.
         """
-        for name in ("lib/ipc.py", "lib/fast.py", "recall.py", "lib/hosted.py"):
+        for name in ("lib/ipc.py", "lib/fast.py", "recall.py", "lib/hosted.py",
+                     "run.py", "core/host.py", "core/envelope.py", "hosts/claude.py"):
             source = (HOOKS / name).read_text(encoding="utf-8")
             self.assertNotIn("from pathlib import", source, name)
 
