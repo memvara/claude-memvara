@@ -451,8 +451,9 @@ server is unauthenticated, which is when the question is worth asking.
 | `/memvara:stats` | Reports what the store holds at this credential's scope |
 
 Typing one of them runs `python3` here, the way the hooks above do, against
-`auth/memvara_auth.py` in the plugin. Standard library only, no `pip install`, and
-nothing left running when the command returns.
+`skills/memory/scripts/memvara_auth.py` — inside the skill, which is where the
+library vendors it so every host gets the same copy. Standard library only, no
+`pip install`, and nothing left running when the command returns.
 
 Each of them asks the deployment about the credential before it acts. `authenticate`
 against one that already works prints what it is and stops, because minting a second

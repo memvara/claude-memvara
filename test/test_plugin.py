@@ -29,7 +29,13 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "plugin"
 HOOKS = PLUGIN / "hooks"
-AUTH = PLUGIN / "auth"
+#: The auth module lives INSIDE the skill, so `skill.lock` vendors it to every host
+#: through the sync that already exists. It used to sit at `plugin/auth/` as well,
+#: and for one commit this plugin shipped both -- two byte-identical copies with
+#: nothing saying which was authoritative, which is the shape this repository keeps
+#: getting caught by. `test_the_module_ships_exactly_once` below is what keeps it at
+#: one.
+AUTH_SCRIPT = PLUGIN / "skills" / "memory" / "scripts" / "memvara_auth.py"
 
 #: Payloads captured off a real client, byte for byte apart from a redacted home
 #: directory. The point of keeping them is that they are not ours to write: a fixture
@@ -105,8 +111,6 @@ ALLOWED_HOOK_FILES = {
 ALLOWED_PLUGIN_FILES = {
     pathlib.Path(".claude-plugin") / "plugin.json",
     pathlib.Path(".mcp.json"),
-    pathlib.Path("auth") / "__init__.py",
-    pathlib.Path("auth") / "memvara_auth.py",
     pathlib.Path("commands") / "authenticate.md",
     pathlib.Path("commands") / "login.md",
     pathlib.Path("commands") / "logout.md",
@@ -445,7 +449,17 @@ class SkillTree(unittest.TestCase):
                 f"library unreachable, drift NOT checked: {exc}") from exc
 
         self.assertTrue(upstream, "the library reported an empty skill tree")
-        ours = {str(path.relative_to(SKILL)) for path in SKILL.rglob("*") if path.is_file()}
+        # `__pycache__` is excluded because it is not part of either side: git never
+        # lists it, and it appears here only because this repository's own tests execute
+        # the vendored script -- which they do precisely so a syntactically broken upstream
+        # cannot ship. It could not arise while the skill was markdown; it arrived the
+        # moment the module moved inside the skill, and it failed this guard with
+        # `scripts/__pycache__/memvara_auth.cpython-313.pyc` present on one side only.
+        # The sibling repos deliberately do NOT carry this filter: nothing there imports
+        # the script, a full local run leaves no .pyc, and a filter for a case that cannot
+        # occur is machinery nobody asked for.
+        ours = {str(path.relative_to(SKILL)) for path in SKILL.rglob("*")
+                if path.is_file() and "__pycache__" not in path.parts}
         self.assertEqual(
             ours, upstream,
             f"the vendored skill's file set differs from the library at {head[:7]} — "
@@ -6596,16 +6610,22 @@ class CredentialProbe(unittest.TestCase):
         shutil.rmtree(self._home, ignore_errors=True)
 
     def _auth(self):
-        sys.path.insert(0, str(PLUGIN))
-        try:
-            import importlib
+        """Loaded from its path rather than imported as `auth.memvara_auth`.
 
-            module = importlib.import_module("auth.memvara_auth")
-        finally:
-            sys.path.pop(0)
-        # The module holds a connection open across calls, so a fake one left in its cache
-        # would be handed to the next test in this process. Dropped the moment this test
-        # ends rather than at some later import.
+        The module moved inside the skill, and `scripts/` is not a package: it holds no
+        `__init__.py` and must not gain one, because the vendored tree has to stay
+        byte-identical to the library's. A file-based load also gives each test its own
+        module object instead of one cached in `sys.modules` -- which is worth having,
+        since a monkeypatched `credential` once leaked from one test into a sibling
+        exactly that way.
+        """
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("memvara_auth", AUTH_SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        # The module holds a connection open across calls; dropped the moment this test
+        # ends rather than at some later point.
         self.addCleanup(module.close)
         return module
 
@@ -6846,7 +6866,7 @@ class CredentialProbe(unittest.TestCase):
         # "urlopen" fails on a module that merely explains why it does not use urlopen,
         # which is the first thing this one does.
         imported = set()
-        for node in ast.walk(ast.parse((AUTH / "memvara_auth.py").read_text(
+        for node in ast.walk(ast.parse((AUTH_SCRIPT).read_text(
                 encoding="utf-8"))):
             if isinstance(node, ast.Import):
                 imported.update(alias.name for alias in node.names)
@@ -7035,13 +7055,11 @@ class DeviceFlow(unittest.TestCase):
         poll test wait the interval the server asks for, five seconds at a time; a real
         `webbrowser.open` would open a browser window on whoever ran the suite.
         """
-        sys.path.insert(0, str(PLUGIN))
-        try:
-            import importlib
+        import importlib.util
 
-            module = importlib.import_module("auth.memvara_auth")
-        finally:
-            sys.path.pop(0)
+        spec = importlib.util.spec_from_file_location("memvara_auth", AUTH_SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
         self.addCleanup(module.close)
 
         clock = {"now": 0.0}
@@ -7237,7 +7255,7 @@ class DeviceFlow(unittest.TestCase):
         with no imports in it at all, so the modules this flow actually needs are named
         and required to be present.
         """
-        tree = ast.parse((AUTH / "memvara_auth.py").read_text(encoding="utf-8"))
+        tree = ast.parse((AUTH_SCRIPT).read_text(encoding="utf-8"))
         imported: "set[str]" = set()
         guarded: "set[str]" = set()
 
@@ -7512,13 +7530,11 @@ class Commands(unittest.TestCase):
     def _auth(self):
         """The module, with its clock and its browser replaced -- see `DeviceFlow._auth`
         for why both replacements are safety rather than convenience."""
-        sys.path.insert(0, str(PLUGIN))
-        try:
-            import importlib
+        import importlib.util
 
-            module = importlib.import_module("auth.memvara_auth")
-        finally:
-            sys.path.pop(0)
+        spec = importlib.util.spec_from_file_location("memvara_auth", AUTH_SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
         self.addCleanup(module.close)
 
         clock = {"now": 0.0}
@@ -7628,6 +7644,62 @@ class Commands(unittest.TestCase):
             self.assertRegex(front, r"(?m)^description:[ \t]*\S",
                              f"{name} states no description, so it is a blank line in "
                              "the picker and Claude has nothing to decide from")
+
+    def test_every_command_runs_a_path_that_resolves(self) -> None:
+        """The command BODIES, which nothing checked until the module moved.
+
+        `test_every_referenced_script_exists` reads `hooks.json` and only that, so the
+        four command files were free to name any path at all. They named
+        `${CLAUDE_PLUGIN_ROOT}/auth/memvara_auth.py` and were repointed by hand when the
+        module moved inside the skill; nothing would have failed if a single one had been
+        missed, and the symptom would have been `/memvara:logout` reporting that memvara
+        could not authenticate on a machine with the plugin correctly installed.
+
+        Resolved rather than string-matched. A guard that checks the spelling agrees with
+        a command that spells a plausible path into the wrong directory -- which is how
+        `${CLAUDE_PLUGIN_ROOT}` reached Grok's command files and expanded to nothing,
+        handing the shell an absolute path to a file that has never existed anywhere.
+        """
+        for name in sorted(_COMMAND_NAMES):
+            with self.subTest(command=name):
+                body = (_COMMANDS_DIR / f"{name}.md").read_text(encoding="utf-8")
+                found = re.findall(r"\$\{CLAUDE_PLUGIN_ROOT\}/(\S+?)\"", body)
+                self.assertTrue(
+                    found,
+                    f"{name}.md runs nothing through ${{CLAUDE_PLUGIN_ROOT}}; a bare "
+                    "relative path resolves against the user's project, not the plugin")
+                # Required to BE the module, not merely to be a file. Spelled
+                # `is_file()` this passed on `stats.md` rewritten to run
+                # `${CLAUDE_PLUGIN_ROOT}/skills/memory/SKILL.md` -- measured, the suite
+                # stayed at `Ran 300 tests / OK` while the command would hand python3 a
+                # markdown file and `/memvara:stats` would report that memvara cannot
+                # authenticate on a correctly installed machine. Distinguishing the right
+                # file from any other file in the tree is most of what this guard is for,
+                # and AUTH_SCRIPT is right here to compare against.
+                for rel in found:
+                    self.assertEqual(
+                        (PLUGIN / rel).resolve(), AUTH_SCRIPT.resolve(),
+                        f"{name}.md runs {rel}, which is not the auth module")
+
+    def test_the_module_ships_exactly_once(self) -> None:
+        """One copy, and it is the one the library vendors.
+
+        For the length of one commit this plugin held both `plugin/auth/memvara_auth.py`
+        and `plugin/skills/memory/scripts/memvara_auth.py`, byte for byte the same file,
+        with nothing saying which the commands ran or which a fix should edit. Two copies
+        that agree are the shape this repository keeps getting caught by: they agree right
+        up until somebody edits one.
+
+        Stated as an exact set rather than a count, so it fails on the wrong single copy
+        as loudly as on two.
+        """
+        copies = sorted(str(p.relative_to(PLUGIN))
+                        for p in PLUGIN.rglob("memvara_auth.py")
+                        if "__pycache__" not in p.parts)
+        self.assertEqual(
+            copies, [str(AUTH_SCRIPT.relative_to(PLUGIN))],
+            "the auth module must ship once, inside the skill, where skill.lock vendors "
+            "it to every host through the sync that already exists")
 
     def test_no_host_config_is_written_without_confirmation(self) -> None:
         """This host's own OAuth client already writes `~/.claude.json`. A command that
@@ -7894,6 +7966,17 @@ class AuthReadme(unittest.TestCase):
                       "the section does not say that python3 runs on this machine when a "
                       "command is invoked, which is the whole of what a reader is owed "
                       "before they type one")
+        # The path, resolved. It was edited by hand in the same commit that repointed the
+        # four command files, and nothing held it to being right: if the module moves
+        # again, or the sanctioned skill rename stops being `memory`, the README goes on
+        # naming a path that is not there and every test stays green -- which is the
+        # failure already fixed in SKILL.md, opencode-memvara and openclaw-memvara.
+        stated = "skills/memory/scripts/memvara_auth.py"
+        self.assertIn(stated, section,
+                      "the section does not say which file the commands run")
+        self.assertEqual((PLUGIN / stated).resolve(), AUTH_SCRIPT.resolve(),
+                         f"the README says {stated}, which is not the auth module")
+
         self.assertIn("~/.memvara/credentials.json", section,
                       "the section does not name the file these commands write; 'stores "
                       "your key' names nothing a user can find, check or delete")

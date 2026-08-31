@@ -5,7 +5,7 @@ description: Report what the memvara store holds at this credential's scope.
 Run this and show the user everything it prints:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/auth/memvara_auth.py" stats
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/memory/scripts/memvara_auth.py" stats
 ```
 
 It asks about the credential before it asks about the store, so a credential that has
