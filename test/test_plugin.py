@@ -6554,8 +6554,16 @@ class DeviceFlow(unittest.TestCase):
                 code = module.authenticate(out=out)
                 text = out.getvalue()
                 self.assertNotEqual(code, 0, "a refused login is not a successful one")
-                self.assertIn("/memvara authenticate <project-id>", text,
+                # What is pinned is that the user is told to supply a project id and shown
+                # the shape of one -- not the syntax of any host's command line. This module
+                # is vendored unchanged into the other plugin repos, where `/memvara ...`
+                # is spelled differently or not at all, so a message quoting one client's
+                # form is wrong everywhere else and right nowhere for long.
+                self.assertIn("project id", text,
                               f"a {label} left the user with nothing to do next: {text}")
+                self.assertIn(module.PROJECT_ID_EXAMPLE, text,
+                              f"a {label} named no project id shape, so 'supply a project "
+                              f"id' is advice the user cannot act on: {text}")
                 self.assertNotIn("Traceback", text)
                 self.assertEqual(self._files_written(), [],
                                  "a login that never happened wrote something")

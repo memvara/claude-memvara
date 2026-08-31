@@ -492,7 +492,7 @@ def authorize(project: "str | None" = None, *, timeout: float = TIMEOUT_SEC) -> 
     if status in (400, 422):
         raise AuthError(
             f"{_base_url()} refused this login with HTTP {status}{said}\n"
-            f"Name the project yourself: /memvara authenticate <project-id>\n"
+            f"Name the project yourself: run authenticate with a project id.\n"
             f"<project-id> is the project's id in the console -- a dashed UUID like "
             f"{PROJECT_ID_EXAMPLE}, not its slug and not its tenant id.")
     raise AuthError(f"{_base_url()} refused to start a device login with HTTP "
@@ -636,7 +636,7 @@ def _project_ok(project: str, out) -> bool:
     if PROJECT_ID.match(project):
         return True
     print(f"{project!r} is not a project id.\n"
-          f"/memvara authenticate <project-id> takes the dashed UUID the console "
+          f"Authenticating with a project takes the dashed UUID the console "
           f"shows, like {PROJECT_ID_EXAMPLE}.\n"
           "A slug and a tenant id are refused rather than converted: a credential "
           "minted against the wrong project is not an error anyone ever sees.",
