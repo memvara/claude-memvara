@@ -4888,8 +4888,14 @@ class ToolCount(unittest.TestCase):
         one, and correcting it here is the edit the drift test forbids.
         """
         word = NUMBER_WORDS[len(HOSTED_TOOLS)]
+        # `(?:memory\s+)?` because a count is not always written "<n> tools".
+        # `codex-memvara`'s store listing says "<n> MEMORY tools", and a pattern without
+        # this does not match it -- there, widening the file set alone left the sabotage
+        # passing: the file was scanned and the regex still missed it. Fixed here before
+        # this repository grows a sentence of that shape.
         pattern = re.compile(
-            r"\b(" + "|".join(w for w in NUMBER_WORDS if w != word) + r")\s+tools\b",
+            r"\b(" + "|".join(w for w in NUMBER_WORDS if w != word)
+            + r")\s+(?:memory\s+)?tools\b",
             re.IGNORECASE)
         # `*.json` as well as `*.md`, because a count is not only ever written in prose.
         # `codex-memvara` scanned markdown alone and its store listing -- the sentence a
