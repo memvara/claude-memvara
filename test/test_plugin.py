@@ -6,8 +6,10 @@ a wrong URL or an npx block is how this repo goes wrong.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import datetime
+import http.client
 import io
 import json
 import os
@@ -27,6 +29,7 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "plugin"
 HOOKS = PLUGIN / "hooks"
+AUTH = PLUGIN / "auth"
 HOSTED = "https://app.memvara.dev/mcp"
 REPO_NAME = "memvara/claude-memvara"
 
@@ -62,6 +65,8 @@ ALLOWED_PLUGIN_FILES = {
     pathlib.Path("hooks") / "lib" / "transcript.py",
     pathlib.Path("hooks") / "lib" / "standing.py",
     pathlib.Path("hooks") / "lib" / "write.py",
+    pathlib.Path("auth") / "__init__.py",
+    pathlib.Path("auth") / "memvara_auth.py",
 }
 
 
@@ -5804,3 +5809,373 @@ class StandingRenderContract(unittest.TestCase):
                 row, _SERVER_ROW,
                 "the fake's row shape has drifted from the recorded server shape; "
                 "the hosted tests are no longer evidence about the server")
+
+
+#: Recorded from the live endpoint on 2026-08-30, reproduced here as they arrived. A
+#: fixture composed by hand would agree with our assumptions about the server forever;
+#: these agreed with the server once, which is the only way a fixture is evidence. The
+#: opaque identifiers are the only edit -- `token_id` and the tenant were elided in the
+#: recording and nothing here reads them.
+_HEALTH_OK = {"status": "ok", "memvara_version": "0.9.0"}
+_WHOAMI_OK = {
+    "token_id": "tok_recorded",
+    "scope": {"tenant": "prj_recorded", "user": None, "agent": None, "session": None},
+    "granted_privilege": "write",
+    "effective_privilege": "write",
+    "expires_at": None,
+    "read_only": False,
+}
+#: `/v1/*` refuses inside an `error` OBJECT.
+_WHOAMI_EXPIRED = {"error": {
+    "code": "unauthenticated",
+    "message": "this token expired at 2026-08-30T16:15:44.695978+00:00"}}
+#: `/mcp` and the RFC 8628 routes refuse with a flat pair instead. Code that parses one
+#: envelope reads the other as saying nothing, which lands every refusal in the fallback
+#: state -- so both shapes are fed to the same classifier here on purpose.
+_REFUSED_REVOKED = {"error": "unauthorized",
+                    "error_description": "this token has been disabled"}
+_REFUSED_UNKNOWN = {"error": "unauthorized",
+                    "error_description": "the bearer token is not recognised"}
+
+
+class CredentialProbe(unittest.TestCase):
+    """Six states a machine can be in, and the probe must never merge two of them.
+
+    The incident these tests exist for, measured 2026-08-30: a host's own OAuth minted a
+    token that lived 59 minutes, and when it died every surface said some version of "not
+    authenticated". An evening went into re-authenticating a credential that had worked
+    perfectly and then expired, because no message anywhere contained the word "expired".
+
+    Every expected value below is written out here rather than read from the module under
+    test. A guard that asks the implementation what it should expect shrinks when the
+    implementation shrinks, and passes under exactly the sabotage it was written to catch
+    -- which happened on this programme on 2026-08-30.
+    """
+
+    def setUp(self) -> None:
+        self._env = {name: os.environ.get(name) for name in
+                     ("HOME", "MEMVARA_API_KEY", "MEMVARA_SERVER_URL")}
+        self._home = tempfile.mkdtemp(prefix="memvara-auth-home-")
+        os.environ["HOME"] = self._home
+        os.environ.pop("MEMVARA_API_KEY", None)
+        os.environ.pop("MEMVARA_SERVER_URL", None)
+        self.calls: "list[tuple[str, str, str | None]]" = []
+
+    def tearDown(self) -> None:
+        for name, value in self._env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        shutil.rmtree(self._home, ignore_errors=True)
+
+    def _auth(self):
+        sys.path.insert(0, str(PLUGIN))
+        try:
+            import importlib
+
+            module = importlib.import_module("auth.memvara_auth")
+        finally:
+            sys.path.pop(0)
+        # The module holds a connection open across calls, so a fake one left in its cache
+        # would be handed to the next test in this process. Dropped the moment this test
+        # ends rather than at some later import.
+        self.addCleanup(module.close)
+        return module
+
+    def _replies(self, module, script) -> None:
+        """Replace the module's one network primitive with the recorded replies.
+
+        `script` maps a path to `(status, body)`, or to an exception the call raises.
+        The exception is the module's own `Unreachable` because that is what the real
+        `request` raises for a transport failure -- asserted directly in
+        `test_a_network_failure_is_not_reported_as_a_credential_failure`, so this fake
+        cannot drift into rehearsing a failure the module never actually produces.
+        """
+        original = module.request
+        self.addCleanup(setattr, module, "request", original)
+        calls = self.calls
+
+        def fake(method, path, *, body=None, auth=None, timeout=10.0):
+            calls.append((method, path, auth))
+            reply = script[path]
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+
+        module.request = fake
+
+    def _probe(self, module, *, whoami=None, key="mv_recorded", health=None):
+        """One probe against the recorded replies, with the credential `key` in the env.
+
+        Paths are written out here rather than taken from the module: a probe that stopped
+        asking `/v1/health` must fail on the missing key, not silently be handed whatever
+        it asks for instead.
+        """
+        script = {"/v1/health": (200, _HEALTH_OK) if health is None else health}
+        if whoami is not None:
+            script["/v1/whoami"] = whoami
+        if key is None:
+            os.environ.pop("MEMVARA_API_KEY", None)
+        else:
+            os.environ["MEMVARA_API_KEY"] = key
+        self.calls = []
+        self._replies(module, script)
+        return module.probe()
+
+    def test_each_credential_state_reports_itself_differently(self) -> None:
+        """Six states, six distinct messages, driven by the recorded bodies.
+
+        "expired" and "absent" collapsing into one string is the whole failure this
+        command exists to end. The six names are stated here as literals; if the module
+        ever learns to answer only five, this is the line that says so.
+        """
+        module = self._auth()
+        results = {
+            "authenticated": self._probe(module, whoami=(200, _WHOAMI_OK)),
+            "expired": self._probe(module, whoami=(401, _WHOAMI_EXPIRED)),
+            "revoked": self._probe(module, whoami=(401, _REFUSED_REVOKED)),
+            "unknown": self._probe(module, whoami=(401, _REFUSED_UNKNOWN)),
+            "absent": self._probe(module, whoami=(401, _REFUSED_UNKNOWN), key=None),
+            "unreachable": self._probe(module, whoami=(200, _WHOAMI_OK),
+                                       health=(503, {})),
+        }
+        self.assertEqual(
+            {result["state"] for result in results.values()},
+            {"authenticated", "expired", "revoked", "unknown", "absent", "unreachable"},
+            "the six states must all be reachable and all be named")
+        for expected, result in results.items():
+            self.assertEqual(result["state"], expected,
+                             f"the {expected} fixture reported {result['state']!r}")
+        details = [result["detail"] for result in results.values()]
+        for detail in details:
+            self.assertTrue(detail.strip(), "a state with no message tells nobody anything")
+        self.assertEqual(len(set(details)), 6,
+                         "two states share a message, which is the failure itself: "
+                         f"{sorted(details)}")
+        self.assertIn(
+            "2026-08-30T16:15:44.695978+00:00", results["expired"]["detail"],
+            "the expired message must name the instant it expired -- 'expired' without a "
+            "time is what sends a user to re-authenticate a token that was fine an hour ago")
+        self.assertEqual(results["authenticated"]["privilege"], "write")
+        self.assertIsNone(results["authenticated"]["expires_at"],
+                          "the recorded key never expires and the probe must say so "
+                          "rather than assume a TTL")
+        self.assertIs(results["authenticated"]["read_only"], False)
+
+    def test_a_network_failure_is_not_reported_as_a_credential_failure(self) -> None:
+        """`/v1/health` takes no credential, so it separates "the deployment is down"
+        from "your key is bad". Without it every outage reads as a login problem and the
+        user is sent to fix something that was never broken.
+
+        Asserted three ways: the transport failing, the deployment answering a health
+        check with an error, and -- the load-bearing one -- that `/v1/whoami` is never
+        reached at all in either case.
+        """
+        module = self._auth()
+
+        # First, and before anything replaces it: the real primitive raises `Unreachable`
+        # for a transport failure. Without this the fake below would be rehearsing an
+        # exception type nothing ever throws -- and it very nearly was, because `_probe`
+        # replaces `request` for the rest of the test.
+        original = module._connect
+        self.addCleanup(setattr, module, "_connect", original)
+
+        def _dead(*_args, **_kwargs):
+            raise ConnectionRefusedError("nothing is listening")
+
+        module._connect = _dead
+        with self.assertRaises(module.Unreachable):
+            module.request("GET", "/v1/health")
+        module._connect = original
+        module.close()
+
+        refused = self._probe(module, whoami=(200, _WHOAMI_OK),
+                              health=module.Unreachable("connection refused"))
+        self.assertEqual(refused["state"], "unreachable")
+        self.assertEqual([path for _method, path, _auth in self.calls], ["/v1/health"],
+                         "the probe asked about the credential after failing to reach "
+                         "the deployment at all")
+
+        sick = self._probe(module, whoami=(200, _WHOAMI_OK), health=(503, {}))
+        self.assertEqual(sick["state"], "unreachable")
+        self.assertEqual([path for _method, path, _auth in self.calls], ["/v1/health"])
+
+    def test_the_request_carries_all_four_things_the_endpoint_requires(self) -> None:
+        """User-Agent, a CA bundle, the CSRF header, and `http.client` rather than
+        `urllib`. Each is asserted PRESENT and individually, because every one of them
+        fails in a way that names something else:
+
+        * the stock `Python-urllib/3.13` agent is refused by Cloudflare with error 1010,
+          a 403 at the edge with nothing in it about the client's name;
+        * `create_default_context()` alone loads no roots at all on python.org's macOS
+          build, so verification fails on a certificate `curl` accepts;
+        * a missing `X-Memvara-CSRF` is `403 csrf_failed`, which reads as an auth problem;
+        * `urlopen` cannot hold a connection open, and this module makes two calls per
+          probe and one every five seconds while polling.
+        """
+        module = self._auth()
+        original_connect, original_context = module._connect, module._context
+        original_http = module.http
+        self.addCleanup(setattr, module, "_connect", original_connect)
+        self.addCleanup(setattr, module, "_context", original_context)
+        self.addCleanup(setattr, module, "http", original_http)
+
+        sent = []
+
+        class _Response:
+            status = 200
+
+            def read(self):
+                return json.dumps(_WHOAMI_OK).encode("utf-8")
+
+        class _Conn:
+            def request(self, method, path, body, headers):
+                sent.append((method, path, body, headers))
+
+            def getresponse(self):
+                return _Response()
+
+            def close(self):
+                pass
+
+        module._connect = lambda *_args, **_kwargs: _Conn()
+        status, body = module.request("GET", "/v1/whoami", auth="mv_recorded")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, _WHOAMI_OK, "the parsed body is what a caller reads")
+
+        self.assertTrue(sent, "the request never reached a connection")
+        _method, _path, _payload, headers = sent[-1]
+        lowered = {name.lower(): value for name, value in headers.items()}
+
+        agent = lowered.get("user-agent", "")
+        self.assertTrue(agent.strip(), "no User-Agent: Cloudflare answers 1010 at the edge")
+        self.assertNotIn("urllib", agent.lower())
+        self.assertNotIn("python-", agent.lower())
+
+        self.assertEqual(lowered.get("x-memvara-csrf"), "cli",
+                         "without this header the device routes answer 403 csrf_failed")
+        self.assertEqual(lowered.get("authorization"), "Bearer mv_recorded",
+                         "the credential must reach the endpoint it is being checked at")
+
+        context = module._context()
+        self.assertIsInstance(context, ssl.SSLContext)
+        self.assertTrue(context.check_hostname, "verification must never be relaxed")
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        try:
+            import certifi  # noqa: PLC0415
+        except ImportError:
+            certifi = None
+        if certifi is not None:
+            self.assertTrue(
+                context.get_ca_certs(),
+                "certifi is importable here and the context loaded no roots at all, so "
+                "the bare default context was used -- the exact configuration that fails "
+                "CERTIFICATE_VERIFY_FAILED on python.org's macOS build")
+
+        # http.client, not urllib -- and the real connection, not a stub.
+        module._connect = original_connect
+        real = module._connect("app.memvara.dev", None, 1.0)
+        self.assertIsInstance(real, http.client.HTTPSConnection)
+        real.close()
+        # Asked of the import graph rather than of the text. A substring scan for
+        # "urlopen" fails on a module that merely explains why it does not use urlopen,
+        # which is the first thing this one does.
+        imported = set()
+        for node in ast.walk(ast.parse((AUTH / "memvara_auth.py").read_text(
+                encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+        self.assertIn("http.client", imported,
+                      "the connection this module holds open must come from http.client")
+        self.assertNotIn("urllib.request", imported)
+
+        # ...and the CA bundle actually reaches that connection, rather than being built
+        # by a function nobody calls.
+        marker = ssl.create_default_context()
+        module._context = lambda: marker
+        built = []
+
+        class _Recorder:
+            def __init__(self, host, port=None, timeout=None, context=None):
+                built.append({"host": host, "port": port, "timeout": timeout,
+                              "context": context})
+
+        module.http = types.SimpleNamespace(
+            client=types.SimpleNamespace(HTTPSConnection=_Recorder,
+                                         HTTPConnection=_Recorder))
+        module._connect("app.memvara.dev", None, 9.5)
+        self.assertIs(built[-1]["context"], marker,
+                      "the connection was built without the CA bundle this module resolves")
+        self.assertEqual(built[-1]["timeout"], 9.5,
+                         "a connection with no timeout can hold a command open forever")
+
+    def test_an_unrecognised_401_is_unknown_and_never_absent(self) -> None:
+        """Telling a user with a bad key that they have no key sends them into a
+        re-login that cannot fix it -- and they will run it twice before doubting the
+        message. The classifier matches wording, so wording is the thing most likely to
+        rot; the fallback has to be the state that still describes a credential.
+        """
+        module = self._auth()
+        unworded = self._probe(module, whoami=(401, {"error": {
+            "code": "unauthenticated",
+            "message": "a refusal nobody here has written a branch for"}}))
+        self.assertEqual(unworded["state"], "unknown")
+
+        bodyless = self._probe(module, whoami=(401, {}))
+        self.assertEqual(bodyless["state"], "unknown",
+                         "a 401 with nothing readable in it is still a credential the "
+                         "deployment refused, not a credential this machine lacks")
+
+        for result in (unworded, bodyless):
+            self.assertNotEqual(result["state"], "absent")
+            self.assertEqual(result["source"], "MEMVARA_API_KEY",
+                             "the key that was refused came from somewhere, and saying "
+                             "where is how a user with two of them finds the wrong one")
+
+    def test_the_probe_names_where_the_credential_came_from(self) -> None:
+        """Three sources, three answers, and the key reported is the key that was sent.
+
+        "Which credential is the host actually using" is unanswerable to a user holding
+        an environment variable, a credentials file and a host config that disagree --
+        and holding all three is the normal state of a machine that has been logged in
+        twice.
+        """
+        module = self._auth()
+        home = pathlib.Path(self._home)
+
+        from_env = self._probe(module, whoami=(200, _WHOAMI_OK), key="mv_from_env")
+        self.assertEqual(from_env["source"], "MEMVARA_API_KEY")
+
+        (home / ".memvara").mkdir(parents=True, exist_ok=True)
+        (home / ".memvara" / "credentials.json").write_text(
+            json.dumps({"api_key": "mv_from_file"}), encoding="utf-8")
+        (home / ".claude.json").write_text(json.dumps({"projects": {"/somewhere": {
+            "mcpServers": {"memvara": {"type": "http", "url": HOSTED,
+                                       "headers": {"Authorization":
+                                                   "Bearer mv_from_host"}}}}}}),
+            encoding="utf-8")
+
+        # The environment still wins while it is set: a machine that sets both must not
+        # reach a different store depending on which client happened to read it.
+        still_env = self._probe(module, whoami=(200, _WHOAMI_OK), key="mv_from_env")
+        self.assertEqual(still_env["source"], "MEMVARA_API_KEY")
+        self.assertEqual(self.calls[-1][2], "mv_from_env")
+
+        from_file = self._probe(module, whoami=(200, _WHOAMI_OK), key=None)
+        self.assertIn("credentials.json", from_file["source"])
+        self.assertEqual(self.calls[-1][2], "mv_from_file",
+                         "the source named must be the source of the key that was sent")
+
+        (home / ".memvara" / "credentials.json").unlink()
+        from_host = self._probe(module, whoami=(200, _WHOAMI_OK), key=None)
+        self.assertIn(".claude.json", from_host["source"],
+                      "a key living only in the host's own MCP config is the one case a "
+                      "user cannot inspect for themselves")
+        self.assertEqual(self.calls[-1][2], "mv_from_host")
+
+        self.assertEqual(
+            len({from_env["source"], from_file["source"], from_host["source"]}), 3,
+            "three sources that report the same string answer nobody's question")
