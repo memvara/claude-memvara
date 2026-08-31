@@ -64,6 +64,13 @@ jobs:
       - name: Test
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
+          # Lets `test_the_declared_tools_are_the_ones_the_endpoint_serves` actually run.
+          # `tools/list` needs Authorization, so without this the one guard that compares
+          # the README against the SERVER skips on every CI run -- honest, visible in the
+          # log, and still a check that never executes where it matters. A permanent skip
+          # is not a guard. Unset in forks and on repos without the secret, where it goes
+          # back to skipping with its reason printed rather than failing.
+          MEMVARA_API_KEY: ${{ secrets.MEMVARA_API_KEY }}
           MEMVARA_LIBRARY: ${{ github.workspace }}/_library
           # Skip the freshness check on a tag, and only on a tag. Freshness compares the
           # vendored skill against the library's CURRENT default branch, so it is a fact

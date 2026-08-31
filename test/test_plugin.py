@@ -4751,13 +4751,31 @@ def _endpoint_tools() -> "list[str]":
         raise EndpointUnreachable(f"tools/list answered HTTP {status}: {raw[:120]!r}")
 
     text = raw.decode("utf-8", "replace")
-    match = re.search(r"\{.*\}", text, re.S)
-    if not match:
-        raise EndpointUnreachable(f"tools/list returned no JSON object: {text[:120]!r}")
+    # The request accepts `text/event-stream` as well as JSON. A greedy `\{.*\}` over an
+    # SSE body spans from the first brace to the last ACROSS events and yields invalid
+    # JSON -- which would surface here as "unreachable" and skip the guard forever, with a
+    # reason line that reads like a transient network problem rather than a parser that
+    # can no longer read the response. The server answers `application/json` today; this
+    # is what keeps a change there from silently retiring the only check that asks it.
+    payloads = [line[len("data:"):].strip()
+                for line in text.splitlines() if line.startswith("data:")]
+    candidates = payloads[::-1] if payloads else [text.strip()]
+    body = None
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict) and "result" in parsed:
+            body = parsed
+            break
+    if body is None:
+        raise EndpointUnreachable(
+            f"tools/list returned nothing this can parse as a JSON-RPC result "
+            f"(content looked like {'SSE' if payloads else 'a single body'}): {text[:120]!r}")
     try:
-        body = json.loads(match.group(0))
         served = [tool["name"] for tool in body["result"]["tools"]]
-    except (ValueError, KeyError, TypeError) as exc:
+    except (KeyError, TypeError) as exc:
         raise EndpointUnreachable(f"tools/list was not the expected shape: {exc}") from exc
     if not served:
         raise EndpointUnreachable("tools/list returned an empty tool set")
