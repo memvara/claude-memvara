@@ -33,7 +33,7 @@ jobs:
           test "$tag" = "$ver"
 
       - name: Zip plugin
-        run: zip -r plugin.zip plugin README.md LICENSE skill.lock
+        run: zip -r plugin.zip plugin README.md LICENSE skill.lock hooks.lock
 
       - uses: softprops/action-gh-release@v2
         with:
