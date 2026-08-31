@@ -7668,10 +7668,18 @@ class Commands(unittest.TestCase):
                     found,
                     f"{name}.md runs nothing through ${{CLAUDE_PLUGIN_ROOT}}; a bare "
                     "relative path resolves against the user's project, not the plugin")
+                # Required to BE the module, not merely to be a file. Spelled
+                # `is_file()` this passed on `stats.md` rewritten to run
+                # `${CLAUDE_PLUGIN_ROOT}/skills/memory/SKILL.md` -- measured, the suite
+                # stayed at `Ran 300 tests / OK` while the command would hand python3 a
+                # markdown file and `/memvara:stats` would report that memvara cannot
+                # authenticate on a correctly installed machine. Distinguishing the right
+                # file from any other file in the tree is most of what this guard is for,
+                # and AUTH_SCRIPT is right here to compare against.
                 for rel in found:
-                    self.assertTrue(
-                        (PLUGIN / rel).is_file(),
-                        f"{name}.md runs {rel}, and there is no such file in the plugin")
+                    self.assertEqual(
+                        (PLUGIN / rel).resolve(), AUTH_SCRIPT.resolve(),
+                        f"{name}.md runs {rel}, which is not the auth module")
 
     def test_the_module_ships_exactly_once(self) -> None:
         """One copy, and it is the one the library vendors.
@@ -7958,6 +7966,17 @@ class AuthReadme(unittest.TestCase):
                       "the section does not say that python3 runs on this machine when a "
                       "command is invoked, which is the whole of what a reader is owed "
                       "before they type one")
+        # The path, resolved. It was edited by hand in the same commit that repointed the
+        # four command files, and nothing held it to being right: if the module moves
+        # again, or the sanctioned skill rename stops being `memory`, the README goes on
+        # naming a path that is not there and every test stays green -- which is the
+        # failure already fixed in SKILL.md, opencode-memvara and openclaw-memvara.
+        stated = "skills/memory/scripts/memvara_auth.py"
+        self.assertIn(stated, section,
+                      "the section does not say which file the commands run")
+        self.assertEqual((PLUGIN / stated).resolve(), AUTH_SCRIPT.resolve(),
+                         f"the README says {stated}, which is not the auth module")
+
         self.assertIn("~/.memvara/credentials.json", section,
                       "the section does not name the file these commands write; 'stores "
                       "your key' names nothing a user can find, check or delete")
