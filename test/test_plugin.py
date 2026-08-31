@@ -4608,9 +4608,15 @@ class ReadmeAndLicense(unittest.TestCase):
 #: about the wrong thing — a reader follows this line to a server, not to a repository.
 #:
 #: One place to change when a deploy moves it, and `memory_standing` is the name to add.
+#: In the order `tools/list` returns them, so the README can be compared position by
+#: position. Checked against the live endpoint by `ToolCount.test_the_declared_tools_are_
+#: the_ones_the_endpoint_serves` -- this tuple is a convenience for the offline guards,
+#: NOT the referent. It held thirteen names while the endpoint served fourteen, and every
+#: guard here was green throughout, because they all compared the README against this
+#: list and this list against nothing.
 HOSTED_TOOLS = (
     "memory_recall", "memory_search", "memory_neighborhood", "memory_paths",
-    "memory_since", "memory_standing", "memory_add", "memory_remember",
+    "memory_ask", "memory_since", "memory_standing", "memory_add", "memory_remember",
     "memory_forget", "memory_end", "memory_history", "memory_why", "memory_stats",
 )
 
@@ -4659,6 +4665,105 @@ def _tracked(pattern: str) -> "list[pathlib.Path]":
             if path.is_file()]
 
 
+class EndpointUnreachable(Exception):
+    """The hosted endpoint could not be asked. Never a pass -- the guard skips and says so."""
+
+
+def _endpoint_tools() -> "list[str]":
+    """`tools/list` from the LIVE hosted endpoint, in the order it returns them.
+
+    The referent for "what does the hosted MCP serve" is the hosted MCP. Everything else
+    in this file -- `HOSTED_TOOLS`, the README, the count word -- is a claim ABOUT it, and
+    a guard that compares one claim against another proves only that this repository is
+    self-consistent. `memvara-web` shipped exactly that: `test/tool-count.test.ts` pinned
+    the site's own number and stayed green while the site said ten and the endpoint served
+    twelve.
+
+    Standard library plus `certifi` when importable, matching the plugin's own rules:
+    python.org's macOS build loads zero roots from the system trust store, and Cloudflare
+    answers the stdlib User-Agent with a 1010 at the edge, so both are set explicitly.
+    """
+    import http.client
+    import ssl
+    import uuid
+
+    key = (os.environ.get("MEMVARA_API_KEY") or "").strip()
+    if not key:
+        path = os.path.expanduser("~/.memvara/credentials.json")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                stored = json.load(handle)
+        except (OSError, ValueError):
+            stored = {}
+        for field in ("api_key", "key", "token"):
+            if isinstance(stored.get(field), str) and stored[field].strip():
+                key = stored[field].strip()
+                break
+    if not key:
+        raise EndpointUnreachable(
+            "no credential: set MEMVARA_API_KEY or run the plugin's authenticate command")
+
+    try:
+        import certifi
+
+        context = ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # noqa: BLE001 -- certifi is optional, the default context is the fallback
+        context = ssl.create_default_context()
+
+    host = "app.memvara.dev"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "User-Agent": "memvara-plugin-tests/1.0",
+    }
+
+    def call(body: dict, extra: "dict | None" = None) -> "tuple[int, dict, bytes]":
+        conn = http.client.HTTPSConnection(host, timeout=20, context=context)
+        try:
+            conn.request("POST", "/mcp", json.dumps(body),
+                         {**headers, **(extra or {})})
+            reply = conn.getresponse()
+            return reply.status, dict(reply.getheaders()), reply.read()
+        finally:
+            conn.close()
+
+    try:
+        status, got, raw = call({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "memvara-plugin-tests", "version": "1"}},
+        })
+    except OSError as exc:
+        raise EndpointUnreachable(f"{type(exc).__name__}: {exc}") from exc
+    if status != 200:
+        raise EndpointUnreachable(f"initialize answered HTTP {status}: {raw[:120]!r}")
+    session = next((value for name, value in got.items()
+                    if name.lower() == "mcp-session-id"), None)
+    if not session:
+        raise EndpointUnreachable("initialize returned no mcp-session-id header")
+
+    call({"jsonrpc": "2.0", "method": "notifications/initialized"},
+         {"mcp-session-id": session})
+    status, _got, raw = call({"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                             {"mcp-session-id": session})
+    if status != 200:
+        raise EndpointUnreachable(f"tools/list answered HTTP {status}: {raw[:120]!r}")
+
+    text = raw.decode("utf-8", "replace")
+    match = re.search(r"\{.*\}", text, re.S)
+    if not match:
+        raise EndpointUnreachable(f"tools/list returned no JSON object: {text[:120]!r}")
+    try:
+        body = json.loads(match.group(0))
+        served = [tool["name"] for tool in body["result"]["tools"]]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise EndpointUnreachable(f"tools/list was not the expected shape: {exc}") from exc
+    if not served:
+        raise EndpointUnreachable("tools/list returned an empty tool set")
+    return served
+
+
 class ToolCount(unittest.TestCase):
     """The README states the tool surface. Nothing checked either half of it.
 
@@ -4667,6 +4772,33 @@ class ToolCount(unittest.TestCase):
     number and the list agreed with each other perfectly, which is exactly why neither
     looked wrong.
     """
+
+    def test_the_declared_tools_are_the_ones_the_endpoint_serves(self) -> None:
+        """The only guard here that asks the SERVER. Everything else asks this file.
+
+        `HOSTED_TOOLS` held thirteen names while `https://app.memvara.dev/mcp` served
+        fourteen, and the whole class was green the entire time -- the README matched the
+        tuple, the tuple matched the count word, and nothing matched the endpoint. That is
+        the `memvara-web` failure repeated: a claim checked against a copy of itself.
+
+        Names AND order, because the README asserts order and a reader reconciles it
+        against the server's listing.
+
+        SKIPS rather than passes when the endpoint cannot be asked -- no credential, no
+        network. `tools/list` needs `Authorization`, so CI without a key cannot run this
+        and must say so out loud. A check that silently succeeds when it could not look is
+        the failure it exists to prevent, one level up.
+        """
+        try:
+            served = _endpoint_tools()
+        except EndpointUnreachable as exc:
+            raise unittest.SkipTest(
+                f"hosted endpoint not asked, tool set NOT checked: {exc}") from exc
+
+        self.assertEqual(
+            served, list(HOSTED_TOOLS),
+            "HOSTED_TOOLS and the endpoint disagree. The endpoint is right: update the "
+            "tuple, the README sentence and its list together")
 
     def test_the_readme_states_the_hosted_count(self) -> None:
         """Stated positively: the CORRECT phrase must be present.
@@ -4759,7 +4891,12 @@ class ToolCount(unittest.TestCase):
         pattern = re.compile(
             r"\b(" + "|".join(w for w in NUMBER_WORDS if w != word) + r")\s+tools\b",
             re.IGNORECASE)
-        for path in _tracked("*.md"):
+        # `*.json` as well as `*.md`, because a count is not only ever written in prose.
+        # `codex-memvara` scanned markdown alone and its store listing -- the sentence a
+        # user reads BEFORE installing -- said "Ten memory tools" for months, free to say
+        # anything because no guard covered the file. This repository's manifests state no
+        # count today; the point is that they cannot start.
+        for path in _tracked("*.md") + _tracked("*.json"):
             # `skills` stays: it is tracked, and deliberately excluded. `node_modules` and
             # `_library` are gone rather than forgotten -- git does not track either, so
             # naming them would only suggest the list still has work to do.
