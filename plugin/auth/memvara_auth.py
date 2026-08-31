@@ -95,6 +95,7 @@ CSRF_VALUE = "cli"
 DEFAULT_BASE = "https://app.memvara.dev"
 HEALTH_PATH = "/v1/health"
 WHOAMI_PATH = "/v1/whoami"
+STATS_PATH = "/v1/stats"
 
 #: Long enough for a cold TLS handshake on a slow link, short enough that a wedged
 #: endpoint does not hold a command open indefinitely.
@@ -623,6 +624,26 @@ def _announce(grant: dict, out) -> str:
     return uri
 
 
+def _project_ok(project: str, out) -> bool:
+    """True when `project` is the dashed UUID the console shows; otherwise a reason and
+    False.
+
+    Asked in `main` as well as inside `authenticate`, because `authenticate` is never
+    reached when the credential already works -- and a mistyped project id that answers
+    "you are already authenticated" is a user who believes they bound this machine to a
+    project they never successfully named.
+    """
+    if PROJECT_ID.match(project):
+        return True
+    print(f"{project!r} is not a project id.\n"
+          f"/memvara authenticate <project-id> takes the dashed UUID the console "
+          f"shows, like {PROJECT_ID_EXAMPLE}.\n"
+          "A slug and a tenant id are refused rather than converted: a credential "
+          "minted against the wrong project is not an error anyone ever sees.",
+          file=out)
+    return False
+
+
 def authenticate(project: "str | None" = None, *, out=None) -> int:
     """Run the whole flow and return a process exit code. 0 is a key on disk.
 
@@ -642,13 +663,7 @@ def authenticate(project: "str | None" = None, *, out=None) -> int:
     # Surrounding whitespace comes off a pasted argument and nothing else does. Trimming
     # what a terminal added is not the same as reshaping what the user meant.
     project = None if project is None else project.strip()
-    if project is not None and not PROJECT_ID.match(project):
-        print(f"{project!r} is not a project id.\n"
-              f"/memvara authenticate <project-id> takes the dashed UUID the console "
-              f"shows, like {PROJECT_ID_EXAMPLE}.\n"
-              "A slug and a tenant id are refused rather than converted: a credential "
-              "minted against the wrong project is not an error anyone ever sees.",
-              file=out)
+    if project is not None and not _project_ok(project, out):
         return 2
 
     try:
@@ -682,3 +697,169 @@ def authenticate(project: "str | None" = None, *, out=None) -> int:
     print(f"Authenticated{where}{how}. The key is in {path}, readable only by you.",
           file=out)
     return 0
+
+
+# -- the four commands ------------------------------------------------------------------
+#
+# Each of the four is `probe` and then, at most, one act. The order is the whole point:
+# `authenticate` against a working credential is a no-op that prints its status, which is
+# what makes it safe to run when unsure, and `stats` against an expired one says
+# "expired" rather than showing an empty store.
+#
+# Nothing here decides anything a person did not ask for. The two irreversible acts --
+# replacing a key and deleting the local copy of one -- are gated by an explicit argument
+# and by having been typed, and neither ever touches a file this module does not own.
+
+#: A command that only answers 0 or 1 cannot say it stopped on purpose, and `login`
+#: stopping on purpose is exactly what its command file has to treat differently from a
+#: failure: one asks the user a question, the other reports an error.
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_USAGE = 2
+EXIT_CONFIRM = 3
+
+COMMANDS = ("authenticate", "login", "logout", "stats")
+
+USAGE = ("usage: memvara_auth.py {" + "|".join(COMMANDS) + "} [project-id]\n"
+         "       memvara_auth.py login [project-id] --confirm")
+
+
+def _stats(*, out) -> int:
+    """`GET /v1/stats` behind the same probe, so an expired key says so.
+
+    Without the probe an expired credential is refused by the stats route and the nearest
+    honest thing to print is that nothing came back -- which a user reads as an empty
+    store and acts on by putting facts into it again.
+    """
+    result = probe()
+    print(result["detail"], file=out)
+    if result["state"] != "authenticated":
+        return EXIT_FAILED
+
+    key, _source = credential()
+    try:
+        status, body = request("GET", STATS_PATH, auth=key)
+    except Unreachable as exc:
+        print(f"{_base_url()} answered whoami and then stopped answering: {exc}",
+              file=out)
+        return EXIT_FAILED
+    if status != 200:
+        print(f"{_base_url()} refused a stats request with HTTP {status}: "
+              f"{_message(body) or 'no reason given'}.", file=out)
+        return EXIT_FAILED
+
+    scope = body.get("scope") or {}
+    print(f"Scope: {scope.get('tenant') or 'unbound'}.", file=out)
+    print(f"Visible here: {body.get('visible')} claims.", file=out)
+    counts = body.get("tenant_counts") or {}
+    if counts:
+        print("Store: " + ", ".join(f"{name} {value}"
+                                    for name, value in sorted(counts.items())) + ".",
+              file=out)
+    print(f"Extractor: {body.get('extractor') or 'unstated'}.", file=out)
+    return EXIT_OK
+
+
+def _logout(*, out) -> int:
+    """Delete `~/.memvara/credentials.json` and name every other place a key still is.
+
+    **Deletes exactly one file and reads the rest.** A host's own MCP configuration is
+    named and left alone: its OAuth client already writes it, and a second writer to one
+    file leaves nobody able to say whose token is live. The person reading this output
+    can decide to edit it; a command that edited it for them could not be undone by
+    anyone who did not already know it had happened.
+
+    Every other credential *source* is named for the same reason the local file is
+    deleted loudly. A machine where `MEMVARA_API_KEY` is still exported is a machine that
+    is still authenticated, and a logout that says nothing about it has told the user
+    something false by omission.
+    """
+    path = _expand(CREDENTIALS)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        print(f"{path} does not exist.", file=out)
+    except OSError as exc:
+        print(f"{path} could not be deleted: {exc}", file=out)
+        return EXIT_FAILED
+    else:
+        print(f"Deleted {path}.", file=out)
+        # Said only when something was actually deleted. A line about a key that still
+        # works, printed on a machine that holds no key, is a sentence about nothing --
+        # and a sentence that appears either way stops being read at all.
+        print("The key it held still works until it is revoked in the console.", file=out)
+
+    if (os.environ.get(ENV_KEY) or "").strip():
+        print(f"{ENV_KEY} is set in this environment and still holds a key.", file=out)
+    for template in HOST_CONFIGS:
+        host = _expand(template)
+        if _header_key(_read_json(host)):
+            print(f"{host} holds a memvara Authorization header. It was not changed.",
+                  file=out)
+    return EXIT_OK
+
+
+def main(argv=None, *, out=None) -> int:
+    """Run one command and return its exit code.
+
+    `authenticate` probes and stops when the credential works. `login` probes and refuses
+    to replace a working credential until `--confirm` says to. Both are the same act with
+    the default reversed, which is why they are two commands rather than one with a flag
+    a user has to know about.
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    out = sys.stdout if out is None else out
+
+    confirm = "--confirm" in argv
+    rest = [arg for arg in argv if arg != "--confirm"]
+    command = rest[0] if rest else ""
+    project = rest[1] if len(rest) > 1 else None
+
+    # Shape first, then meaning. A `logout` handed a project id is a usage error and has
+    # to say so; running it through the project-id check first answers a question about
+    # UUIDs that nobody asked.
+    if command not in COMMANDS or len(rest) > 2:
+        print(USAGE, file=out)
+        return EXIT_USAGE
+    if project is not None and command not in ("authenticate", "login"):
+        print(USAGE, file=out)
+        return EXIT_USAGE
+    if confirm and command != "login":
+        # Accepting a flag a command does not act on is how a user comes to believe they
+        # confirmed something. `--confirm` means one thing here and only `login` has
+        # anything to confirm.
+        print(USAGE, file=out)
+        return EXIT_USAGE
+    if project is not None:
+        # Before the probe, not after it. `authenticate` and `login` both stop early on a
+        # credential that already works, so a check that lives only in the flow never runs
+        # on the machines most likely to have typed the argument for a reason.
+        project = project.strip()
+        if not _project_ok(project, out):
+            return EXIT_USAGE
+
+    try:
+        if command == "logout":
+            return _logout(out=out)
+        if command == "stats":
+            return _stats(out=out)
+
+        result = probe()
+        state = result["state"]
+        if state == "unreachable":
+            print(result["detail"], file=out)
+            return EXIT_FAILED
+        if state == "authenticated":
+            print(result["detail"], file=out)
+            if command == "authenticate":
+                return EXIT_OK
+            if not confirm:
+                print("Nothing was replaced.", file=out)
+                return EXIT_CONFIRM
+        return authenticate(project, out=out)
+    finally:
+        close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

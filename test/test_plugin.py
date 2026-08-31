@@ -67,6 +67,10 @@ ALLOWED_PLUGIN_FILES = {
     pathlib.Path("hooks") / "lib" / "write.py",
     pathlib.Path("auth") / "__init__.py",
     pathlib.Path("auth") / "memvara_auth.py",
+    pathlib.Path("commands") / "authenticate.md",
+    pathlib.Path("commands") / "login.md",
+    pathlib.Path("commands") / "logout.md",
+    pathlib.Path("commands") / "stats.md",
 }
 
 
@@ -4085,9 +4089,19 @@ class Hygiene(unittest.TestCase):
             raw = path.read_text(encoding="utf-8")
             self.assertNotIn("npx", raw, path)
 
-    def test_no_app_json_or_commands(self) -> None:
+    def test_no_app_json(self) -> None:
+        """This was `test_no_app_json_or_commands` and also asserted `commands/` did not
+        exist. That was right while the plugin was prose and an endpoint; shipping four
+        commands the user can type is a different promise, and the same thing happened to
+        `test_no_hooks_or_app_json` when the hooks landed.
+
+        The half about `commands/` is replaced rather than dropped, by two guards that
+        are strictly stronger than "it is absent": `ALLOWED_PLUGIN_FILES` names every file
+        under it one by one, and
+        `Commands.test_every_command_this_plugin_declares_points_at_a_file_that_exists`
+        requires the manifest and the tree to agree on exactly four named commands.
+        """
         self.assertFalse((PLUGIN / ".app.json").exists())
-        self.assertFalse((PLUGIN / "commands").exists())
 
     def test_plugin_tree_has_no_stray_files(self) -> None:
         allowed = set(ALLOWED_PLUGIN_FILES)
@@ -6659,3 +6673,409 @@ class DeviceFlow(unittest.TestCase):
             "mv_the_new_one")
         self.assertEqual(oct(credentials.stat().st_mode & 0o777), "0o600")
         self.assertEqual(self._files_written(), [".memvara/credentials.json"])
+
+
+#: Recorded from `GET /v1/stats` on the live deployment, 2026-08-31. The tenant is the
+#: only edit -- it is an opaque identifier, nothing here reads it, and it is a real
+#: project's. The shape is the point: `stats` reports these fields or it reports nothing
+#: a user could not already get from `whoami`.
+_STATS_OK = {
+    "scope": {"tenant": "prj_recorded", "user": None, "agent": None, "session": None},
+    "visible": 611,
+    "tenant_counts": {"episodes": 1082, "claims": 716, "live_claims": 611,
+                      "ended_claims": 82, "invalidated": 23, "embeddings": 1798,
+                      "joinable_claims": 3},
+    "extractor": "fast-path-only",
+    "read_only": False,
+}
+_STATS_PATH = "/v1/stats"
+
+#: The four commands, written out here rather than read from the manifest or globbed from
+#: the tree. Both of those are the things under test, and a guard that asks them what to
+#: expect agrees with them however wrong they get.
+_COMMAND_NAMES = ("authenticate", "login", "logout", "stats")
+_COMMANDS_DIR = PLUGIN / "commands"
+
+#: A host configuration shaped the way this client writes one: the memvara server block
+#: is nested per checkout under `projects`, not at the top level. Written with a key in
+#: it because a file with no credential in it is not the file this guard is about.
+_HOST_CONFIG_NAME = ".claude.json"
+_HOST_CONFIG = {
+    "numStartups": 41,
+    "projects": {
+        "/a/checkout": {
+            "mcpServers": {
+                "memvara": {
+                    "type": "http",
+                    "url": "https://app.memvara.dev/mcp",
+                    "headers": {"Authorization": "Bearer mv_the_host_wrote_this"},
+                }
+            }
+        }
+    },
+}
+
+
+class Commands(unittest.TestCase):
+    """Four commands, and the two things among them that cannot be taken back.
+
+    A minted key is returned exactly once, so replacing one is destroying one, and
+    deleting the local copy leaves a live write-capable credential on the deployment with
+    nothing on this machine pointing at it. Both acts have to be things the user asked
+    for in the moment rather than things a command did on the way to something else.
+
+    Every expected value here is written out in this file rather than read from the
+    manifest, the tree, or the module under test. All three are what is being checked.
+    """
+
+    def setUp(self) -> None:
+        self._env = {name: os.environ.get(name) for name in
+                     ("HOME", "MEMVARA_API_KEY", "MEMVARA_SERVER_URL")}
+        self._home = tempfile.mkdtemp(prefix="memvara-commands-home-")
+        os.environ["HOME"] = self._home
+        os.environ.pop("MEMVARA_API_KEY", None)
+        os.environ.pop("MEMVARA_SERVER_URL", None)
+        self.calls: "list[tuple[str, str, object, str | None]]" = []
+        self.slept: "list[float]" = []
+        self.opened: "list[str]" = []
+
+    def tearDown(self) -> None:
+        for name, value in self._env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        shutil.rmtree(self._home, ignore_errors=True)
+
+    @property
+    def home(self) -> pathlib.Path:
+        return pathlib.Path(self._home)
+
+    def _auth(self):
+        """The module, with its clock and its browser replaced -- see `DeviceFlow._auth`
+        for why both replacements are safety rather than convenience."""
+        sys.path.insert(0, str(PLUGIN))
+        try:
+            import importlib
+
+            module = importlib.import_module("auth.memvara_auth")
+        finally:
+            sys.path.pop(0)
+        self.addCleanup(module.close)
+
+        clock = {"now": 0.0}
+
+        def _sleep(seconds):
+            self.slept.append(float(seconds))
+            clock["now"] += float(seconds)
+            if clock["now"] > 3600.0:
+                raise AssertionError(
+                    "the poll loop passed an hour of simulated time without stopping; "
+                    "it has no working bound")
+
+        self.addCleanup(setattr, module, "time", module.time)
+        module.time = types.SimpleNamespace(sleep=_sleep,
+                                            monotonic=lambda: clock["now"])
+        self.addCleanup(setattr, module, "webbrowser", module.webbrowser)
+        module.webbrowser = types.SimpleNamespace(open=self.opened.append)
+        return module
+
+    def _replies(self, module, script) -> None:
+        """Recorded replies keyed by path; a path the script does not name fails by name.
+
+        "the command called something it should not have" is the finding in half the
+        tests below, and it should read like one rather than like a `KeyError`.
+        """
+        original = module.request
+        self.addCleanup(setattr, module, "request", original)
+        queues = {path: (list(reply) if isinstance(reply, list) else [reply])
+                  for path, reply in script.items()}
+        calls = self.calls
+
+        def fake(method, path, *, body=None, auth=None, timeout=10.0):
+            calls.append((method, path, body, auth))
+            if path not in queues:
+                raise AssertionError(
+                    f"the command called {method} {path}, which this test did not expect "
+                    "it to call at all")
+            queue = queues[path]
+            reply = queue[0] if len(queue) == 1 else queue.pop(0)
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+
+        module.request = fake
+
+    def _paths(self) -> "list[str]":
+        return [path for _method, path, _body, _auth in self.calls]
+
+    def _snapshot(self) -> "dict[str, bytes]":
+        return {str(path.relative_to(self.home)): path.read_bytes()
+                for path in self.home.rglob("*") if path.is_file()}
+
+    def _credential_file(self, key: str = "mv_local") -> pathlib.Path:
+        path = self.home / ".memvara" / "credentials.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"api_key": key}), encoding="utf-8")
+        os.chmod(path, 0o600)
+        return path
+
+    def test_every_command_this_plugin_declares_points_at_a_file_that_exists(self) -> None:
+        """Non-empty as well as resolvable, and checked in both directions.
+
+        Non-empty because an emptied `commands/` directory otherwise satisfies "every
+        declared command exists" perfectly, and a guard a deletion satisfies has stopped
+        guarding. Both directions because declaring `commands` in `plugin.json` *replaces*
+        the default directory scan rather than adding to it -- so a file added to the
+        tree and not added to the list is a command the host never loads, and nothing
+        about the repository looks wrong.
+
+        The four names are asserted as literals. "whatever is in the tree matches whatever
+        is in the manifest" is satisfied by a plugin that ships two commands, or four
+        different ones.
+        """
+        manifest = _json(PLUGIN / ".claude-plugin" / "plugin.json")
+        declared = manifest.get("commands")
+        self.assertIsInstance(
+            declared, list,
+            "plugin.json must declare its commands as a list of paths; without the "
+            "field the host scans commands/ by convention, which is a different promise "
+            "and one this repository does not otherwise rely on")
+        self.assertTrue(declared, "a plugin that declares no commands ships no commands")
+
+        resolved: "dict[str, pathlib.Path]" = {}
+        for entry in declared:
+            self.assertTrue(str(entry).startswith("./"),
+                            f"{entry!r} must be relative to the plugin root and begin "
+                            "'./', which is the only form the host resolves")
+            path = PLUGIN / str(entry)[2:]
+            self.assertTrue(path.is_file(),
+                            f"{entry} is declared and there is no file there")
+            resolved[path.stem] = path
+
+        self.assertEqual(sorted(resolved), sorted(_COMMAND_NAMES),
+                         "these four commands are what this plugin is for; the manifest "
+                         f"declares {sorted(resolved)}")
+        self.assertEqual(sorted(path.stem for path in _COMMANDS_DIR.glob("*.md")),
+                         sorted(_COMMAND_NAMES),
+                         "the tree and the manifest disagree, and the manifest is what "
+                         "the host reads -- a file here that nobody declared is a "
+                         "command that silently does not exist")
+
+        for name, path in sorted(resolved.items()):
+            text = path.read_text(encoding="utf-8")
+            self.assertTrue(text.startswith("---\n"),
+                            f"{name} has no frontmatter block")
+            front = text.split("---", 2)[1]
+            self.assertRegex(front, r"(?m)^description:[ \t]*\S",
+                             f"{name} states no description, so it is a blank line in "
+                             "the picker and Claude has nothing to decide from")
+
+    def test_no_host_config_is_written_without_confirmation(self) -> None:
+        """This host's own OAuth client already writes `~/.claude.json`. A command that
+        writes there unprompted is a second writer to one file with nobody able to say
+        whose token is live -- measured 2026-08-30, when exactly that ambiguity cost an
+        evening.
+
+        Every command is driven, including the two that do write, and every byte under
+        `$HOME` is compared before and after. `~/.memvara/credentials.json` is the one
+        file allowed to differ; anything else changing is the failure, whether it is a
+        host configuration or something nobody thought of.
+
+        The positive half is the last assertion: `logout` must *name* the host
+        configuration that still holds a key. Silence about it satisfies "wrote nothing"
+        and leaves the user believing they logged out.
+        """
+        module = self._auth()
+        host = self.home / _HOST_CONFIG_NAME
+        host.write_text(json.dumps(_HOST_CONFIG, indent=2), encoding="utf-8")
+        self._credential_file()
+        before = self._snapshot()
+        self.assertIn(_HOST_CONFIG_NAME, before)
+
+        flow = {"/v1/health": (200, _HEALTH_OK),
+                "/v1/whoami": (401, _REFUSED_UNKNOWN),
+                _AUTHORIZE: (201, _DEVICE_AUTHORIZED),
+                _TOKEN: _TOKEN_APPROVED}
+        working = {"/v1/health": (200, _HEALTH_OK), "/v1/whoami": (200, _WHOAMI_OK),
+                   _STATS_PATH: (200, _STATS_OK)}
+
+        logout = io.StringIO()
+        runs = (
+            (["authenticate"], flow, io.StringIO()),
+            (["authenticate"], working, io.StringIO()),
+            (["login"], working, io.StringIO()),
+            (["login", "--confirm"], dict(working, **{_AUTHORIZE: (201, _DEVICE_AUTHORIZED),
+                                                      _TOKEN: _TOKEN_APPROVED}),
+             io.StringIO()),
+            (["stats"], working, io.StringIO()),
+            (["logout"], {}, logout),
+        )
+        for argv, script, out in runs:
+            with self.subTest(command=" ".join(argv)):
+                self.calls = []
+                self._replies(module, script)
+                module.main(list(argv), out=out)
+                after = self._snapshot()
+                for name, content in before.items():
+                    if name == ".memvara/credentials.json":
+                        continue
+                    self.assertEqual(
+                        after.get(name), content,
+                        f"{' '.join(argv)} changed {name}, which it does not own")
+                new = set(after) - set(before)
+                self.assertFalse(
+                    new - {".memvara/credentials.json"},
+                    f"{' '.join(argv)} created {sorted(new)} under $HOME")
+
+        self.assertIn(str(host), logout.getvalue(),
+                      "logout said nothing about the host configuration that still "
+                      "holds a memvara key, so the user believes they logged out")
+
+    def test_logout_says_the_key_still_exists_until_it_is_revoked(self) -> None:
+        """Deleting the local file is not revocation. A user who believes otherwise
+        leaves a live write-capable credential behind, on a deployment they have stopped
+        looking at.
+
+        Both halves. The act must actually happen -- a command that says the right
+        sentence and deletes nothing passes a scan for the sentence -- and the sentence
+        must not be said when there was nothing to delete, or it becomes a line that
+        appears whether or not there is a key it could be true of.
+        """
+        module = self._auth()
+        credentials = self._credential_file()
+        out = io.StringIO()
+        self.assertEqual(module.main(["logout"], out=out), 0)
+        text = out.getvalue()
+
+        self.assertFalse(credentials.exists(),
+                         "logout printed its message and left the credential in place")
+        self.assertIn(str(credentials), text,
+                      "logout must name the file it deleted; 'logged out' names nothing "
+                      "a user can check")
+        said = [line for line in text.splitlines() if "revoke" in line.lower()]
+        self.assertTrue(said, f"logout never mentions revocation at all: {text!r}")
+        self.assertTrue(
+            any("still" in line.lower() for line in said),
+            "logout names revocation without saying the key still works until then, "
+            f"which reads as a claim that it was revoked: {said}")
+
+        empty = io.StringIO()
+        module.main(["logout"], out=empty)
+        self.assertNotIn("revoke", empty.getvalue().lower(),
+                         "logout told a machine holding no credential that its key "
+                         "still works, which is a sentence about nothing")
+
+    def test_authenticate_does_not_start_a_device_flow_when_the_credential_already_works(
+            self) -> None:
+        """The no-op is what makes the command safe to run when unsure.
+
+        Without it `authenticate` mints a second key every time somebody wonders whether
+        they are logged in, and the first one is still live on the deployment with
+        nothing on this machine pointing at it.
+
+        The second half is what stops the guard passing on a command that never does
+        anything: with no credential, the flow must run.
+        """
+        module = self._auth()
+        os.environ["MEMVARA_API_KEY"] = "mv_working"
+        self._replies(module, {"/v1/health": (200, _HEALTH_OK),
+                               "/v1/whoami": (200, _WHOAMI_OK)})
+        out = io.StringIO()
+        self.assertEqual(module.main(["authenticate"], out=out), 0,
+                         "a machine that is already authenticated is not an error")
+        self.assertNotIn(_AUTHORIZE, self._paths(),
+                         "authenticate started a device flow against a credential that "
+                         f"works: {self._paths()}")
+        self.assertEqual(self.opened, [], "a browser was opened for a login nobody needed")
+        self.assertEqual(self._snapshot(), {},
+                         "authenticate wrote a file without minting anything")
+        self.assertIn("write", out.getvalue(),
+                      "the no-op must still report what the live credential is, or it "
+                      "is indistinguishable from a command that did nothing")
+
+        os.environ.pop("MEMVARA_API_KEY")
+        self.calls = []
+        self._replies(module, {"/v1/health": (200, _HEALTH_OK),
+                               _AUTHORIZE: (201, _DEVICE_AUTHORIZED),
+                               _TOKEN: _TOKEN_APPROVED})
+        self.assertEqual(module.main(["authenticate"], out=io.StringIO()), 0)
+        self.assertIn(_AUTHORIZE, self._paths(),
+                      "with no credential on the machine, authenticate has to run the "
+                      f"flow: {self._paths()}")
+
+    def test_login_will_not_replace_a_working_credential_without_confirmation(self) -> None:
+        """`login` exists to replace a credential, so the confirmation is the whole of
+        its safety: the key it would overwrite was returned exactly once and this machine
+        holds the only copy.
+
+        Refusing is not the behaviour being bought -- the confirmed run must go through,
+        or the command is broken in the more expensive direction.
+        """
+        module = self._auth()
+        os.environ["MEMVARA_API_KEY"] = "mv_working"
+        self._replies(module, {"/v1/health": (200, _HEALTH_OK),
+                               "/v1/whoami": (200, _WHOAMI_OK)})
+        out = io.StringIO()
+        code = module.main(["login"], out=out)
+        self.assertNotEqual(code, 0,
+                            "an unconfirmed login that reports success is one the caller "
+                            "cannot tell from a completed one")
+        self.assertNotIn(_AUTHORIZE, self._paths(),
+                         "login began replacing a working credential before anybody "
+                         "agreed to it")
+        self.assertEqual(self._snapshot(), {}, "the refused login wrote a file anyway")
+        self.assertIn("write", out.getvalue(),
+                      "the refusal must show what it declined to replace, or the user "
+                      "is asked to confirm something they cannot see")
+
+        self.calls = []
+        self._replies(module, {"/v1/health": (200, _HEALTH_OK),
+                               "/v1/whoami": (200, _WHOAMI_OK),
+                               _AUTHORIZE: (201, _DEVICE_AUTHORIZED),
+                               _TOKEN: _TOKEN_APPROVED})
+        self.assertEqual(module.main(["login", "--confirm"], out=io.StringIO()), 0)
+        self.assertIn(_AUTHORIZE, self._paths(),
+                      "a confirmed login must actually replace the credential")
+        self.assertEqual(sorted(self._snapshot()), [".memvara/credentials.json"])
+
+    def test_a_mistyped_project_id_is_refused_before_the_credential_is_probed(self) -> None:
+        """The no-op and the argument check are in tension, and the argument check has to
+        win.
+
+        `authenticate` and `login` both stop early on a credential that already works, so
+        a project id checked inside the flow is never looked at on exactly the machines
+        where somebody typed one. What that user sees is "you are already authenticated",
+        exit 0, and no sign at all that the project they named was refused -- which is the
+        same class of silence as a credential minted against the wrong project.
+
+        Found by running the command rather than by reading it: `authenticate my-project`
+        against a live working credential answered 0.
+        """
+        module = self._auth()
+        os.environ["MEMVARA_API_KEY"] = "mv_working"
+        for command in ("authenticate", "login"):
+            with self.subTest(command=command):
+                self.calls = []
+                self._replies(module, {"/v1/health": (200, _HEALTH_OK),
+                                       "/v1/whoami": (200, _WHOAMI_OK)})
+                out = io.StringIO()
+                self.assertNotEqual(
+                    module.main([command, "my-project"], out=out), 0,
+                    f"{command} reported success on a project id it never accepted")
+                self.assertEqual(self.calls, [],
+                                 "the deployment was asked anything at all before the "
+                                 f"argument was looked at: {self._paths()}")
+                self.assertRegex(
+                    out.getvalue(),
+                    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                    r"-[0-9a-fA-F]{12}",
+                    "the refusal must show the form that works rather than only saying "
+                    f"no: {out.getvalue()}")
+
+        self.calls = []
+        self._replies(module, {"/v1/health": (200, _HEALTH_OK),
+                               "/v1/whoami": (200, _WHOAMI_OK)})
+        self.assertEqual(module.main(["authenticate", _PROJECT_ID], out=io.StringIO()), 0,
+                         "a well-formed project id must still reach the no-op that makes "
+                         "this command safe to run when unsure")
