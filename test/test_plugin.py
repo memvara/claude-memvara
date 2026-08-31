@@ -7079,3 +7079,123 @@ class Commands(unittest.TestCase):
         self.assertEqual(module.main(["authenticate", _PROJECT_ID], out=io.StringIO()), 0,
                          "a well-formed project id must still reach the no-op that makes "
                          "this command safe to run when unsure")
+
+
+#: The heading the auth section is written under. Named here rather than searched for by
+#: keyword because the guard below reads only what sits beneath it: a keyword scan of the
+#: whole README passes on four sentences scattered through a page about hooks, which is
+#: not a section anybody can be pointed at.
+_AUTH_HEADING = "## Four commands for the credential itself"
+
+
+class AuthReadme(unittest.TestCase):
+    """The README is where this plugin says what it runs on your machine.
+
+    It already does that for the hooks, at length, because a background process nobody
+    was told about is how someone finds one. The four commands are the same promise: they
+    run `python3` here and one of them writes a key into the user's home directory, and a
+    README that describes the hooks and not those is a README that stopped being true at
+    the commit before this one.
+    """
+
+    def _section(self) -> str:
+        """Everything under the auth heading, up to the next one.
+
+        Bounded deliberately. Every assertion below is a substring check, and against the
+        whole README each one would be satisfied by a word that happens to appear in the
+        hooks section -- `python3` and `~/.memvara/` are both already there.
+        """
+        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(_AUTH_HEADING, text,
+                      f"the README has no {_AUTH_HEADING!r} section, so the commands it "
+                      "now ships are undocumented")
+        return text.split(_AUTH_HEADING, 1)[1].split("\n## ", 1)[0]
+
+    @staticmethod
+    def _sentences(section: str) -> "list[str]":
+        """Sentences, not lines. The README is hard-wrapped, so a claim about revocation
+        is routinely split across two lines and neither half holds both words."""
+        return re.split(r"(?<=[.!?])\s+", " ".join(section.split()))
+
+    def test_the_readme_says_what_the_auth_commands_run_and_write(self) -> None:
+        """Positive: names the four commands, python3, and ~/.memvara/credentials.json.
+
+        Stated positively because a README that has simply stopped describing the auth
+        surface is indistinguishable, to a negative-only guard, from one that never had it.
+
+        The four names come from `_COMMAND_NAMES`, which is written out in this file. The
+        README and the manifest are both things under test here and neither may be asked
+        what to expect.
+        """
+        section = self._section()
+        for name in _COMMAND_NAMES:
+            self.assertIn(f"/memvara:{name}", section,
+                          f"the section never names /memvara:{name}, so one of the four "
+                          "commands ships undocumented")
+        self.assertIn("python3", section,
+                      "the section does not say that python3 runs on this machine when a "
+                      "command is invoked, which is the whole of what a reader is owed "
+                      "before they type one")
+        self.assertIn("~/.memvara/credentials.json", section,
+                      "the section does not name the file these commands write; 'stores "
+                      "your key' names nothing a user can find, check or delete")
+        self.assertIn("0600", section,
+                      "the section names the file it writes without naming the mode it "
+                      "writes it at, and a key is what is in it")
+
+    def test_the_readme_says_a_host_configuration_is_changed_only_by_agreement(self) -> None:
+        """The one promise a user cannot verify after the fact.
+
+        This host's own OAuth client writes `~/.claude.json`, so a second writer to it
+        leaves nobody able to say whose token is live. The code refuses to be that writer;
+        the README is where a reader learns they can run these commands without finding
+        out afterwards.
+        """
+        said = [s for s in self._sentences(self._section())
+                if "configuration" in s.lower()]
+        self.assertTrue(said,
+                        "the section never mentions the client configuration a key may "
+                        "also be sitting in, so a user reads 'writes one file' as 'there "
+                        "is one place a key can be'")
+        self.assertTrue(
+            any(word in s.lower() for s in said
+                for word in ("say yes", "agree", "ask", "confirm", "approve")),
+            "the section names the host configuration without saying it is changed only "
+            f"if the user agrees, which is the guarantee being made: {said}")
+
+    def test_the_readme_says_logout_is_local_and_the_key_outlives_it(self) -> None:
+        """Deleting the local copy is not revocation, and a user who reads it as one
+        walks away from a live write-capable key.
+
+        The second assertion is the load-bearing one: a sentence naming revocation and
+        not saying the key still works reads as a claim that revocation happened.
+        """
+        said = [s for s in self._sentences(self._section()) if "revoke" in s.lower()]
+        self.assertTrue(said, "the section never mentions revocation, so logout reads as "
+                              "the end of the key rather than the end of this copy of it")
+        self.assertTrue(
+            any("still" in s.lower() for s in said),
+            f"the section names revocation without saying the key still works until "
+            f"then: {said}")
+
+    def test_the_readme_states_both_argument_forms_and_what_the_bare_one_needs(self) -> None:
+        """Both forms, and the status the bare one answers today.
+
+        The no-argument form depends on a console change that is not deployed everywhere,
+        and a user who types it against a deployment without it gets `422`. Naming the
+        status is what turns that from a wall into a sentence about which form to use.
+
+        `400` is deliberately not the number here: it is what a *slug* gets from the
+        route, while an omitted project fails schema validation first. The plan said 400
+        until it was measured against the live endpoint on 2026-08-31.
+        """
+        section = self._section()
+        self.assertIn("`/memvara:authenticate`", section,
+                      "the section never shows the no-argument form on its own")
+        self.assertIn("/memvara:authenticate <project-id>", section,
+                      "the section never shows the form that works against a deployment "
+                      "which has not taken the console change")
+        self.assertIn("422", section,
+                      "the section does not name the status a bare authenticate answers "
+                      "until the console change is deployed, so the command's own advice "
+                      "arrives with nothing in the README to match it against")
