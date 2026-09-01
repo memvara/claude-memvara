@@ -104,12 +104,14 @@ ALLOWED_HOOK_FILES = {
     "lib/standing.py",
     "lib/write.py",
     # Vendored because the tree is copied whole with ZERO transforms, and read
-    # before being listed. `hosts/codex.py` and `hosts/opencode.py` are other
-    # clients' records: inert here, since `run.py --host claude` never imports
-    # them, and present so this copy stays byte-identical to the library. The two
-    # `js/` modules are OpenCode's bridge, which Claude Code never loads.
+    # before being listed. `hosts/codex.py`, `hosts/opencode.py` and
+    # `hosts/cursor.py` are other clients' records: inert here, since
+    # `run.py --host claude` never imports them, and present so this copy stays
+    # byte-identical to the library. The two `js/` modules are OpenCode's bridge,
+    # which Claude Code never loads.
     "hosts/codex.py",
     "hosts/opencode.py",
+    "hosts/cursor.py",
     "js/shim.mjs",
     "js/opencode.mjs",
 }
