@@ -113,8 +113,6 @@ jobs:
               'path=memvara/skills/memvara\\n'
           )
           "
-          # CLAUDE.md is in the list, or a canonical-only change composes a new file and
-          # opens nothing -- the sync would run, succeed, and leave the edit unshipped.
           echo "changed=true" >> "$GITHUB_ENV"
           echo "sha=$sha" >> "$GITHUB_ENV"
 
