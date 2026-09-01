@@ -1251,7 +1251,7 @@ class Hooks(unittest.TestCase):
         self.assertLess(write, clip, "hash the full line, then clip for display")
 
     def test_the_episode_pass_selects_wider_and_injects_no_wider(self) -> None:
-        """Select generously, inject tersely. The first version had this backwards.
+        r"""Select generously, inject tersely. The first version had this backwards.
 
         `EPISODE_K` was set *below* `K` to "bound" the escalation, on the reasoning that an
         episode is the largest thing this hook can inject. But `k` is the candidate cap that
