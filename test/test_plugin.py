@@ -104,12 +104,14 @@ ALLOWED_HOOK_FILES = {
     "lib/standing.py",
     "lib/write.py",
     # Vendored because the tree is copied whole with ZERO transforms, and read
-    # before being listed. `hosts/codex.py` and `hosts/opencode.py` are other
-    # clients' records: inert here, since `run.py --host claude` never imports
-    # them, and present so this copy stays byte-identical to the library. The two
-    # `js/` modules are OpenCode's bridge, which Claude Code never loads.
+    # before being listed. `hosts/codex.py`, `hosts/opencode.py` and
+    # `hosts/cursor.py` are other clients' records: inert here, since
+    # `run.py --host claude` never imports them, and present so this copy stays
+    # byte-identical to the library. The two `js/` modules are OpenCode's bridge,
+    # which Claude Code never loads.
     "hosts/codex.py",
     "hosts/opencode.py",
+    "hosts/cursor.py",
     "js/shim.mjs",
     "js/opencode.mjs",
 }
@@ -652,6 +654,34 @@ class HookTree(unittest.TestCase):
             written, (ROOT / "hooks.lock").read_text(encoding="utf-8"),
             "hooks-sync.yml would rewrite hooks.lock differently from how it is "
             "committed, so every scheduled run would open a PR that changes nothing")
+
+    def test_the_sync_workflow_copies_the_tree_this_repository_actually_vendors(self) -> None:
+        """The destination path is the half the heredoc guard cannot check.
+
+        A workflow that rewrites the lock perfectly and copies into the wrong directory
+        leaves the old tree in place and the lock claiming a sha it does not hold -- a
+        pair agreeing with each other while both are wrong, which is this project's
+        commonest defect shape. `HOOKS` is where the tree is on disk here, so this
+        compares the workflow against the repository rather than against a copy of itself.
+
+        The decision must also be taken with a command that sees UNTRACKED files. `git
+        diff` does not, and a module the library ADDS lands untracked: `hosts/cursor.py`
+        was exactly that, so a `git diff` gate would have dropped it and re-copied it
+        nightly without ever opening a pull request.
+        """
+        source = (ROOT / ".github" / "workflows" / "hooks-sync.yml").read_text(
+            encoding="utf-8")
+        dest = HOOKS.relative_to(ROOT).as_posix()
+        self.assertIn(f"rm -rf {dest}\n", source,
+                      f"hooks-sync.yml does not clear {dest} before copying")
+        self.assertIn(f'cp -R "$src" {dest}\n', source,
+                      f"hooks-sync.yml does not copy the library tree into {dest}")
+        self.assertIn(f'if [ -z "$(git status --porcelain -- {dest})" ]; then', source,
+                      f"hooks-sync.yml decides on a different path than {dest}")
+        self.assertNotIn("git diff --quiet", source,
+                         "`git diff` cannot see a file the library ADDED -- it lands "
+                         "untracked -- so the addition is dropped and re-copied nightly "
+                         "in silence. `git status --porcelain` lists untracked entries")
 
     def test_the_registration_file_is_what_the_generator_produces(self) -> None:
         """`hooks.json` is the one unvendored file, so it is checked against its source.
@@ -1249,7 +1279,7 @@ class Hooks(unittest.TestCase):
         self.assertLess(write, clip, "hash the full line, then clip for display")
 
     def test_the_episode_pass_selects_wider_and_injects_no_wider(self) -> None:
-        """Select generously, inject tersely. The first version had this backwards.
+        r"""Select generously, inject tersely. The first version had this backwards.
 
         `EPISODE_K` was set *below* `K` to "bound" the escalation, on the reasoning that an
         episode is the largest thing this hook can inject. But `k` is the candidate cap that
