@@ -8283,3 +8283,52 @@ class AuthReadme(unittest.TestCase):
                       "the section does not name the status a bare authenticate answers "
                       "until the console change is deployed, so the command's own advice "
                       "arrives with nothing in the README to match it against")
+
+
+class SkillSyncWorkflow(unittest.TestCase):
+    """`skill-sync.yml` must open a pull request only when there is something in it.
+
+    The sibling of the hook-sync guards, added for the same pair of defects, found in
+    `hooks-sync.yml` and present here verbatim.
+    """
+
+    SOURCE = ROOT / ".github" / "workflows" / "skill-sync.yml"
+
+    def test_the_sync_decides_before_it_rewrites_the_lock(self) -> None:
+        """A sha bumped first makes the decision fire on every library commit.
+
+        `skill.lock`'s sha used to be written before anything was compared, so the
+        comparison saw the lock differ after ANY commit to the library -- one touching
+        only the core, the tests or the docs included -- and opened a pull request whose
+        entire diff was that one line. Seven repositories carried exactly such a PR,
+        pinning one sha, open and unread, until they were closed by hand. Both shas name
+        a commit holding these exact bytes when the tree is unchanged, so both are
+        truthful, and the freshness gate compares BYTES against the library's current
+        HEAD rather than against the pinned sha -- it is green either way.
+
+        Stated positively: the decision must name the skill and CLAUDE.md, and must NOT
+        name `skill.lock`, which is the derived half.
+        """
+        source = self.SOURCE.read_text(encoding="utf-8")
+        skill = SKILL.relative_to(ROOT).as_posix()
+        self.assertIn(f'if [ -z "$(git status --porcelain -- {skill} CLAUDE.md)" ]; then',
+                      source,
+                      f"skill-sync.yml must decide on {skill} and CLAUDE.md, before the "
+                      "lock is written and without the lock in the comparison")
+        decision = source.index("git status --porcelain")
+        self.assertLess(decision, source.index("skill.lock').write_text"),
+                        "the decision must be taken BEFORE skill.lock is rewritten, or "
+                        "the rewritten sha is what the decision sees")
+
+    def test_the_sync_can_see_a_file_the_library_added(self) -> None:
+        """`git diff` cannot, and that is how an addition is dropped in silence.
+
+        A file the library ADDS lands untracked after `cp -R`, and `git diff --quiet`
+        never reports it -- so the addition sets changed=false, is deleted by the next
+        run's `rm -rf`, and is re-copied, nightly, forever. `hosts/cursor.py` was exactly
+        such an addition in the hook tree. `git status --porcelain` lists untracked
+        entries; this asserts the blind command is gone rather than merely that the
+        seeing one is present, because both can be there at once.
+        """
+        self.assertNotIn("git diff --quiet", self.SOURCE.read_text(encoding="utf-8"),
+                         "`git diff` cannot see a file the library ADDED")

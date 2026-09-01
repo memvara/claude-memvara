@@ -81,6 +81,25 @@ jobs:
               raise SystemExit('library frontmatter is no longer "name: memvara"')
           p.write_text(text.replace('name: memvara\n', 'name: memory\n', 1), encoding='utf-8')
           RENAME
+          # Decided from the TREE, and BEFORE the lock is rewritten. A sha bumped
+          # unconditionally makes the check fire on every library commit, skill-touching
+          # or not, opening a pull request whose whole diff is one sha line. Seven
+          # repositories carried exactly such a PR, open and unread, until they were
+          # closed by hand. Both shas name a commit holding these exact bytes when the
+          # tree is unchanged, so both are truthful and there is nothing to open a PR
+          # about. `skill.lock` is deliberately NOT in the comparison: it is the derived
+          # half, and comparing it is what made the decision circular.
+          #
+          # `git status --porcelain`, not `git diff`, because only the former sees
+          # UNTRACKED files: a file the library ADDS lands untracked after `cp -R`, and
+          # a `git diff` gate would drop it, then re-copy it nightly in silence.
+          # CLAUDE.md stays in the comparison -- a canonical-only change composes a new
+          # file here and must still ship.
+          if [ -z "$(git status --porcelain -- plugin/skills/memory CLAUDE.md)" ]; then
+            echo "changed=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
           sha=$(git -C /tmp/memvara rev-parse HEAD)
           python3 -c "
           from pathlib import Path
@@ -96,12 +115,8 @@ jobs:
           "
           # CLAUDE.md is in the list, or a canonical-only change composes a new file and
           # opens nothing -- the sync would run, succeed, and leave the edit unshipped.
-          if git diff --quiet -- plugin/skills/memory skill.lock CLAUDE.md; then
-            echo "changed=false" >> "$GITHUB_ENV"
-          else
-            echo "changed=true" >> "$GITHUB_ENV"
-            echo "sha=$sha" >> "$GITHUB_ENV"
-          fi
+          echo "changed=true" >> "$GITHUB_ENV"
+          echo "sha=$sha" >> "$GITHUB_ENV"
 
       - name: Open PR
         if: env.changed == 'true'
