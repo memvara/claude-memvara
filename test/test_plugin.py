@@ -103,6 +103,15 @@ ALLOWED_HOOK_FILES = {
     "lib/transcript.py",
     "lib/standing.py",
     "lib/write.py",
+    # Vendored because the tree is copied whole with ZERO transforms, and read
+    # before being listed. `hosts/codex.py` and `hosts/opencode.py` are other
+    # clients' records: inert here, since `run.py --host claude` never imports
+    # them, and present so this copy stays byte-identical to the library. The two
+    # `js/` modules are OpenCode's bridge, which Claude Code never loads.
+    "hosts/codex.py",
+    "hosts/opencode.py",
+    "js/shim.mjs",
+    "js/opencode.mjs",
 }
 
 #: The hook half is derived rather than restated. Two hand-maintained lists of the same
@@ -1943,7 +1952,7 @@ class Hooks(unittest.TestCase):
         original = os.environ.get(SENTINEL)
         os.environ[SENTINEL] = "1"
         try:
-            result, usage = _payload("anything at all", "prompt")
+            result, usage, _model = _payload("anything at all", "prompt")
             self.assertEqual(result, "", "extraction ran despite the recursion sentinel")
             self.assertEqual(usage, {}, "a blocked run must report no tokens spent")
         finally:
@@ -1986,7 +1995,7 @@ class Hooks(unittest.TestCase):
         extract_mod.subprocess.run = lambda *a, **k: _Dead()  # type: ignore[assignment]
         extract_mod.log = logged.append  # type: ignore[assignment]
         try:
-            result, usage = extract_mod._payload("a turn", "a prompt")
+            result, usage, _model = extract_mod._payload("a turn", "a prompt")
         finally:
             extract_mod.subprocess.run = original_run  # type: ignore[assignment]
             extract_mod.log = original_log  # type: ignore[assignment]
@@ -2026,7 +2035,7 @@ class Hooks(unittest.TestCase):
         extract_mod.subprocess.run = _timeout  # type: ignore[assignment]
         extract_mod.log = logged.append  # type: ignore[assignment]
         try:
-            result, usage = extract_mod._payload("a turn", "a prompt")
+            result, usage, _model = extract_mod._payload("a turn", "a prompt")
         finally:
             extract_mod.subprocess.run = original_run  # type: ignore[assignment]
             extract_mod.log = original_log  # type: ignore[assignment]
@@ -2111,7 +2120,7 @@ class Hooks(unittest.TestCase):
         extract_mod.raise_capture_alert = raised.append  # type: ignore[assignment]
         original_env = os.environ.pop(extract_mod.SENTINEL, None)
         try:
-            result, usage = extract_mod._payload("a turn", "a prompt")
+            result, usage, _model = extract_mod._payload("a turn", "a prompt")
         finally:
             extract_mod.subprocess.run = original_run  # type: ignore[assignment]
             extract_mod.log = original_log  # type: ignore[assignment]
@@ -2157,7 +2166,7 @@ class Hooks(unittest.TestCase):
         original_env = os.environ.get(SENTINEL)
         os.environ[SENTINEL] = "1"
         try:
-            result, usage = _payload("anything at all", "prompt")
+            result, usage, _model = _payload("anything at all", "prompt")
         finally:
             extract_mod.raise_capture_alert = original_raise  # type: ignore[assignment]
             if original_env is None:
@@ -2195,7 +2204,7 @@ class Hooks(unittest.TestCase):
         extract_mod.subprocess.run = lambda *a, **k: _Fine()  # type: ignore[assignment]
         extract_mod.clear_capture_alert = lambda: cleared.append(True)  # type: ignore[assignment]
         try:
-            result, _usage = extract_mod._payload("a turn", "a prompt")
+            result, _usage, _model = extract_mod._payload("a turn", "a prompt")
         finally:
             extract_mod.subprocess.run = original_run  # type: ignore[assignment]
             extract_mod.clear_capture_alert = original_clear  # type: ignore[assignment]
@@ -2285,7 +2294,10 @@ class Extraction(unittest.TestCase):
 
     def _facts(self, extract, reply: str, turn: str = "irrelevant", injected=()):
         original = extract._payload
-        extract._payload = lambda text, prompt: (reply, {})
+        # Three values since memvara/memvara#139: the model label follows the rung that
+        # answered, because a host that mines with its own CLI must not be accounted
+        # against the model claude -p pins.
+        extract._payload = lambda text, prompt: (reply, {}, "claude")
         try:
             return extract.triples(turn, injected=injected)
         finally:
@@ -4992,6 +5004,11 @@ class Hygiene(unittest.TestCase):
 
     def test_plugin_tree_has_no_stray_files(self) -> None:
         allowed = set(ALLOWED_PLUGIN_FILES)
+        # The hook tree is admitted by NAME from the same allowlist `Hooks` checks in both
+        # directions -- not by a `hooks/**` wildcard, which would let a stray script ship
+        # from this plugin without anything going red.
+        for rel in ALLOWED_HOOK_FILES:
+            allowed.add(pathlib.Path("hooks") / rel)
         for path in SKILL.rglob("*"):
             if path.is_file():
                 allowed.add(path.relative_to(PLUGIN))
@@ -5304,7 +5321,10 @@ class ParaphraseRepair(unittest.TestCase):
         reply = json.dumps({"facts": [
             {"subject": "user", "predicate": "prefers", "object": obj}]})
         original = extract._payload
-        extract._payload = lambda text, prompt: (reply, {})
+        # Three values since memvara/memvara#139: the model label follows the rung that
+        # answered, because a host that mines with its own CLI must not be accounted
+        # against the model claude -p pins.
+        extract._payload = lambda text, prompt: (reply, {}, "claude")
         try:
             return extract.triples(turn)
         finally:
@@ -5345,7 +5365,10 @@ class ParaphraseRepair(unittest.TestCase):
         reply = json.dumps({"facts": [
             {"subject": "user", "predicate": "working_on", "object": "the migration"}]})
         original = e._payload
-        e._payload = lambda text, prompt: (reply, {})
+        # Three values since memvara/memvara#139 -- the model label follows the rung
+        # that answered, so a host mining with its own CLI is not accounted against
+        # the model claude -p pins.
+        e._payload = lambda text, prompt: (reply, {}, "claude")
         try:
             facts = e.triples(turn)
         finally:
