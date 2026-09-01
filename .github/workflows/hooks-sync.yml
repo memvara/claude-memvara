@@ -57,6 +57,23 @@ jobs:
           # bytes must match the committed lock exactly or every night opens a PR that
           # changes nothing; `test_the_sync_workflow_rewrites_the_lock_it_already_has`
           # compares them.
+          # Decided from the TREE, and BEFORE the lock is rewritten. A sha bumped
+          # unconditionally makes the check fire on every library commit,
+          # hook-touching or not, opening a pull request whose whole diff is one sha
+          # line -- claude-memvara#92 was exactly that, and it sat unread. Both shas
+          # name a commit holding these exact bytes when the tree is unchanged, so
+          # both are truthful and there is nothing to open a PR about.
+          #
+          # `git status --porcelain`, not `git diff`, because only the former sees
+          # UNTRACKED files: a module the library ADDS -- which is what
+          # plugin/hooks/hosts/cursor.py was this morning -- lands untracked, and a
+          # `git diff` gate would drop it and re-copy it nightly in silence. A file SET
+          # is the drift this repository's own guard went red on.
+          if [ -z "$(git status --porcelain -- plugin/hooks)" ]; then
+            echo "changed=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
           sha=$(git -C /tmp/memvara rev-parse HEAD)
           cat > hooks.lock <<LOCK
           # The library commit whose plugin/hooks/ tree this plugin vendors.
@@ -70,12 +87,8 @@ jobs:
           host=$host
           LOCK
 
-          if git diff --quiet -- plugin/hooks hooks.lock; then
-            echo "changed=false" >> "$GITHUB_ENV"
-          else
-            echo "changed=true" >> "$GITHUB_ENV"
-            echo "sha=$sha" >> "$GITHUB_ENV"
-          fi
+          echo "changed=true" >> "$GITHUB_ENV"
+          echo "sha=$sha" >> "$GITHUB_ENV"
 
       - name: Open PR
         if: env.changed == 'true'
