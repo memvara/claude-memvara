@@ -2292,6 +2292,40 @@ class Extraction(unittest.TestCase):
         finally:
             sys.path.pop(0)
 
+    def test_the_ledger_names_the_model_that_actually_ran(self) -> None:
+        """The whole reason `_payload` grew a third value, and nothing was checking it.
+
+        Every other `_payload` double in this file returns an empty usage dict, and
+        `triples()` records only `if usage:` -- so the model label they supply is never
+        read, and a regression to a hardcoded `MODEL` would leave every one of them green.
+        The ledger would then attribute a Codex or OpenCode extraction to
+        `claude-haiku-4-5-20251001`, a model that never ran, in the one file whose whole
+        job is to say what was spent.
+        """
+        from lib import extract as extract_mod  # noqa: PLC0415
+
+        recorded: "list[str]" = []
+        original_payload = extract_mod._payload
+        original_record = extract_mod.record_extraction
+        reply = json.dumps({"facts": [
+            {"subject": "user", "predicate": "prefers", "object": "fish"}]})
+        # A non-empty usage, which is what makes `triples()` reach the recorder at all,
+        # and a label that is NOT the pinned Claude model -- the case that matters.
+        extract_mod._payload = (  # type: ignore[assignment]
+            lambda text, prompt: (reply, {"input_tokens": 11}, "codex"))
+        extract_mod.record_extraction = (  # type: ignore[assignment]
+            lambda usage, model: recorded.append(model))
+        try:
+            extract_mod.triples("a turn")
+        finally:
+            extract_mod._payload = original_payload  # type: ignore[assignment]
+            extract_mod.record_extraction = original_record  # type: ignore[assignment]
+
+        self.assertEqual(
+            recorded, ["codex"],
+            "the ledger did not record the rung that answered; a host mining with its "
+            "own CLI would be accounted against the model claude -p pins")
+
     def _facts(self, extract, reply: str, turn: str = "irrelevant", injected=()):
         original = extract._payload
         # Three values since memvara/memvara#139: the model label follows the rung that
@@ -5004,11 +5038,6 @@ class Hygiene(unittest.TestCase):
 
     def test_plugin_tree_has_no_stray_files(self) -> None:
         allowed = set(ALLOWED_PLUGIN_FILES)
-        # The hook tree is admitted by NAME from the same allowlist `Hooks` checks in both
-        # directions -- not by a `hooks/**` wildcard, which would let a stray script ship
-        # from this plugin without anything going red.
-        for rel in ALLOWED_HOOK_FILES:
-            allowed.add(pathlib.Path("hooks") / rel)
         for path in SKILL.rglob("*"):
             if path.is_file():
                 allowed.add(path.relative_to(PLUGIN))
