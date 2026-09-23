@@ -4,6 +4,6 @@
 # host= names the record in hooks/hosts/ that hooks/hooks.json is generated from. It is
 # this repository's own: hooks-sync.yml reads it and writes it back, never overwrites it.
 repo=memvara/memvara
-sha=64581f732dbbe7d64b685086e935001a9c4899d8
+sha=a4789634262f64efae318f306d90b0756e8877fe
 path=plugin/hooks
 host=claude
