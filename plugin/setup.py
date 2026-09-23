@@ -134,8 +134,9 @@ COSTS = {
                      "/memvara:setup verify-key shows both before anything is turned on.",
     "synthesis": "One chat call to your model per recall that asks for a summary.",
     "metadata_filters": "No model call. The filter runs inside the store, before the "
-                        "number of results is cut, so a filtered search still returns as "
-                        "many matches as exist.",
+                        "limit on the number of results is applied, so a filtered search "
+                        "returns up to the number of results asked for whenever that many "
+                        "matches exist.",
     "encryption": "Under 1 ms more per write, and more memory from the first search, when "
                   "the vectors are decrypted into memory instead of read from disk. "
                   "Measured on a store of 20,000 claims: 0.53 ms against 0.30 ms per write, "
