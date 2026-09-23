@@ -5,6 +5,13 @@ switches, the counts and the project are read by the same code the hooks run. Th
 is called `lib`, a common name. Putting `hooks/` on `sys.path` and writing `from lib import
 x` would pick up any other `lib` already imported in the process, so this loads the package
 from its file and replaces a `lib` that lives anywhere else.
+
+A few of those modules import the hooks' other packages in turn: `lib.ipc` reads the
+client's record through `core.host`, which finds it in `hosts`, to locate the client's MCP
+configuration, and `lib.read_model`, which setup's key check uses, imports `lib.ipc`. A
+caller that asks for such a module passes `host=True`, and `core` and `hosts` are loaded
+the same way, from their files, since they are common names too. The status line and the
+project header need `lib` alone, and do not depend on the other two being present.
 """
 
 import importlib
@@ -16,16 +23,28 @@ HOOKS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks")
 _LIB = os.path.join(HOOKS, "lib")
 
 
-def hooks_lib(*names: str) -> tuple:
-    """The modules `lib.<name>` of the vendored hooks, in the order named."""
-    package = sys.modules.get("lib")
-    where = getattr(package, "__file__", None) or ""
-    if package is None or os.path.realpath(os.path.dirname(where)) != os.path.realpath(_LIB):
-        for key in [key for key in sys.modules if key == "lib" or key.startswith("lib.")]:
-            del sys.modules[key]
-        spec = importlib.util.spec_from_file_location(
-            "lib", os.path.join(_LIB, "__init__.py"), submodule_search_locations=[_LIB])
-        package = importlib.util.module_from_spec(spec)
-        sys.modules["lib"] = package
-        spec.loader.exec_module(package)
+def _vendored(name: str) -> None:
+    """Make `sys.modules[name]` the vendored package `hooks/<name>`, replacing any other."""
+    where = os.path.join(HOOKS, name)
+    package = sys.modules.get(name)
+    found = getattr(package, "__file__", None) or ""
+    if package is not None and os.path.realpath(os.path.dirname(found)) == os.path.realpath(where):
+        return
+    for key in [key for key in sys.modules if key == name or key.startswith(f"{name}.")]:
+        del sys.modules[key]
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(where, "__init__.py"), submodule_search_locations=[where])
+    package = importlib.util.module_from_spec(spec)
+    sys.modules[name] = package
+    spec.loader.exec_module(package)
+
+
+def hooks_lib(*names: str, host: bool = False) -> tuple:
+    """The modules `lib.<name>` of the vendored hooks, in the order named.
+
+    `host=True` also loads the hooks' `core` and `hosts` packages, which `lib.ipc` and
+    everything that imports it need.
+    """
+    for package in ("core", "hosts", "lib") if host else ("lib",):
+        _vendored(package)
     return tuple(importlib.import_module(f"lib.{name}") for name in names)

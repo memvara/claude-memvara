@@ -40,6 +40,7 @@ from lib.ipc import (  # noqa: E402
     due_capture_alert, payload, plural, status, under_extraction, with_alert,
 )
 from lib import counts, project  # noqa: E402
+from lib.fast import read_kinds  # noqa: E402
 from lib.mark import count as count_memories  # noqa: E402
 from lib.mark import mark_block  # noqa: E402
 from lib.mark import on as mark_on  # noqa: E402
@@ -208,6 +209,12 @@ def main() -> int:
     # backend answers -- local library first, hosted second -- which is exactly what this
     # hook needs and what it used to be missing.
     hosted = close is not None
+    # Both reads below are of a fixed sentence at every session start, so they are plain
+    # reads: a model rewrite of the same words each time would cost a call and could
+    # return a different block from one session to the next. The library's store takes
+    # `query_rewrite` unless it was released before query rewrite, which never rewrites.
+    # The stdlib hosted client takes no such argument and always asks for a plain read.
+    plain_read: dict = {} if hosted else read_kinds(store)[0]
     #: What a section could not be fetched for, in words. Set before the `try` so that
     #: every path to the banner below has it, including the ones that leave early.
     missing = ""
@@ -222,7 +229,7 @@ def main() -> int:
             return str(store.recall(QUERY, k=STANDING_K,
                                     budget=STANDING_FALLBACK_TOKENS,
                                     header=STANDING_HEADER,
-                                    memory_types=STANDING) or "")
+                                    memory_types=STANDING, **plain_read) or "")
 
         try:
             standing = standing_block(store, hosted=hosted, budget=STANDING_BUDGET,
@@ -237,7 +244,7 @@ def main() -> int:
 
         try:
             notes = str(store.recall(QUERY, k=K, budget=BUDGET, header=HEADER,
-                                     include_episodes=True) or "")
+                                     include_episodes=True, **plain_read) or "")
         except Exception as exc:
             # "Empty" and "could not ask" are not the same block, and collapsing them here
             # was worse than the same bug in `recall.py`: that one at least said it had

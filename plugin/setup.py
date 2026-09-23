@@ -4,14 +4,31 @@ Usage, as the command runs it:
 
     python3 setup.py                       list every feature, its value and its default
     python3 setup.py <feature> on|off      set one feature
+    python3 setup.py query_rewrite on --yes
+                                           turn query rewrite on after seeing its cost
+    python3 setup.py verify-key [--yes]    show what query rewrite costs; with --yes,
+                                           make one test call and record the result
     python3 setup.py remove-status-line    take memvara's status line out of Claude Code
     python3 setup.py check <feature>       exit 0 when the feature is on, 1 when it is off
     python3 setup.py install-status-line [--hook]
 
 The switches live in `~/.memvara/settings.json`, a flat JSON object of
-`feature_name: true|false`, where a missing key means on. The list of features is the one
-the vendored hooks read, `FEATURES` in `hooks/lib/settings.py`, so this command and the
-hooks can never disagree about which names exist, and a name outside it is refused.
+`feature_name: true|false`, where a missing key means the feature's default. The features
+and their defaults are the ones the vendored hooks read, `FEATURE_DEFAULTS` in
+`hooks/lib/settings.py`, which is a copy of the library's, so this command, the hooks and
+the library never disagree about which names exist or what they default to. A name outside
+it is refused. Two switches that are still being built, `metadata_filters` and
+`encryption`, are listed as arriving in a later release and cannot be set yet, because
+nothing would read them.
+
+Query rewrite has a check of its own. The recall hook asks the local store's model to
+rewrite each prompt's query only after `verify-key --yes` has made one test call through
+the library and the model answered it (`hooks/lib/read_model.py`). `verify-key` without
+`--yes` prints what a rewrite adds to each prompt, in time and in model calls, and changes
+nothing, so the user sees the cost before anything is switched on. The result of the test
+call is saved in the hooks' own state file, `~/.memvara/.hooks/read_model.json`, not in
+the switch file, and a record an earlier build left in the switch file is removed once a
+new one is saved.
 
 Two features also change Claude Code's own settings file, `~/.claude/settings.json`
 (or `$CLAUDE_CONFIG_DIR/settings.json`), because that is where Claude Code reads them:
@@ -67,21 +84,110 @@ DESCRIPTIONS = {
                        "end or retire every memory matching a query after a preview.",
     "end_reason": "A reason stored when a memory is ended, retired or given an end date.",
     "links": "The memory_link tool and typed links between memories.",
+    "documents": "The document tools, which store a whole document so that a search can "
+                 "find passages in it: memory_add_document, memory_get_document, "
+                 "memory_list_documents and memory_delete_document.",
+    "retrieval_chunks": "A stored document is split into passages of about 1,000 "
+                        "characters, so a search finds the passage that answers it. Off: "
+                        "each document is stored as one piece.",
+    "extraction_chunks": "A turn longer than 6,000 characters is read for facts in pieces "
+                         "of at most 6,000 characters. It is off by default because it has "
+                         "not met its release bar yet: the one measured run found 4 of 5 "
+                         "key facts in a long turn.",
+    "ingest_urls": "A document can be added from a web address, which the server fetches. "
+                   "Off: a document has to be sent as text or as a file.",
+    "ingest_media": "A document can be an image, an audio file or a video, which the "
+                    "server's model turns into text. Off: those types are refused.",
+    "query_rewrite": "Before a search, a model writes up to three other phrasings of the "
+                     "question and reads any dates out of it, and every phrasing is "
+                     "searched. The recall hook uses it only after /memvara:setup "
+                     "verify-key has checked your model key.",
+    "synthesis": "memory_recall can put a short summary, written by a model, above the "
+                 "recalled notes when the caller asks for one. The recall hook never asks "
+                 "for one.",
 }
+
+#: What each phase 2 switch costs when it is on, in words a user can act on. A test
+#: requires an entry for every one of them and for each switch still to come.
+COSTS = {
+    "documents": "No model call of its own. Each passage of a document is read for facts "
+                 "like a turn, which calls your extraction model if one is configured.",
+    "retrieval_chunks": "No model call. One stored row and one embedding per passage, "
+                        "instead of one per document.",
+    "extraction_chunks": "One extraction call to your model per piece, instead of one per "
+                         "long turn.",
+    "ingest_urls": "No model call. One web request per address added, of at most 10 MB "
+                   "and 20 seconds.",
+    "ingest_media": "One call to your model per image, audio file or video, on your key. "
+                    "The anthropic backend reads images only; the openai backend also "
+                    "transcribes audio and the sound of a video.",
+    "query_rewrite": "One chat call to your model per search that rewrites. For the recall "
+                     "hook that is one call per prompt, and it adds time to each prompt. "
+                     "/memvara:setup verify-key shows both before anything is turned on.",
+    "synthesis": "One chat call to your model per recall that asks for a summary.",
+    "metadata_filters": "No model call.",
+    "encryption": "The vector index is held in memory instead of being read from disk as "
+                  "needed, so memory use grows with the store. Losing the key makes the "
+                  "store unreadable.",
+}
+
+#: Switches that are still being built in the library. They are listed so the user knows
+#: they are coming, and refused if set, because no version of the library reads them yet
+#: and a saved switch that nothing reads is a promise nothing keeps. Each one moves into
+#: the library's `FEATURE_DEFAULTS`, and so out of this table, when it ships.
+UPCOMING = {
+    "metadata_filters": "Filter a search by a memory's metadata or by a document's file "
+                        "path.",
+    "encryption": "Encrypt the local store on disk, vectors included, with a key kept in "
+                  "your system keychain.",
+}
+
+UPCOMING_NOTE = "arriving in the next release; it cannot be set in this version"
 
 #: Features the server provides rather than the plugin. The switch is saved like any other,
 #: but no server reads this file yet, and saying otherwise would be a promise nothing keeps.
-SERVER_SIDE = frozenset({"profile", "forget_matching", "end_reason", "links"})
+SERVER_SIDE = frozenset({"profile", "forget_matching", "end_reason", "links", "documents",
+                         "retrieval_chunks", "extraction_chunks", "ingest_urls",
+                         "ingest_media", "synthesis"})
 
 SERVER_NOTE = ("saved, but no server reads this file yet: the hosted server's switches are "
                "set by its deployment, and a local memvara-mcp server takes "
-               "MEMVARA_FEATURE_{upper}=0")
+               "MEMVARA_FEATURE_{upper}=0 or =1")
+
+#: `query_rewrite` is read by the recall hook from this file, and by a server from its own
+#: environment, so it gets its own note.
+REWRITE_NOTE = ("The recall hook reads this switch from this file. A local memvara-mcp "
+                "server reads MEMVARA_FEATURE_QUERY_REWRITE=0 or =1 instead, and the "
+                "hosted server's switches are set by its deployment")
+
+#: The measured local overhead of a rewritten read, from memvara/memvara#231. The model
+#: call is not in these numbers.
+REWRITE_MEASURED = ("Measured without the model call, a read with query rewrite took a "
+                    "median of 21.0 ms against 5.6 ms without it (200 reads, k=10, a local "
+                    "store of 1,000 claims and 1,000 turns, and a model stand-in that "
+                    "answers instantly).")
+
+#: Where each backend's prices are published. memvara keeps no price list, so setup never
+#: states a price; it says where to find one.
+PRICES = {
+    "anthropic": "https://www.anthropic.com/pricing",
+    "openai": "https://openai.com/api/pricing (or the price list of the server "
+              "OPENAI_BASE_URL points to, if you set one)",
+}
 
 
 def _settings_module():
     from memvara_hooks import hooks_lib
 
     return hooks_lib("settings")[0]
+
+
+def _read_model_module():
+    from memvara_hooks import hooks_lib
+
+    # `host=True`: `lib.read_model` reads the client's configuration through `lib.ipc`,
+    # which needs the hooks' `core` and `hosts` packages.
+    return hooks_lib("read_model", host=True)[0]
 
 
 def features() -> "tuple[str, ...]":
@@ -318,6 +424,151 @@ def agent_rule_state() -> str:
     return "present" if isinstance(deny, list) and AGENT_RULE in deny else "absent"
 
 
+# -- query rewrite and its key check ------------------------------------------------------
+
+def _model_words(backend: str, model_setting: str, model: str = "") -> str:
+    """The configured model, named the way a user would look it up."""
+    name = model or model_setting
+    if name:
+        return f"the model {name} (the {backend} backend)"
+    return f"the {backend} backend's default model"
+
+
+def rewrite_cost() -> str:
+    """What query rewrite adds to each prompt, in time and in model calls. Changes nothing.
+
+    No price is stated, because memvara keeps no price list: the text names the model and
+    says where its price is published.
+    """
+    backend, model_setting = _read_model_module().configured()
+    lines = ["Query rewrite on the recall hook", ""]
+    if backend == "none":
+        lines += [
+            "No model is configured for a local store: MEMVARA_LLM is not set in the "
+            "memvara MCP server's configuration, or it is none. Query rewrite needs one, so "
+            "there is nothing to check and the recall hook reads without it.",
+            "",
+            "On a hosted install, the hosted service would rewrite with your "
+            "organisation's own key, which this machine cannot check, so the recall hook "
+            "always asks it for a plain read."]
+        return "\n".join(lines)
+    who = _model_words(backend, model_setting)
+    where = PRICES.get(backend, "your provider's pricing page")
+    lines += [
+        f"What it does: before each prompt's search, the recall hook sends your prompt and "
+        f"today's date to {who}. The model answers with up to three other phrasings and "
+        "any dates the prompt names, and every phrasing is searched.",
+        "",
+        f"Time: {REWRITE_MEASURED} The model call adds its own time on top of that. The "
+        "library stops waiting for it after 10 seconds, and the recall hook after 5 "
+        "seconds, and then uses the result without a rewrite, so a slow or failing model "
+        "never costs you your memories.",
+        "",
+        f"Cost: one chat call per prompt to {who}, on your own key, with a reply of at "
+        "most 300 tokens. memvara does not know what that model costs. Look up its price "
+        f"per token at {where}."]
+    return "\n".join(lines)
+
+
+def rewrite_state() -> str:
+    """One sentence saying whether the recall hook rewrites its query now, and why."""
+    read_model = _read_model_module()
+    if not _settings_module().enabled("query_rewrite"):
+        return "The recall hook does not rewrite queries, because query_rewrite is off."
+    record = read_model.recorded()
+    if not isinstance(record, dict):
+        return ("The recall hook does not rewrite queries yet: no model key has been "
+                "checked. Run /memvara:setup verify-key to see what it costs.")
+    when = str(record.get("checked_at") or "")[:10] or "an unknown date"
+    if record.get("outcome") != "applied":
+        return (f"The recall hook does not rewrite queries: the check on {when} found "
+                f"{record.get('outcome') or 'nothing'}. Run /memvara:setup verify-key to "
+                "check again.")
+    if not read_model.verified_for_current_config():
+        return (f"The recall hook does not rewrite queries: the model configured now is "
+                f"not the one checked on {when}. Run /memvara:setup verify-key to check "
+                "it.")
+    who = _model_words(str(record.get("backend")), str(record.get("model_setting") or ""),
+                       str(record.get("model") or ""))
+    return (f"The recall hook rewrites each prompt's query with {who}, checked on {when}. "
+            "That is one model call per prompt.")
+
+
+#: What each outcome of the test call means, and what to do about it.
+_VERIFIED = {
+    "applied": "The test call worked: the model answered.",
+    "key_rejected": "The provider refused the key{status}. Fix the key in the memvara MCP "
+                    "server's configuration, then run /memvara:setup verify-key --yes "
+                    "again.",
+    "fallback": "The test call failed ({reason}). Nothing is wrong with the setting "
+                "itself; run /memvara:setup verify-key --yes again to retry.",
+    "unconfigured": "The local store has no model that can chat, so there is nothing to "
+                    "rewrite with. Set MEMVARA_LLM in the memvara MCP server's "
+                    "configuration to use one.",
+    "disabled": "The local store was built with query rewrite off: "
+                "MEMVARA_FEATURE_QUERY_REWRITE=0 is set for it. Remove that setting to use "
+                "it.",
+    "no_local_store": "There is no local store to check. On a hosted install, the hosted "
+                      "service would rewrite with your organisation's own key, which this "
+                      "machine cannot check, so the recall hook always asks it for a plain "
+                      "read.",
+    "unsupported": "The installed memvara library is older than query rewrite. Upgrade it "
+                   "with pip install -U memvara, then run /memvara:setup verify-key --yes "
+                   "again.",
+    "error": "The check could not run ({reason}). Run /memvara:setup verify-key --yes "
+             "again, and look at the memvara MCP server's configuration if it happens "
+             "twice.",
+}
+
+
+def verify_key(confirmed: bool) -> "tuple[int, str]":
+    """Show the cost of query rewrite, or, when `confirmed`, check the key and record it.
+
+    Unconfirmed, nothing is called and nothing is written: exit 0. Confirmed, one test
+    rewrite goes through the library (`read_model.check()`) and its result is saved in the
+    hooks' state file `~/.memvara/.hooks/read_model.json` (`read_model.save()`), whatever
+    it was. Exit 0 means the model answered and the recall hook will rewrite; exit 1 means
+    it will not, or the result could not be saved.
+    """
+    if not confirmed:
+        cost = rewrite_cost()
+        if _read_model_module().configured()[0] == "none":
+            return 0, cost
+        return 0, (f"{cost}\n\n{rewrite_state()}\n\nTo make one test call to that model "
+                   "now, and let the recall hook rewrite each prompt's query if it "
+                   "answers, run: /memvara:setup verify-key --yes")
+    read_model = _read_model_module()
+    record = read_model.check()
+    where = _home_relative(read_model.STATE)
+    if not read_model.save(record):
+        return 1, (f"The test call ran, but its result could not be saved to {where}, so "
+                   "the recall hook will not rewrite. Check that the directory can be "
+                   "written, then run /memvara:setup verify-key --yes again.")
+    _forget_old_record(read_model.KEY)
+    outcome = str(record.get("outcome") or "")
+    status = f" (HTTP {record['status']})" if record.get("status") else ""
+    said = [_VERIFIED.get(outcome, "The check returned {outcome}.").format(
+        status=status, reason=record.get("reason") or "no reason given", outcome=outcome)]
+    said.append(f"The result is saved in {where}.")
+    said.append(rewrite_state())
+    return (0 if outcome == "applied" else 1), " ".join(said)
+
+
+def _forget_old_record(key: str) -> None:
+    """Take an earlier build's check record out of the switch file, once one is saved.
+
+    It lived under `key` in `~/.memvara/settings.json`. The hooks read it from there only
+    while the state file is missing, so once a check is saved it is dead weight in a file
+    of switches. A settings file that cannot be read is left exactly as it is.
+    """
+    path = memvara_settings_path()
+    data, _ = load(path)
+    if data and key in data:
+        del data[key]
+        write(path, data)
+        _settings_module().reload()
+
+
 # -- the switches -------------------------------------------------------------------------
 
 def _override(name: str) -> "str | None":
@@ -335,6 +586,9 @@ def refuse_unknown(name: str) -> "str | None":
     known = features()
     if name in known:
         return None
+    if name in UPCOMING:
+        return (f"{name} is {UPCOMING_NOTE}. Nothing was written, because no version of "
+                "memvara reads it yet.")
     close = difflib.get_close_matches(name, known, n=1)
     hint = f" (did you mean {close[0]}?)" if close else ""
     return f"{name!r}{hint} is not a memvara feature. The features are {', '.join(known)}."
@@ -345,12 +599,16 @@ def listing() -> str:
     names = tuple(settings.FEATURES)
     stored, problem = load(settings.SETTINGS)
     lines = [f"memvara features, stored in {_home_relative(settings.SETTINGS)}. "
-             "Every feature is on by default.", ""]
+             "A feature that is not set has its default.", ""]
     if problem:
-        lines += [f"Note: {problem}. Every feature reads as on until it is fixed.", ""]
-    width = max(len(name) for name in names)
+        lines += [f"Note: {problem}. Every feature reads as its default until it is fixed.",
+                  ""]
+    upcoming = [name for name in UPCOMING if name not in names]
+    width = max(len(name) for name in (*names, *upcoming))
+    indent = f"  {' ' * width}  "
     for name in names:
         value = "on" if settings.enabled(name) else "off"
+        default = "on" if settings.FEATURE_DEFAULTS[name] else "off"
         where = []
         if isinstance((stored or {}).get(name), bool):
             where.append("set in the file")
@@ -358,11 +616,21 @@ def listing() -> str:
         if variable:
             where.append(f"{variable} overrides the file")
         suffix = f"  ({'; '.join(where)})" if where else ""
-        lines.append(f"  {name.ljust(width)}  {value.ljust(3)}  default on{suffix}")
-        lines.append(f"  {' ' * width}  {DESCRIPTIONS.get(name, 'No description yet.')}")
+        lines.append(f"  {name.ljust(width)}  {value.ljust(3)}  default {default}{suffix}")
+        lines.append(indent + DESCRIPTIONS.get(name, "No description yet."))
+        if name in COSTS:
+            lines.append(f"{indent}Cost: {COSTS[name]}")
         if name in SERVER_SIDE:
-            lines.append(f"  {' ' * width}  This switch is "
+            lines.append(f"{indent}This switch is "
                          + SERVER_NOTE.format(upper=name.upper()) + ".")
+        if name == "query_rewrite":
+            lines.append(f"{indent}{REWRITE_NOTE}.")
+            lines.append(indent + rewrite_state())
+    if upcoming:
+        lines += ["", "Arriving in the next release. These cannot be set in this version:"]
+        for name in upcoming:
+            lines.append(f"  {name.ljust(width)}  {UPCOMING[name]}")
+            lines.append(f"{indent}Cost: {COSTS[name]}")
     path = claude_settings_path()
     where = _home_relative(path)
     data, unreadable = load(path)
@@ -432,7 +700,23 @@ def set_feature(name: str, value: bool) -> "tuple[int, str]":
                     "session.")
     if name in SERVER_SIDE:
         said.append("This switch is " + SERVER_NOTE.format(upper=name.upper()) + ".")
+    if name == "query_rewrite":
+        # This process read the file before writing it; report what the hooks will read.
+        _settings_module().reload()
+        said.append(REWRITE_NOTE + ".")
+        said.append(rewrite_state())
     return 0, " ".join(said)
+
+
+def rewrite_would_start() -> bool:
+    """Whether turning `query_rewrite` on would make the recall hook start rewriting now.
+
+    True when the switch is off and a key check for the configured model is on record, so
+    the only thing between the user and one model call per prompt is this switch. Whether
+    the key is checked for this model is `read_model`'s rule, asked here rather than copied.
+    """
+    return (not _settings_module().enabled("query_rewrite")
+            and _read_model_module().verified_for_current_config())
 
 
 def main(argv: "list[str]") -> int:
@@ -483,12 +767,25 @@ def main(argv: "list[str]") -> int:
         print(f"The {argv[1]} feature is switched off. Turn it on with "
               f"/memvara:setup {argv[1]} on.")
         return 1
-    if len(argv) == 2 and argv[1].lower() in ("on", "off"):
-        code, sentence = set_feature(command, argv[1].lower() == "on")
+    if command == "verify-key" and argv[1:] in ([], ["--yes"]):
+        code, sentence = verify_key(confirmed=argv[1:] == ["--yes"])
+        print(sentence)
+        return code
+    confirmed = argv[2:] == ["--yes"] and command == "query_rewrite"
+    if (len(argv) == 2 or confirmed) and argv[1].lower() in ("on", "off"):
+        value = argv[1].lower() == "on"
+        if command == "query_rewrite" and value and not confirmed and rewrite_would_start():
+            # The key was checked while the switch was off, so this switch alone starts
+            # one model call per prompt. The user sees what that costs first.
+            print(f"{rewrite_cost()}\n\nNothing changed yet. To turn query rewrite on for "
+                  "the recall hook, run: /memvara:setup query_rewrite on --yes")
+            return 0
+        code, sentence = set_feature(command, value)
         print(sentence)
         return code
     problem = refuse_unknown(command) if len(argv) <= 2 else None
-    print(problem or "usage: /memvara:setup [<feature> on|off | remove-status-line]")
+    print(problem or "usage: /memvara:setup [<feature> on|off | verify-key [--yes] | "
+                     "remove-status-line]")
     return 2
 
 

@@ -523,7 +523,7 @@ through `memvara_hooks.py`.
 | Command | What it does |
 |---|---|
 | `/memvara:index` | Explores the current repository and records 10 to 30 facts about it |
-| `/memvara:setup` | Lists every feature switch; `/memvara:setup <feature> on\|off` sets one |
+| `/memvara:setup` | Lists every feature switch; `/memvara:setup <feature> on\|off` sets one; `/memvara:setup verify-key` shows what query rewrite costs and, with `--yes`, checks the model key |
 
 ### `/memvara:index`
 
@@ -627,27 +627,88 @@ write, end, retire or link anything.
 
 ### The switches
 
-`/memvara:setup` lists nine switches, all on by default: `index_command`,
-`research_agent`, `project_scope`, `status_line`, `recall_mark`, `profile`,
-`forget_matching`, `end_reason` and `links`. The list is the one the hooks
-read, so a name the hooks do not know is refused. The values are stored in
+`/memvara:setup` lists sixteen switches. Fifteen are on by default:
+`index_command`, `research_agent`, `project_scope`, `status_line`,
+`recall_mark`, `profile`, `forget_matching`, `end_reason`, `links`,
+`documents`, `retrieval_chunks`, `ingest_urls`, `ingest_media`,
+`query_rewrite` and `synthesis`. `extraction_chunks` is off by default,
+because it has not yet met its release bar. The list and the defaults are
+the ones the hooks read, which are a copy of the library's, so a name the
+hooks do not know is refused. The values are stored in
 `~/.memvara/settings.json`, and an environment variable
 `MEMVARA_FEATURE_<NAME>=0` or `=1` overrides the file.
+
+For each of the seven newer switches the listing says, in one sentence each,
+what it does and what it costs:
+
+| Switch | What it does | What it costs |
+|---|---|---|
+| `documents` | The document tools, which store a whole document so a search can find passages in it | No model call of its own; each passage is read for facts like a turn |
+| `retrieval_chunks` | Splits a stored document into passages of about 1,000 characters | No model call; one row and one embedding per passage |
+| `extraction_chunks` | Reads a turn over 6,000 characters for facts in pieces | One extraction call per piece instead of one per long turn |
+| `ingest_urls` | Lets a document be added from a web address | No model call; one web request of at most 10 MB and 20 seconds |
+| `ingest_media` | Lets a document be an image, audio or video, turned into text by the server's model | One model call per file, on your key |
+| `query_rewrite` | Has a model rephrase a search and read its dates before searching | One chat call per rewritten search; on the recall hook, one per prompt |
+| `synthesis` | Puts a model's short summary above recalled notes when asked | One chat call per recall that asks for one |
+
+Two more, `metadata_filters` and `encryption`, are listed as arriving in the
+next release. They cannot be set yet, because no version of the library
+reads them.
+
+#### Query rewrite on the recall hook
+
+The recall hook runs on every prompt, so a query rewrite there is one model
+call per prompt, billed to your key. The hook therefore asks for one only
+when three things are true: the `query_rewrite` switch is on;
+`/memvara:setup verify-key --yes` has made one test call to your configured
+model through the memvara library and the model answered; and the model
+configured now (`MEMVARA_LLM` and `MEMVARA_LLM_MODEL` in the memvara MCP
+server's configuration) is the one that was checked. Otherwise it reads
+without a rewrite.
+
+`/memvara:setup verify-key`, without `--yes`, changes nothing. It prints
+what a rewrite adds before you turn it on. Measured without the model call, a
+read with rewrite took a median of 21.0 ms against 5.6 ms without it (200
+reads, k=10, a local store of 1,000 claims and 1,000 turns, and a model
+stand-in that answers instantly). The model call comes on top. The library
+stops waiting for it after 10 seconds, and the recall hook after 5 seconds,
+and then uses the result without a rewrite, so a slow or failing model
+never costs you your memories. memvara keeps no price list, so the command
+names the model and says where its price per token is published instead of
+guessing a price.
+
+`verify-key --yes` saves the result of the test call in
+`~/.memvara/.hooks/read_model.json`, whatever it was, and says what to fix
+when the model did not answer. That is a state file of the hooks', not a
+switch, so it is kept out of `~/.memvara/settings.json`. If the provider
+rejects the key on a later prompt, that prompt still gets its memories, and
+the hook marks the check failed and stops rewriting until you run
+`verify-key --yes` again. If you switch `query_rewrite` off and back on over
+a key that was already checked, the command shows the cost again and waits
+for `/memvara:setup query_rewrite on --yes`.
+
+A hosted install never rewrites from the recall hook. The hosted service
+would use your organisation's own key, which this machine cannot check, so
+the hook always asks it for a plain read.
 
 Two switches also change Claude Code's settings file. `research_agent off`
 adds the rule `Agent(memvara:memory-researcher)` to `permissions.deny`,
 which is how Claude Code disables one subagent, and `research_agent on`
 removes that rule and nothing else. `status_line` is described above.
 
-`profile`, `forget_matching`, `end_reason` and `links` are features of the
-server. Their switches are saved, but no server reads this file yet: the
-hosted server's switches are set by its deployment, and a local
-`memvara-mcp` server reads `MEMVARA_FEATURE_<NAME>=0`. The command says so
-when you set one.
+`profile`, `forget_matching`, `end_reason`, `links`, `documents`,
+`retrieval_chunks`, `extraction_chunks`, `ingest_urls`, `ingest_media` and
+`synthesis` are features of the server. Their switches are saved, but no
+server reads this file yet: the hosted server's switches are set by its
+deployment, and a local `memvara-mcp` server reads
+`MEMVARA_FEATURE_<NAME>=0` or `=1`. The command says so when you set one.
+`query_rewrite` is read from this file by the recall hook, and by a server
+from its own environment.
 
 Files these write: `~/.memvara/settings.json`; in
 `~/.claude/settings.json`, the `statusLine` key and the one deny rule
-above; `~/.memvara/.hooks/statusline.json` and `~/.memvara/.hooks/setup.log`,
+above; `~/.memvara/.hooks/statusline.json`, `~/.memvara/.hooks/setup.log` and
+`~/.memvara/.hooks/read_model.json` with its lock file `read_model.json.lock`,
 described above; `~/.memvara/.hooks/counts/`, one small file per session,
 removed after 14 days; and `~/.memvara/.hooks/projects/`, where the project
 for each directory is cached for an hour.
