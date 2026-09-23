@@ -627,18 +627,19 @@ write, end, retire or link anything.
 
 ### The switches
 
-`/memvara:setup` lists sixteen switches. Fifteen are on by default:
+`/memvara:setup` lists eighteen switches. Seventeen are on by default:
 `index_command`, `research_agent`, `project_scope`, `status_line`,
 `recall_mark`, `profile`, `forget_matching`, `end_reason`, `links`,
 `documents`, `retrieval_chunks`, `ingest_urls`, `ingest_media`,
-`query_rewrite` and `synthesis`. `extraction_chunks` is off by default,
+`query_rewrite`, `synthesis`, `metadata_filters` and `encryption`.
+`extraction_chunks` is off by default,
 because it has not yet met its release bar. The list and the defaults are
 the ones the hooks read, which are a copy of the library's, so a name the
 hooks do not know is refused. The values are stored in
 `~/.memvara/settings.json`, and an environment variable
 `MEMVARA_FEATURE_<NAME>=0` or `=1` overrides the file.
 
-For each of the seven newer switches the listing says, in one sentence each,
+For each of the nine newer switches the listing says, in one sentence each,
 what it does and what it costs:
 
 | Switch | What it does | What it costs |
@@ -650,10 +651,19 @@ what it does and what it costs:
 | `ingest_media` | Lets a document be an image, audio or video, turned into text by the server's model | One model call per file, on your key |
 | `query_rewrite` | Has a model rephrase a search and read its dates before searching | One chat call per rewritten search; on the recall hook, one per prompt |
 | `synthesis` | Puts a model's short summary above recalled notes when asked | One chat call per recall that asks for one |
+| `metadata_filters` | Lets a search keep only memories whose metadata matches, or that came from a document under a file path | No model call; the filter runs inside the store |
+| `encryption` | Encrypts a new local store on disk, vectors included | Under 1 ms more per write, and more memory from the first search |
 
-Two more, `metadata_filters` and `encryption`, are listed as arriving in the
-next release. They cannot be set yet, because no version of the library
-reads them.
+**Encryption and its key.** With `encryption` on, a new local store is
+encrypted, vectors included; an existing store stays as it is, and
+`memvara encrypt` converts one. It needs `pip install 'memvara[encrypt]'`.
+The key is looked up in the OS keychain, then in `MEMVARA_DB_KEY`, then in
+`~/.memvara/db.key`, where one is created when a new store needs it.
+**Losing the key makes the store unreadable.** Run
+`memvara encrypt --export-key` to print the key for a backup. Measured on a
+store of 20,000 claims, a write took 0.53 ms against 0.30 ms unencrypted,
+and peak memory was 122 MB against 71 MB, because the vectors are decrypted
+into memory on the first search instead of being read from disk.
 
 #### Query rewrite on the recall hook
 
@@ -697,8 +707,8 @@ which is how Claude Code disables one subagent, and `research_agent on`
 removes that rule and nothing else. `status_line` is described above.
 
 `profile`, `forget_matching`, `end_reason`, `links`, `documents`,
-`retrieval_chunks`, `extraction_chunks`, `ingest_urls`, `ingest_media` and
-`synthesis` are features of the server. Their switches are saved, but no
+`retrieval_chunks`, `extraction_chunks`, `ingest_urls`, `ingest_media`,
+`synthesis`, `metadata_filters` and `encryption` are features of the server. Their switches are saved, but no
 server reads this file yet: the hosted server's switches are set by its
 deployment, and a local `memvara-mcp` server reads
 `MEMVARA_FEATURE_<NAME>=0` or `=1`. The command says so when you set one.

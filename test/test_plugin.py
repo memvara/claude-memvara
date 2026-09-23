@@ -8852,7 +8852,8 @@ class Setup(_Home):
     """`/memvara:setup`: every feature listed, one set at a time, unknown names refused."""
 
     PHASE_TWO = ("documents", "retrieval_chunks", "extraction_chunks", "ingest_urls",
-                 "ingest_media", "query_rewrite", "synthesis")
+                 "ingest_media", "query_rewrite", "synthesis", "metadata_filters",
+                 "encryption")
 
     def settings_module(self):
         spec = importlib.util.spec_from_file_location(
@@ -8890,27 +8891,30 @@ class Setup(_Home):
             expected = "off" if name in ("recall_mark", "extraction_chunks") else "on"
             self.assertEqual(row[0].split()[1:4], [expected, "default", default], row[0])
 
-    def test_every_phase_two_switch_and_every_upcoming_one_has_a_cost(self) -> None:
+    def test_every_phase_two_switch_has_a_cost(self) -> None:
         module = self.setup_module()
-        self.assertEqual(sorted(module.COSTS), sorted((*self.PHASE_TWO, *module.UPCOMING)))
+        self.assertEqual(sorted(module.COSTS), sorted(self.PHASE_TWO))
         said = self.setup().stdout.decode("utf-8")
         for name in self.PHASE_TWO:
             self.assertIn(f"Cost: {module.COSTS[name][:40]}", said, name)
 
-    def test_an_upcoming_switch_is_listed_and_cannot_be_set(self) -> None:
-        said = self.setup().stdout.decode("utf-8")
-        self.assertIn("Arriving in the next release", said)
+    def test_the_filter_and_encryption_switches_can_be_set(self) -> None:
+        """Both shipped in the library, so setup saves them like any server switch."""
         for name in ("metadata_filters", "encryption"):
-            self.assertIn(name, said)
             done = self.setup(name, "off")
-            self.assertEqual(done.returncode, 2)
-            self.assertIn(b"arriving in the next release", done.stdout)
-        self.assertFalse(self.memvara_settings.exists(),
-                         "a switch nothing reads was written to the settings file")
+            self.assertEqual(done.returncode, 0, done.stdout)
+            self.assertIn(b"no server reads this file yet", done.stdout)
+        self.assertEqual(json.loads(self.memvara_settings.read_text("utf-8")),
+                         {"metadata_filters": False, "encryption": False})
+        self.assertNotIn("next release", self.setup().stdout.decode("utf-8"))
 
-    def test_an_upcoming_switch_is_not_a_feature_yet(self) -> None:
-        """When the library ships one, it belongs in the feature list and out of UPCOMING."""
-        self.assertFalse(set(self.setup_module().UPCOMING) & set(self.features()))
+    def test_the_encryption_entry_says_where_the_key_is_and_what_losing_it_means(self) -> None:
+        said = " ".join(self.setup().stdout.decode("utf-8").split())
+        for fact in ("A new local store is encrypted", "OS keychain", "MEMVARA_DB_KEY",
+                     "~/.memvara/db.key", "Losing the key makes the store unreadable",
+                     "memvara encrypt --export-key", "0.53 ms", "0.30 ms", "122 MB",
+                     "71 MB", "20,000 claims"):
+            self.assertIn(fact, said)
 
     def test_every_feature_has_a_description(self) -> None:
         spec = importlib.util.spec_from_file_location("setup_for_test", SETUP_SCRIPT)

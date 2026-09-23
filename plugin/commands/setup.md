@@ -11,8 +11,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/setup.py" $ARGUMENTS
 
 With no arguments it lists every feature with its current value, its default, one sentence
 on what it does and, for the newer features, what it costs. Every feature is on by default
-except `extraction_chunks`. The list ends with the features that arrive in the next
-release, which cannot be set yet, and says whether memvara's status line is installed.
+except `extraction_chunks`. It also says whether memvara's status line is installed.
 
 `/memvara:setup <feature> on|off` writes the switch to `~/.memvara/settings.json`. A name
 that is not a feature is refused, and the output lists the names that are. Exit code 0 means

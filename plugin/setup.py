@@ -17,9 +17,7 @@ The switches live in `~/.memvara/settings.json`, a flat JSON object of
 and their defaults are the ones the vendored hooks read, `FEATURE_DEFAULTS` in
 `hooks/lib/settings.py`, which is a copy of the library's, so this command, the hooks and
 the library never disagree about which names exist or what they default to. A name outside
-it is refused. Two switches that are still being built, `metadata_filters` and
-`encryption`, are listed as arriving in a later release and cannot be set yet, because
-nothing would read them.
+it is refused.
 
 Query rewrite has a check of its own. The recall hook asks the local store's model to
 rewrite each prompt's query only after `verify-key --yes` has made one test call through
@@ -105,10 +103,20 @@ DESCRIPTIONS = {
     "synthesis": "memory_recall can put a short summary, written by a model, above the "
                  "recalled notes when the caller asks for one. The recall hook never asks "
                  "for one.",
+    "metadata_filters": "memory_search and memory_recall can keep only the memories whose "
+                        "metadata matches given values, or that came from a document whose "
+                        "file path starts with given text. Off: a search that asks for "
+                        "either is refused, never answered unfiltered.",
+    "encryption": "A new local store is encrypted on disk, vectors included. The key is "
+                  "looked up in the OS keychain, then in MEMVARA_DB_KEY, then in "
+                  "~/.memvara/db.key, where one is created when a new store needs it. "
+                  "Losing the key makes the store unreadable, so back it up with "
+                  "memvara encrypt --export-key. An existing store stays as it is; "
+                  "memvara encrypt converts one.",
 }
 
 #: What each phase 2 switch costs when it is on, in words a user can act on. A test
-#: requires an entry for every one of them and for each switch still to come.
+#: requires an entry for every one of them.
 COSTS = {
     "documents": "No model call of its own. Each passage of a document is read for facts "
                  "like a turn, which calls your extraction model if one is configured.",
@@ -125,30 +133,23 @@ COSTS = {
                      "hook that is one call per prompt, and it adds time to each prompt. "
                      "/memvara:setup verify-key shows both before anything is turned on.",
     "synthesis": "One chat call to your model per recall that asks for a summary.",
-    "metadata_filters": "No model call.",
-    "encryption": "The vector index is held in memory instead of being read from disk as "
-                  "needed, so memory use grows with the store. Losing the key makes the "
-                  "store unreadable.",
+    "metadata_filters": "No model call. The filter runs inside the store, before the "
+                        "limit on the number of results is applied, so a filtered search "
+                        "returns up to the number of results asked for whenever that many "
+                        "matches exist.",
+    "encryption": "Under 1 ms more per write, and more memory from the first search, when "
+                  "the vectors are decrypted into memory instead of read from disk. "
+                  "Measured on a store of 20,000 claims: 0.53 ms against 0.30 ms per write, "
+                  "and 122 MB against 71 MB of peak memory. It needs "
+                  "pip install 'memvara[encrypt]'.",
 }
-
-#: Switches that are still being built in the library. They are listed so the user knows
-#: they are coming, and refused if set, because no version of the library reads them yet
-#: and a saved switch that nothing reads is a promise nothing keeps. Each one moves into
-#: the library's `FEATURE_DEFAULTS`, and so out of this table, when it ships.
-UPCOMING = {
-    "metadata_filters": "Filter a search by a memory's metadata or by a document's file "
-                        "path.",
-    "encryption": "Encrypt the local store on disk, vectors included, with a key kept in "
-                  "your system keychain.",
-}
-
-UPCOMING_NOTE = "arriving in the next release; it cannot be set in this version"
 
 #: Features the server provides rather than the plugin. The switch is saved like any other,
 #: but no server reads this file yet, and saying otherwise would be a promise nothing keeps.
 SERVER_SIDE = frozenset({"profile", "forget_matching", "end_reason", "links", "documents",
                          "retrieval_chunks", "extraction_chunks", "ingest_urls",
-                         "ingest_media", "synthesis"})
+                         "ingest_media", "synthesis", "metadata_filters",
+                         "encryption"})
 
 SERVER_NOTE = ("saved, but no server reads this file yet: the hosted server's switches are "
                "set by its deployment, and a local memvara-mcp server takes "
@@ -586,9 +587,6 @@ def refuse_unknown(name: str) -> "str | None":
     known = features()
     if name in known:
         return None
-    if name in UPCOMING:
-        return (f"{name} is {UPCOMING_NOTE}. Nothing was written, because no version of "
-                "memvara reads it yet.")
     close = difflib.get_close_matches(name, known, n=1)
     hint = f" (did you mean {close[0]}?)" if close else ""
     return f"{name!r}{hint} is not a memvara feature. The features are {', '.join(known)}."
@@ -603,8 +601,7 @@ def listing() -> str:
     if problem:
         lines += [f"Note: {problem}. Every feature reads as its default until it is fixed.",
                   ""]
-    upcoming = [name for name in UPCOMING if name not in names]
-    width = max(len(name) for name in (*names, *upcoming))
+    width = max(len(name) for name in names)
     indent = f"  {' ' * width}  "
     for name in names:
         value = "on" if settings.enabled(name) else "off"
@@ -626,11 +623,6 @@ def listing() -> str:
         if name == "query_rewrite":
             lines.append(f"{indent}{REWRITE_NOTE}.")
             lines.append(indent + rewrite_state())
-    if upcoming:
-        lines += ["", "Arriving in the next release. These cannot be set in this version:"]
-        for name in upcoming:
-            lines.append(f"  {name.ljust(width)}  {UPCOMING[name]}")
-            lines.append(f"{indent}Cost: {COSTS[name]}")
     path = claude_settings_path()
     where = _home_relative(path)
     data, unreadable = load(path)
