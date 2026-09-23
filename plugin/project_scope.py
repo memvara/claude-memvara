@@ -29,9 +29,6 @@ import json
 import os
 import sys
 
-#: The vendored hook tree, whose `lib` package this imports.
-HOOKS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks")
-
 #: The header name the hooks send in lower case. HTTP header names are case-insensitive;
 #: this spelling is the one the design documents use.
 HEADER = "Memvara-Project"
@@ -41,12 +38,9 @@ SUBJECT_PREFIX = "project:"
 
 
 def _project_module():
-    sys.path.insert(0, HOOKS)
-    try:
-        from lib import project
-    finally:
-        sys.path.pop(0)
-    return project
+    from memvara_hooks import hooks_lib
+
+    return hooks_lib("project")[0]
 
 
 def headers(directory: str) -> dict:
@@ -56,6 +50,9 @@ def headers(directory: str) -> dict:
             return {}
         project = _project_module()
         value = project.resolve(directory)
+        # `resolve` can answer from its cache file, which is outside this process's
+        # control. A value the server would refuse must not reach the header, because a
+        # refused header costs every MCP call in the session.
         if value and project.is_canonical(value):
             return {HEADER: value}
     except Exception:  # noqa: BLE001 -- a helper that fails must not block the connection

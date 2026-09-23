@@ -17,8 +17,10 @@ Two features also change Claude Code's own settings file, `~/.claude/settings.js
 (or `$CLAUDE_CONFIG_DIR/settings.json`), because that is where Claude Code reads them:
 
 - `status_line`: the plugin's `SessionStart` hook runs `install-status-line --hook`, which
-  adds memvara's status line only when no status line is set at all. Another tool's status
-  line is never replaced or changed. `remove-status-line` takes memvara's line out and
+  adds memvara's status line only when no status line is set at all, and records the exact
+  command it wrote in `~/.memvara/.hooks/statusline.json`. A status line counts as
+  memvara's only when its command is this plugin's own or the recorded one, so another
+  tool's status line is never replaced or changed. `remove-status-line` takes memvara's line out and
   switches `status_line` off, so the next session does not add it back.
 - `research_agent`: switching it off adds the deny rule `Agent(memvara:memory-researcher)`
   to `permissions.deny`, which is how Claude Code disables one subagent. Switching it on
@@ -26,7 +28,8 @@ Two features also change Claude Code's own settings file, `~/.claude/settings.js
 
 Every write goes to a temporary file in the same directory and is renamed into place, so a
 reader never sees half a file. A settings file that is not valid JSON is never
-overwritten: the command says so and changes nothing.
+overwritten: the command says so and changes nothing. When the `SessionStart` hook cannot
+install the status line, it says so in `~/.memvara/.hooks/setup.log` rather than on screen.
 """
 
 from __future__ import annotations
@@ -34,11 +37,10 @@ from __future__ import annotations
 import difflib
 import json
 import os
-import re
 import sys
+import time
 
 PLUGIN = os.path.dirname(os.path.abspath(__file__))
-HOOKS = os.path.join(PLUGIN, "hooks")
 STATUSLINE = os.path.join(PLUGIN, "statusline.py")
 
 #: The permission rule that disables the memory-research subagent. Plugin agents are named
@@ -75,16 +77,11 @@ SERVER_NOTE = ("saved, but no server reads this file yet: the hosted server's sw
                "set by its deployment, and a local memvara-mcp server takes "
                "MEMVARA_FEATURE_{upper}=0")
 
-_OURS = re.compile(r'^python3(?: -S)? "(?P<path>[^"]+)"$')
-
 
 def _settings_module():
-    sys.path.insert(0, HOOKS)
-    try:
-        from lib import settings
-    finally:
-        sys.path.pop(0)
-    return settings
+    from memvara_hooks import hooks_lib
+
+    return hooks_lib("settings")[0]
 
 
 def features() -> "tuple[str, ...]":
@@ -93,6 +90,10 @@ def features() -> "tuple[str, ...]":
 
 def memvara_settings_path() -> str:
     return _settings_module().SETTINGS
+
+
+def hooks_state_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".memvara", ".hooks")
 
 
 def claude_settings_path() -> str:
@@ -124,7 +125,9 @@ def write(path: str, data: dict) -> None:
     """Write `data` as indented JSON through a temporary file and a rename.
 
     An existing file keeps its permission bits. Raises `OSError` on failure, and leaves no
-    temporary file behind.
+    temporary file behind. The hooks' `lib/state_file.py` has an atomic writer too, but it
+    writes compact JSON at mode 0600 and is vendored, so it cannot be changed here; a
+    settings file a person edits by hand keeps its layout and its mode.
     """
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
@@ -148,6 +151,18 @@ def write(path: str, data: dict) -> None:
         raise
 
 
+def log(line: str) -> None:
+    """Append one line to `~/.memvara/.hooks/setup.log`. Silent on failure."""
+    try:
+        os.makedirs(hooks_state_dir(), exist_ok=True)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(os.path.join(hooks_state_dir(), "setup.log"), "a",
+                  encoding="utf-8") as fh:
+            fh.write(f"{stamp} {line}\n")
+    except OSError:
+        pass
+
+
 # -- the status line ----------------------------------------------------------------------
 
 def status_line_entry() -> dict:
@@ -161,22 +176,40 @@ def status_line_entry() -> dict:
     return {"type": "command", "command": f'python3 -S "{STATUSLINE}"'}
 
 
-def is_ours(entry: object) -> bool:
-    """Whether a `statusLine` value is one this plugin wrote, from this or another version.
+def _record_path() -> str:
+    return os.path.join(hooks_state_dir(), "statusline.json")
 
-    Recognised by its exact shape: `python3 -S "<path>"` (or without `-S`, as an earlier
-    version may have written it), where the path ends in
-    `statusline.py` and names memvara. The plugin's directory changes with every version,
-    so the path itself cannot be compared, and anything that does not match this shape is
-    treated as another tool's line and left alone.
+
+def _recorded_command() -> "str | None":
+    data, _ = load(_record_path())
+    command = (data or {}).get("command")
+    return command if isinstance(command, str) else None
+
+
+def _record(command: "str | None") -> None:
+    """Remember the command memvara wrote, or forget it when `command` is `None`."""
+    if command is None:
+        try:
+            os.unlink(_record_path())
+        except OSError:
+            pass
+    else:
+        write(_record_path(), {"command": command})
+
+
+def is_ours(entry: object) -> bool:
+    """Whether a `statusLine` value is one memvara wrote.
+
+    Only two commands count: the one this copy of the plugin would write, and the one
+    memvara recorded when it last installed its line, which is how the line of an earlier
+    plugin version is recognised after an update moves the plugin's directory. A command
+    that merely looks similar, such as another tool's `statusline.py` in a directory whose
+    name contains memvara, is another tool's line and is left alone.
     """
     if not isinstance(entry, dict) or entry.get("type") != "command":
         return False
-    match = _OURS.match(str(entry.get("command", "")))
-    if not match:
-        return False
-    path = match.group("path")
-    return os.path.basename(path) == "statusline.py" and "memvara" in path
+    command = entry.get("command")
+    return command in (status_line_entry()["command"], _recorded_command())
 
 
 def install_status_line(check_switch: bool = True) -> "tuple[str, str]":
@@ -199,6 +232,7 @@ def install_status_line(check_switch: bool = True) -> "tuple[str, str]":
     if current is None:
         data["statusLine"] = wanted
         write(path, data)
+        _record(wanted["command"])
         return "installed", (f"memvara added its status line to {where}. Run "
                              "/memvara:setup remove-status-line to take it out.")
     if is_ours(current):
@@ -206,6 +240,7 @@ def install_status_line(check_switch: bool = True) -> "tuple[str, str]":
             return "present", f"memvara's status line is already set in {where}."
         data["statusLine"] = {**current, "command": wanted["command"]}
         write(path, data)
+        _record(wanted["command"])
         return "updated", (f"memvara's status line in {where} now runs this version of "
                            "the plugin.")
     return "other", (f"{where} already has a status line from another tool, so memvara "
@@ -227,50 +262,60 @@ def remove_status_line() -> "tuple[str, str]":
                          "left it as it is.")
     del data["statusLine"]
     write(path, data)
+    _record(None)
     return "removed", f"memvara's status line was removed from {where}."
 
 
 # -- the research agent -------------------------------------------------------------------
 
-def set_agent_rule(denied: bool) -> "tuple[str, str]":
-    """Add or remove `AGENT_RULE` in `permissions.deny`. Touches nothing else."""
+def plan_agent_rule(denied: bool) -> "tuple[str, str, dict | None]":
+    """Work out the settings change for `AGENT_RULE` without writing anything.
+
+    Returns `(outcome, sentence, data)`, where `data` is the whole new settings object to
+    write, or `None` when there is nothing to write (`unchanged`) or it cannot be done
+    (`error`). Only `permissions.deny` changes; every other key is kept.
+    """
     path = claude_settings_path()
     where = _home_relative(path)
     data, problem = load(path)
     if data is None:
-        return "error", f"Nothing changed in Claude Code's settings: {problem}."
+        return "error", f"Nothing changed: {problem}.", None
     permissions = data.get("permissions", {})
-    deny = permissions.get("deny", []) if isinstance(permissions, dict) else None
+    if not isinstance(permissions, dict):
+        return "error", (f"Nothing changed: permissions in {where} is not an object, so "
+                         "memvara did not edit it."), None
+    deny = permissions.get("deny", [])
     if not isinstance(deny, list):
         return "error", (f"Nothing changed: permissions.deny in {where} is not a list, so "
-                         "memvara did not edit it.")
+                         "memvara did not edit it."), None
     if denied == (AGENT_RULE in deny):
         state = "denied" if denied else "allowed"
-        return "unchanged", f"The memory-researcher agent was already {state} in {where}."
-    if denied:
-        deny = [*deny, AGENT_RULE]
-    else:
-        deny = [rule for rule in deny if rule != AGENT_RULE]
+        return ("unchanged", f"The memory-researcher agent was already {state} in {where}.",
+                None)
+    deny = [*deny, AGENT_RULE] if denied else [rule for rule in deny if rule != AGENT_RULE]
     permissions = dict(permissions)
     if deny:
         permissions["deny"] = deny
     else:
         permissions.pop("deny", None)
+    data = dict(data)
     if permissions:
         data["permissions"] = permissions
     else:
         data.pop("permissions", None)
-    write(path, data)
     if denied:
-        return "denied", f"Added {AGENT_RULE} to permissions.deny in {where}."
-    return "allowed", f"Removed {AGENT_RULE} from permissions.deny in {where}."
+        return "denied", f"Added {AGENT_RULE} to permissions.deny in {where}.", data
+    return "allowed", f"Removed {AGENT_RULE} from permissions.deny in {where}.", data
 
 
-def agent_rule_present() -> bool:
-    data, _ = load(claude_settings_path())
-    permissions = (data or {}).get("permissions")
+def agent_rule_state() -> str:
+    """`present`, `absent`, or the reason the settings file could not be read."""
+    data, problem = load(claude_settings_path())
+    if data is None:
+        return f"unknown, because {problem}"
+    permissions = data.get("permissions")
     deny = permissions.get("deny") if isinstance(permissions, dict) else None
-    return isinstance(deny, list) and AGENT_RULE in deny
+    return "present" if isinstance(deny, list) and AGENT_RULE in deny else "absent"
 
 
 # -- the switches -------------------------------------------------------------------------
@@ -297,13 +342,14 @@ def refuse_unknown(name: str) -> "str | None":
 
 def listing() -> str:
     settings = _settings_module()
+    names = tuple(settings.FEATURES)
     stored, problem = load(settings.SETTINGS)
     lines = [f"memvara features, stored in {_home_relative(settings.SETTINGS)}. "
              "Every feature is on by default.", ""]
     if problem:
         lines += [f"Note: {problem}. Every feature reads as on until it is fixed.", ""]
-    width = max(len(name) for name in features())
-    for name in features():
+    width = max(len(name) for name in names)
+    for name in names:
         value = "on" if settings.enabled(name) else "off"
         where = []
         if isinstance((stored or {}).get(name), bool):
@@ -317,23 +363,26 @@ def listing() -> str:
         if name in SERVER_SIDE:
             lines.append(f"  {' ' * width}  This switch is "
                          + SERVER_NOTE.format(upper=name.upper()) + ".")
-    data, _ = load(claude_settings_path())
+    path = claude_settings_path()
+    where = _home_relative(path)
+    data, unreadable = load(path)
     current = (data or {}).get("statusLine")
-    where = _home_relative(claude_settings_path())
-    if current is None:
+    if data is None:
+        state = f"unknown, because {unreadable}"
+    elif current is None:
         state = f"not installed; {where} has no status line"
     elif is_ours(current):
         state = f"installed in {where}"
     else:
         state = f"not installed; {where} has another tool's status line"
     lines += ["", f"Status line: {state}.",
-              f"Research agent rule {AGENT_RULE}: "
-              + ("present" if agent_rule_present() else "absent") + ".", "",
+              f"Research agent rule {AGENT_RULE}: {agent_rule_state()}.", "",
               "Change one with: /memvara:setup <feature> on|off"]
     return "\n".join(lines)
 
 
 def set_feature(name: str, value: bool) -> "tuple[int, str]":
+    """Set one switch. Exit code 1 means neither settings file was changed."""
     problem = refuse_unknown(name)
     if problem:
         return 2, problem
@@ -341,21 +390,38 @@ def set_feature(name: str, value: bool) -> "tuple[int, str]":
     data, unreadable = load(path)
     if data is None:
         return 1, f"Nothing changed: {unreadable}. Fix or delete it, then try again."
+    # The client's settings change is worked out before anything is written, so a file
+    # that cannot take it stops the whole change rather than leaving the switch saved and
+    # the rule missing.
+    rule = None
+    if name == "research_agent":
+        outcome, sentence, planned = plan_agent_rule(denied=not value)
+        if outcome == "error":
+            return 1, f"{sentence} The research_agent switch was not changed either."
+        rule = (sentence, planned)
+    previous = dict(data)
+    existed = os.path.exists(path)
     data[name] = value
     write(path, data)
     said = [f"{name} is now {'on' if value else 'off'} in {_home_relative(path)}."]
+    if rule is not None:
+        sentence, planned = rule
+        if planned is not None:
+            try:
+                write(claude_settings_path(), planned)
+            except OSError as exc:
+                # Put the switch back, so exit 1 still means nothing changed.
+                if existed:
+                    write(path, previous)
+                else:
+                    os.unlink(path)
+                return 1, (f"Nothing changed: {_home_relative(claude_settings_path())} "
+                           f"could not be written ({exc}).")
+        said.append(sentence)
     variable = _override(name)
     if variable:
         said.append(f"{variable} is set in this environment and overrides the file until "
                     "it is unset.")
-    code = 0
-    if name == "research_agent":
-        outcome, sentence = set_agent_rule(denied=not value)
-        said.append(sentence)
-        if outcome == "error":
-            said.append("The switch is saved, but Claude Code will keep offering the agent "
-                        "until that file is fixed and this is run again.")
-            code = 1
     if name == "status_line" and value:
         said.append(install_status_line(check_switch=False)[1])
     if name == "status_line" and not value:
@@ -366,7 +432,7 @@ def set_feature(name: str, value: bool) -> "tuple[int, str]":
                     "session.")
     if name in SERVER_SIDE:
         said.append("This switch is " + SERVER_NOTE.format(upper=name.upper()) + ".")
-    return code, " ".join(said)
+    return 0, " ".join(said)
 
 
 def main(argv: "list[str]") -> int:
@@ -382,12 +448,16 @@ def main(argv: "list[str]") -> int:
             if not hook:
                 print(f"Could not install the status line: {exc}", file=sys.stderr)
                 return 1
+            log(f"install-status-line failed: {type(exc).__name__}: {exc}")
             return 0
         if hook:
             # A SessionStart hook's systemMessage is the one line the person at the
-            # terminal sees. Only a change is worth that line.
+            # terminal sees. Only a change is worth that line; a failure goes to the log,
+            # so "could not" and "did not need to" do not look alike.
             if outcome in ("installed", "updated"):
                 print(json.dumps({"systemMessage": sentence}))
+            elif outcome == "error":
+                log(f"install-status-line: {sentence}")
             return 0
         print(sentence)
         return 1 if outcome == "error" else 0

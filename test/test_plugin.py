@@ -148,6 +148,8 @@ ALLOWED_PLUGIN_FILES = {
     pathlib.Path("statusline.py"),
     pathlib.Path("setup.py"),
     pathlib.Path("project_scope.py"),
+    # What those three import the hooks' `lib` package through, by its location.
+    pathlib.Path("memvara_hooks.py"),
 } | {pathlib.Path("hooks", *rel.split("/")) for rel in ALLOWED_HOOK_FILES}
 
 
@@ -8003,6 +8005,17 @@ class Commands(unittest.TestCase):
         `${CLAUDE_PLUGIN_ROOT}` reached Grok's command files and expanded to nothing,
         handing the shell an absolute path to a file that has never existed anywhere.
         """
+        for name in sorted(_COMMAND_NAMES):
+            with self.subTest(command=name):
+                body = (_COMMANDS_DIR / f"{name}.md").read_text(encoding="utf-8")
+                found = re.findall(r"\$\{CLAUDE_PLUGIN_ROOT\}/(\S+?)\"", body)
+                self.assertTrue(
+                    found,
+                    f"{name}.md runs nothing through ${{CLAUDE_PLUGIN_ROOT}}; a bare "
+                    "relative path resolves against the user's project, not the plugin")
+                for rel in found:
+                    self.assertTrue((PLUGIN / rel).is_file(),
+                                    f"{name}.md runs {rel}, and there is no file there")
         for name in sorted(_AUTH_COMMAND_NAMES):
             with self.subTest(command=name):
                 body = (_COMMANDS_DIR / f"{name}.md").read_text(encoding="utf-8")
@@ -8657,20 +8670,28 @@ class StatusLine(_Home):
         """The budget is 50 ms, and interpreter start-up is already about 21 of it.
 
         Timings are not asserted, because they vary by machine. What makes this script
-        slow is an import, so the imports are what is checked: none of the modules below
-        may load. `-X importtime` lists every module the run imported.
+        slow is an import, so the imports are what is checked: the script is run to the end
+        in a fresh interpreter, and none of the modules below may be loaded afterwards.
         """
+        probe = ("import io, runpy, sys\n"
+                 "sys.stdin = io.TextIOWrapper(io.BytesIO(sys.argv[2].encode()))\n"
+                 "sys.argv = [sys.argv[1]]\n"
+                 "sys.path.insert(0, sys.argv[0].rsplit('/', 1)[0])\n"
+                 "try:\n"
+                 "    runpy.run_path(sys.argv[0], run_name='__main__')\n"
+                 "except SystemExit:\n"
+                 "    pass\n"
+                 "sys.stderr.write('\\n'.join(sorted(sys.modules)))\n")
         done = subprocess.run(
-            [sys.executable, "-X", "importtime", str(STATUSLINE_SCRIPT)],
-            input=json.dumps({"session_id": "s1"}).encode("utf-8"), capture_output=True,
-            env=_clean_env(self.home), timeout=30)
+            [sys.executable, "-S", "-c", probe, str(STATUSLINE_SCRIPT),
+             json.dumps({"session_id": "s1"})],
+            capture_output=True, env=_clean_env(self.home), timeout=30)
         self.assertTrue(done.stdout, "the script printed nothing, so this measured nothing")
-        imported = {line.rsplit("|", 1)[-1].strip()
-                    for line in done.stderr.decode("utf-8").splitlines() if "|" in line}
-        self.assertIn("lib.counts", imported, "the counts reader is not what it read")
+        loaded = set(done.stderr.decode("utf-8").splitlines())
+        self.assertIn("lib.counts", loaded, "the counts reader is not what it read")
         for slow in ("subprocess", "urllib", "http", "ssl", "socket", "lib.ipc",
                      "lib.project", "lib.state_file"):
-            self.assertNotIn(slow, imported, f"the status line imported {slow}")
+            self.assertNotIn(slow, loaded, f"the status line imported {slow}")
 
 
 class StatusLineInstall(_Home):
@@ -8715,12 +8736,21 @@ class StatusLineInstall(_Home):
         self.assertEqual((done.returncode, done.stdout), (0, b""))
         self.assertEqual(self.claude_settings.read_bytes(), before)
 
+    def record(self, command: str) -> None:
+        path = pathlib.Path(self.home) / ".memvara" / ".hooks" / "statusline.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"command": command}), encoding="utf-8")
+
     def test_an_older_plugin_versions_line_is_repointed(self) -> None:
-        """The plugin directory changes with each version, and the old one is deleted."""
+        """The plugin directory changes with each version, and the old one is deleted.
+
+        The old line is recognised because memvara recorded the exact command it wrote.
+        """
         self.claude_settings.parent.mkdir(parents=True)
         old = '/u/.claude/plugins/cache/claude-memvara/memvara/0.2.11/statusline.py'
+        self.record(f'python3 -S "{old}"')
         self.claude_settings.write_text(json.dumps(
-            {"statusLine": {"type": "command", "command": f'python3 "{old}"',
+            {"statusLine": {"type": "command", "command": f'python3 -S "{old}"',
                             "padding": 1}}), encoding="utf-8")
         done = self.setup("install-status-line", "--hook")
         self.assertEqual(done.returncode, 0)
@@ -8728,6 +8758,40 @@ class StatusLineInstall(_Home):
         entry = json.loads(self.claude_settings.read_text("utf-8"))["statusLine"]
         self.assertEqual(entry, {"type": "command", "padding": 1,
                                  "command": f'python3 -S "{STATUSLINE_SCRIPT}"'})
+
+    def test_a_look_alike_line_is_another_tools(self) -> None:
+        """A path that merely resembles memvara's is not memvara's.
+
+        The first version recognised its own line by `statusline.py` and the word memvara
+        in the path, which claims `~/dev/memvara-notes/statusline.py` too: the next session
+        would have replaced it, and remove would have deleted it.
+        """
+        self.claude_settings.parent.mkdir(parents=True)
+        for command in ('python3 "/home/u/dev/memvara-notes/statusline.py"',
+                        'python3 -S "/u/.claude/plugins/cache/x/memvara/0.2.11/statusline.py"'):
+            with self.subTest(command=command):
+                self.claude_settings.write_text(json.dumps(
+                    {"statusLine": {"type": "command", "command": command}}),
+                    encoding="utf-8")
+                before = self.claude_settings.read_bytes()
+                self.setup("install-status-line", "--hook")
+                self.assertEqual(self.claude_settings.read_bytes(), before)
+                self.setup("remove-status-line")
+                self.assertEqual(self.claude_settings.read_bytes(), before)
+
+    def test_installing_records_the_command_it_wrote(self) -> None:
+        self.setup("install-status-line", "--hook")
+        recorded = json.loads((pathlib.Path(self.home) / ".memvara" / ".hooks"
+                               / "statusline.json").read_text("utf-8"))
+        self.assertEqual(recorded, {"command": f'python3 -S "{STATUSLINE_SCRIPT}"'})
+
+    def test_a_failure_in_the_hook_is_logged_not_shown(self) -> None:
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text("{broken", encoding="utf-8")
+        done = self.setup("install-status-line", "--hook")
+        self.assertEqual((done.returncode, done.stdout), (0, b""))
+        log = pathlib.Path(self.home) / ".memvara" / ".hooks" / "setup.log"
+        self.assertIn("could not be read as JSON", log.read_text("utf-8"))
 
     def test_unreadable_settings_are_never_overwritten(self) -> None:
         self.claude_settings.parent.mkdir(parents=True)
@@ -8780,12 +8844,11 @@ class Setup(_Home):
     """`/memvara:setup`: every feature listed, one set at a time, unknown names refused."""
 
     def features(self) -> "tuple[str, ...]":
-        sys.path.insert(0, str(HOOKS))
-        try:
-            from lib import settings
-        finally:
-            sys.path.pop(0)
-        return settings.FEATURES
+        spec = importlib.util.spec_from_file_location(
+            "memvara_hooks_for_test", PLUGIN / "memvara_hooks.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.hooks_lib("settings")[0].FEATURES
 
     def test_the_phase_one_features_are_the_hooks_list(self) -> None:
         self.assertEqual(self.features(), (
@@ -8880,8 +8943,33 @@ class Setup(_Home):
         self.claude_settings.write_text("{broken", encoding="utf-8")
         done = self.setup("research_agent", "off")
         self.assertEqual(done.returncode, 1)
-        self.assertIn(b"Nothing changed in Claude Code's settings", done.stdout)
+        self.assertIn(b"Nothing changed", done.stdout)
         self.assertEqual(self.claude_settings.read_text("utf-8"), "{broken")
+
+    def test_a_failed_agent_rule_changes_neither_file(self) -> None:
+        """Exit 1 means nothing was changed, which is what setup.md tells the user."""
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text("{broken", encoding="utf-8")
+        done = self.setup("research_agent", "off")
+        self.assertEqual(done.returncode, 1)
+        self.assertFalse(self.memvara_settings.exists(),
+                         "the switch was saved although the rule could not be")
+
+    def test_permissions_that_are_not_an_object_are_named_as_such(self) -> None:
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text('{"permissions": ["x"]}', encoding="utf-8")
+        done = self.setup("research_agent", "off")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(b"permissions in", done.stdout)
+        self.assertIn(b"is not an object", done.stdout)
+
+    def test_the_listing_says_when_the_client_settings_cannot_be_read(self) -> None:
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text("{broken", encoding="utf-8")
+        said = self.setup().stdout.decode("utf-8")
+        self.assertIn("could not be read as JSON", said)
+        self.assertNotIn("not installed", said)
+        self.assertNotIn(": absent", said)
 
     def test_a_server_side_switch_says_no_server_reads_it_yet(self) -> None:
         done = self.setup("profile", "off")

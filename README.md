@@ -517,7 +517,8 @@ server is not authenticated. When it is connected, ask the tool.
 
 Two more commands, and three small scripts beside the vendored hooks:
 `project_scope.py`, `statusline.py` and `setup.py`. All three use only the
-standard library and the hooks' own modules.
+standard library and the hooks' own modules, which they load by location
+through `memvara_hooks.py`.
 
 | Command | What it does |
 |---|---|
@@ -600,10 +601,16 @@ session, `searched` how many read-only memory tools the model called, and
 The plugin's `SessionStart` hook adds the status line to
 `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) only when
 no status line is set there. It never replaces or changes another tool's
-status line. After a plugin update it points its own line at the new plugin
-directory. It writes through a temporary file and a rename, and it leaves a
-settings file that is not valid JSON untouched. The line runs
-`python3 -S statusline.py`, which prints nothing at all on any error.
+status line. It records the exact command it wrote in
+`~/.memvara/.hooks/statusline.json`, and treats a status line as its own only
+when the command is that one or the one this version would write, so a
+similar-looking line from another tool is never taken for memvara's. After a
+plugin update it points its own line at the new plugin directory. It writes
+through a temporary file and a rename, and it leaves a settings file that is
+not valid JSON untouched. When it cannot install the line it writes the
+reason to `~/.memvara/.hooks/setup.log` instead of interrupting the session.
+The line runs `python3 -S statusline.py`, which prints nothing at all on any
+error.
 
 `/memvara:setup remove-status-line` takes memvara's line out and switches
 `status_line` off, so the next session does not add it back.
@@ -640,9 +647,14 @@ when you set one.
 
 Files these write: `~/.memvara/settings.json`; in
 `~/.claude/settings.json`, the `statusLine` key and the one deny rule
-above; `~/.memvara/.hooks/counts/`, one small file per session, removed
-after 14 days; and `~/.memvara/.hooks/projects/`, where the project for
-each directory is cached for an hour.
+above; `~/.memvara/.hooks/statusline.json` and `~/.memvara/.hooks/setup.log`,
+described above; `~/.memvara/.hooks/counts/`, one small file per session,
+removed after 14 days; and `~/.memvara/.hooks/projects/`, where the project
+for each directory is cached for an hour.
+
+A switch change that would also have to edit `~/.claude/settings.json` is
+checked first: if that file cannot be read or has the wrong shape, neither
+file is changed and the command exits 1.
 
 ## Teach it your vocabulary
 

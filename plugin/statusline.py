@@ -14,16 +14,14 @@ When the `status_line` switch is off the hooks stop counting, and this prints
 `⋈ memvara · off` so the line does not show numbers that have stopped moving.
 
 It must finish in well under 50 ms and must never show an error in the status bar. So it
-imports only `json`, `os` and `sys` besides the two small hook modules, and on any failure
-it prints nothing and exits 0. `setup.py` installs it into `~/.claude/settings.json` and
+imports only `json`, `os`, `sys`, `importlib` and the two small hook modules, and on any
+failure it prints nothing and exits 0. `setup.py` installs it into `~/.claude/settings.json` and
 removes it again.
 """
 
 import json
 import os
 import sys
-
-HOOKS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks")
 
 #: The same glyph the hooks put in front of every recalled line.
 GLYPH = "⋈"
@@ -34,11 +32,9 @@ FEATURE = "status_line"
 
 def render(session_id: str) -> str:
     """The line for `session_id`. Raises on a broken install; `main` catches that."""
-    sys.path.insert(0, HOOKS)
-    try:
-        from lib import counts, settings
-    finally:
-        sys.path.pop(0)
+    from memvara_hooks import hooks_lib
+
+    counts, settings = hooks_lib("counts", "settings")
     if not settings.enabled(FEATURE):
         return f"{GLYPH} memvara · off"
     got = counts.read(session_id)
