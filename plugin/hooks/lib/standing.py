@@ -42,6 +42,9 @@ import re
 import unicodedata
 from typing import Any, Callable, NamedTuple
 
+from .mark import marked
+from .mark import on as mark_on
+
 #: A row of the "Believed now, not believed then" half of a `memory_since` reply. The other
 #: half is claims the store STOPPED believing, and parsing it into the standing set would
 #: re-assert every preference the user has ever withdrawn. `_from_since` stops reading at
@@ -58,6 +61,14 @@ _ADDED_ROW = re.compile(r"^\+\s+\[id=(\S+)([^\]]*)\]\s+(.+)$")
 
 #: The server's word for "a machine derived this". Matched as a bracket field.
 _INFERRED = "inferred"
+
+#: What `memory_standing` is asked for on a hosted deployment, instead of the tool's own
+#: default of 64. The deployment truncates BEFORE this module orders or filters anything,
+#: and a store measured at 169 standing claims was handing back 64 of them chosen by the
+#: server. 200 is the most memvara-cloud's `GET /v1/standing` accepts (`le=200` on its
+#: `limit`); a larger number is refused there, not clamped, so this is a ceiling and not
+#: a wish. Only the hosted route reads it: the local route holds the whole set already.
+HOSTED_STANDING_MAX = 200
 
 #: What a marked row ends with. The library's own spelling, so a reader who has seen one
 #: block has seen both. The extractor's NAME is deliberately never rendered here or
@@ -137,7 +148,10 @@ def _mine(subject: str, cwd: str) -> bool:
     """
     if subject == "user":
         return True
-    return bool(cwd) and subject == f"project:{cwd}"
+    # The namespace folds case, the way every typed entity does in the library
+    # (`Claim.subject_type`); the path does not, because paths do not.
+    namespace, sep, path = subject.partition(":")
+    return bool(cwd) and bool(sep) and namespace.lower() == "project" and path == cwd
 
 
 def _machine_wrote(claim: Any) -> bool:
@@ -251,7 +265,7 @@ def _from_tool(store: Any) -> "list[Note] | None":
     call = getattr(store, "_call", None)
     if not callable(accepts) or not callable(call) or not accepts("memory_standing", "k"):
         return None
-    return _rows(str(call("memory_standing", {}) or ""))
+    return _rows(str(call("memory_standing", {"k": HOSTED_STANDING_MAX}) or ""))
 
 
 def _from_since(store: Any) -> "list[Note] | None":
@@ -269,7 +283,14 @@ def _from_since(store: Any) -> "list[Note] | None":
 
 
 def _order(notes: "list[Note]") -> "list[Note]":
-    """Most-trusted first, then newest, then by id so the order is total.
+    """Stated first, then most-trusted, then newest, then by id so the order is total.
+
+    Stated before trusted, because confidence is written by whoever wrote the claim and
+    a model writes its own. Measured on the real store: one extractor filed every
+    paraphrase it derived at 0.84 to 1.00 and the capture hook filed the user's own
+    sentence at 0.70, so seven machine restatements of one rule sat above the sentence
+    the user typed, and the budget cut off below them. The server's `memory_standing`
+    sorts the same way; this is the same rule on the route that parses rows.
 
     The id tiebreak is not decoration. Without a total order two claims written in the same
     instant swap places between runs, and a block that differs run to run is a block whose
@@ -279,9 +300,11 @@ def _order(notes: "list[Note]") -> "list[Note]":
     stand-in value would sort real claims against a number nobody measured.
     """
     if any(note.confidence is None for note in notes):
-        return list(notes)
-    return sorted(notes, key=lambda n: (-(n.confidence or 0.0), _negated(n.recorded),
-                                        n.ident))
+        # Stated before derived is still knowable without a number: the marker is on
+        # the row. Stable, so within each half the server's own order stands.
+        return sorted(notes, key=lambda n: n.inferred)
+    return sorted(notes, key=lambda n: (n.inferred, -(n.confidence or 0.0),
+                                        _negated(n.recorded), n.ident))
 
 
 def _negated(stamp: str) -> str:
@@ -303,6 +326,7 @@ def render(notes: "list[Note]", header: str, budget: int) -> str:
     """
     if not notes:
         return ""
+    mark = mark_on()
     lines, used, kept = [header], len(header), 0
     for note in notes:
         # The marker goes on the row, not in the header. The header already says some of
@@ -312,7 +336,10 @@ def render(notes: "list[Note]", header: str, budget: int) -> str:
         # the block is ordered so stated rules come first, and order tells a reader the
         # list is sorted without telling them WHERE the boundary falls. In twenty-two
         # rows, row twelve is unknowable.
-        line = f"- {note.text}{MARKER if note.inferred else ''}"
+        #
+        # Each row also starts with the recall mark (`lib.mark`), so the block reads as
+        # recalled memory and capture never mines it back in.
+        line = marked(f"- {note.text}{MARKER if note.inferred else ''}", mark)
         if kept and used + 1 + len(line) > budget:
             break
         lines.append(line)

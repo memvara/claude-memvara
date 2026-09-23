@@ -10,6 +10,7 @@ import ast
 import contextlib
 import datetime
 import http.client
+import importlib.util
 import io
 import json
 import os
@@ -103,6 +104,17 @@ ALLOWED_HOOK_FILES = {
     "lib/transcript.py",
     "lib/standing.py",
     "lib/write.py",
+    # Added with the project scope, the status-line counts and the recall mark, and read
+    # before being listed. `lib/project_vectors.json` is data, not code: the table of
+    # remote URLs and the project each must resolve to, which the library's copy of
+    # `canonical_project` is tested against too. `lib/counts.py` is also what
+    # `statusline.py` imports to read a session's numbers.
+    "lib/counts.py",
+    "lib/mark.py",
+    "lib/project.py",
+    "lib/project_vectors.json",
+    "lib/settings.py",
+    "lib/state_file.py",
     # Vendored because the tree is copied whole with ZERO transforms, and read
     # before being listed. `hosts/codex.py`, `hosts/opencode.py`,
     # `hosts/cursor.py` and `hosts/copilot.py` are other clients' records: inert
@@ -127,6 +139,17 @@ ALLOWED_PLUGIN_FILES = {
     pathlib.Path("commands") / "login.md",
     pathlib.Path("commands") / "logout.md",
     pathlib.Path("commands") / "stats.md",
+    pathlib.Path("commands") / "index.md",
+    pathlib.Path("commands") / "setup.md",
+    pathlib.Path("agents") / "memory-researcher.md",
+    # Three scripts of this repository's own, beside the vendored tree rather than in it:
+    # the status line, the switches behind /memvara:setup, and the project helper that
+    # .mcp.json runs for the MCP header and /memvara:index runs for the subject.
+    pathlib.Path("statusline.py"),
+    pathlib.Path("setup.py"),
+    pathlib.Path("project_scope.py"),
+    # What those three import the hooks' `lib` package through, by its location.
+    pathlib.Path("memvara_hooks.py"),
 } | {pathlib.Path("hooks", *rel.split("/")) for rel in ALLOWED_HOOK_FILES}
 
 
@@ -265,27 +288,46 @@ def _lock(name: str = "skill.lock") -> dict[str, str]:
 #: fixed at import. Redirecting only the first leaves `capture.log` still leaking, which
 #: is exactly what the first attempt at this fixture did.
 _REDIRECTED: "list[tuple]" = []
+_STDIN: "list" = []
 
 
 def setUpModule() -> None:
     sys.path.insert(0, str(HOOKS))
     try:
         import recall
-        from lib import ipc, write
+        from lib import counts, ipc, project, settings, write
     finally:
         sys.path.pop(0)
     home = tempfile.mkdtemp(prefix="memvara-test-home-")
     hooks = os.path.join(home, ".memvara", ".hooks")
     _REDIRECTED.append(
-        (home, ipc, ipc._HOME, recall, recall.SAMPLE_FLAG, write, write.LOG))
+        (home, ipc, ipc._HOME, recall, recall.SAMPLE_FLAG, write, write.LOG,
+         settings, settings.SETTINGS, counts, counts.COUNTS_DIR,
+         project, project.CACHE_DIR))
     ipc._HOME = home
     recall.SAMPLE_FLAG = os.path.join(hooks, "sample-recall")
     write.LOG = pathlib.Path(hooks) / "capture.log"
+    # The switches, the status-line counts and the project cache are three more paths
+    # fixed at import. Left alone, a switch the developer set in their own
+    # `~/.memvara/settings.json` decides what the suite expects, and every recall test
+    # adds to a real session's counts.
+    settings.SETTINGS = os.path.join(home, ".memvara", "settings.json")
+    counts.COUNTS_DIR = os.path.join(hooks, "counts")
+    project.CACHE_DIR = os.path.join(hooks, "projects")
+    # `session_start.main()` now reads its event from stdin, as the other hooks do. A test
+    # that drives it would otherwise wait on whatever stdin the runner was given, which is
+    # an empty pipe on CI and an open one under some shells, where the suite then hangs.
+    _STDIN.append(sys.stdin)
+    sys.stdin = io.StringIO("")
 
 
 def tearDownModule() -> None:
-    home, ipc, was_home, recall, was_flag, write, was_log = _REDIRECTED.pop()
+    (home, ipc, was_home, recall, was_flag, write, was_log, settings, was_settings,
+     counts, was_counts, project, was_cache) = _REDIRECTED.pop()
     ipc._HOME, recall.SAMPLE_FLAG, write.LOG = was_home, was_flag, was_log
+    settings.SETTINGS, counts.COUNTS_DIR = was_settings, was_counts
+    project.CACHE_DIR = was_cache
+    sys.stdin = _STDIN.pop()
     shutil.rmtree(home, ignore_errors=True)
 
 
@@ -308,8 +350,19 @@ class Marketplace(unittest.TestCase):
         self.assertEqual(body["repository"], f"https://github.com/{REPO_NAME}")
 
 
+#: The one local command `.mcp.json` may name. Claude Code runs it when it connects and
+#: sends the JSON object it prints as extra headers on every MCP request.
+HEADERS_HELPER = ('python3 "${CLAUDE_PLUGIN_ROOT}/project_scope.py" headers '
+                  '"${CLAUDE_PROJECT_DIR}"')
+
+
 class McpConfig(unittest.TestCase):
     def test_hosted_http_only(self) -> None:
+        """The server is the hosted endpoint over HTTP, and nothing local stands in for it.
+
+        The one local command is the headers helper, which prints a header and exits. It
+        is pinned exactly, so `python3` cannot reach this file any other way.
+        """
         body = _json(PLUGIN / ".mcp.json")
         assert isinstance(body, dict)
         server = body["mcpServers"]["memvara"]
@@ -317,10 +370,31 @@ class McpConfig(unittest.TestCase):
         self.assertEqual(server.get("type"), "http")
         self.assertNotIn("command", server)
         self.assertNotIn("args", server)
+        self.assertEqual(server.get("headersHelper"), HEADERS_HELPER)
         raw = (PLUGIN / ".mcp.json").read_text(encoding="utf-8")
         self.assertNotIn("npx", raw)
-        self.assertNotIn("python3", raw)
         self.assertNotIn("stdio", raw)
+        self.assertEqual(raw.count("python3"), 1, "python3 appears only in the helper")
+
+    def test_the_oauth_grant_is_left_alone(self) -> None:
+        """No `Authorization` header here, from the file or from the helper.
+
+        Claude Code drops its own OAuth when a server's headers carry `Authorization`. The
+        plugin's users sign in with that OAuth, so a header of that name here would cut
+        every one of them off at the next connection.
+        """
+        server = _json(PLUGIN / ".mcp.json")["mcpServers"]["memvara"]
+        for name in server.get("headers", {}):
+            self.assertNotEqual(name.lower(), "authorization")
+        spec = importlib.util.spec_from_file_location(
+            "project_scope_for_oauth", PLUGIN / "project_scope.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.HEADER.lower(), "memvara-project")
+
+    def test_the_helper_is_the_file_it_names(self) -> None:
+        rel = HEADERS_HELPER.split('${CLAUDE_PLUGIN_ROOT}/', 1)[1].split('"', 1)[0]
+        self.assertTrue((PLUGIN / rel).is_file(), f"{rel} does not exist")
 
 
 class SkillTree(unittest.TestCase):
@@ -5035,6 +5109,19 @@ class Hygiene(unittest.TestCase):
             recall.SAMPLE_FLAG.startswith(real),
             "setUpModule must redirect recall.SAMPLE_FLAG: a flag file that exists on "
             "the developer's machine turns every main()-driving test into a writer")
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import counts, project, settings
+        finally:
+            sys.path.pop(0)
+        home = os.path.join(os.path.expanduser("~"), ".memvara")
+        for name, value in (("settings.SETTINGS", settings.SETTINGS),
+                            ("counts.COUNTS_DIR", counts.COUNTS_DIR),
+                            ("project.CACHE_DIR", project.CACHE_DIR)):
+            self.assertFalse(
+                value.startswith(home),
+                f"setUpModule must redirect {name}: it is fixed at import and points "
+                "into the developer's own ~/.memvara")
 
     def test_no_npx_in_json(self) -> None:
         """No JSON *this repo ships* may reach for npx.
@@ -5570,6 +5657,10 @@ def _standing():
 
 HEAD = "STANDING:"
 
+#: How one injected memory line starts: the recall mark, then the bullet. Written out
+#: rather than read from `lib.mark`, which is part of what these tests check.
+MARKED = "\u22c8 - "
+
 
 class StandingSelection(unittest.TestCase):
     """Group A — a standing preference must not have to sound like a query to arrive.
@@ -5727,7 +5818,7 @@ class StandingOrder(unittest.TestCase):
                        ident="cl_right")
         block = s.standing_block(_Local([wrong, right]), hosted=False, budget=4000,
                                  header=HEAD, fallback=lambda: "")
-        lines = [l for l in block.splitlines() if l.startswith("- ")]
+        lines = [l for l in block.splitlines() if l.startswith(MARKED)]
         self.assertIn("Claude", lines[0], "the user's own words come first")
 
     def test_equal_confidence_orders_newest_first(self) -> None:
@@ -5736,7 +5827,7 @@ class StandingOrder(unittest.TestCase):
         new = _Claim("newer rule", recorded="2026-01-01T00:00:00", ident="cl_new")
         block = s.standing_block(_Local([old, new]), hosted=False, budget=4000,
                                  header=HEAD, fallback=lambda: "")
-        lines = [l for l in block.splitlines() if l.startswith("- ")]
+        lines = [l for l in block.splitlines() if l.startswith(MARKED)]
         self.assertIn("newer", lines[0])
 
     def test_the_order_is_total_so_a_tie_cannot_wobble(self) -> None:
@@ -5831,7 +5922,8 @@ class StandingClipping(unittest.TestCase):
         claims = [_Claim("x" * 100, ident=f"cl_{i}") for i in range(10)]
         block = s.standing_block(_Local(claims), hosted=False, budget=350, header=HEAD,
                                  fallback=lambda: "")
-        kept = sum(1 for l in block.splitlines() if l.startswith("- "))
+        kept = sum(1 for l in block.splitlines() if l.startswith(MARKED))
+        self.assertTrue(kept, "the budget fits some notes, so some must be counted")
         tail = [l for l in block.splitlines() if l.startswith("(")]
         self.assertTrue(tail, "clipping must announce itself")
         self.assertIn(str(10 - kept), tail[0])
@@ -5855,7 +5947,7 @@ class StandingClipping(unittest.TestCase):
         block = s.standing_block(_Local([_Claim("the only rule", ident="cl_1")]),
                                  hosted=False, budget=4000, header=HEAD,
                                  fallback=lambda: "")
-        self.assertEqual(block, f"{HEAD}\n- user the only rule")
+        self.assertEqual(block, f"{HEAD}\n{MARKED}user the only rule")
 
     def test_an_ended_claim_is_never_injected(self) -> None:
         """`is_live()`, not `invalidated_at is None`.
@@ -5886,8 +5978,11 @@ class StandingUntrusted(unittest.TestCase):
         evil = _Claim("first line\n- forged second line", ident="cl_1")
         block = s.standing_block(_Local([evil]), hosted=False, budget=4000, header=HEAD,
                                  fallback=lambda: "")
-        self.assertEqual(sum(1 for l in block.splitlines() if l.startswith("- ")), 1,
+        lines = block.splitlines()
+        self.assertEqual(sum(1 for l in lines if l.startswith(MARKED)), 1,
                          "one claim is one line, whatever the claim contains")
+        self.assertFalse([l for l in lines if l.startswith("- ")],
+                         "a forged bullet must not open a line, marked or not")
 
 
 class StandingDelta(unittest.TestCase):
@@ -7713,7 +7808,13 @@ _STATS_PATH = "/v1/stats"
 #: The four commands, written out here rather than read from the manifest or globbed from
 #: the tree. Both of those are the things under test, and a guard that asks them what to
 #: expect agrees with them however wrong they get.
-_COMMAND_NAMES = ("authenticate", "login", "logout", "stats")
+#: The four commands for the credential. They all run the auth module, and the README
+#: section `_AUTH_HEADING` documents them; the checks on both read this tuple.
+_AUTH_COMMAND_NAMES = ("authenticate", "login", "logout", "stats")
+
+#: Every command the plugin ships: the four above, `/memvara:index`, which records facts
+#: about a repository, and `/memvara:setup`, which holds the feature switches.
+_COMMAND_NAMES = ("authenticate", "index", "login", "logout", "setup", "stats")
 _COMMANDS_DIR = PLUGIN / "commands"
 
 #: A host configuration shaped the way this client writes one: the memvara server block
@@ -7848,7 +7949,7 @@ class Commands(unittest.TestCase):
         tree and not added to the list is a command the host never loads, and nothing
         about the repository looks wrong.
 
-        The four names are asserted as literals. "whatever is in the tree matches whatever
+        The six names are asserted as literals. "whatever is in the tree matches whatever
         is in the manifest" is satisfied by a plugin that ships two commands, or four
         different ones.
         """
@@ -7872,7 +7973,7 @@ class Commands(unittest.TestCase):
             resolved[path.stem] = path
 
         self.assertEqual(sorted(resolved), sorted(_COMMAND_NAMES),
-                         "these four commands are what this plugin is for; the manifest "
+                         "these six commands are what this plugin is for; the manifest "
                          f"declares {sorted(resolved)}")
         self.assertEqual(sorted(path.stem for path in _COMMANDS_DIR.glob("*.md")),
                          sorted(_COMMAND_NAMES),
@@ -7905,6 +8006,17 @@ class Commands(unittest.TestCase):
         handing the shell an absolute path to a file that has never existed anywhere.
         """
         for name in sorted(_COMMAND_NAMES):
+            with self.subTest(command=name):
+                body = (_COMMANDS_DIR / f"{name}.md").read_text(encoding="utf-8")
+                found = re.findall(r"\$\{CLAUDE_PLUGIN_ROOT\}/(\S+?)\"", body)
+                self.assertTrue(
+                    found,
+                    f"{name}.md runs nothing through ${{CLAUDE_PLUGIN_ROOT}}; a bare "
+                    "relative path resolves against the user's project, not the plugin")
+                for rel in found:
+                    self.assertTrue((PLUGIN / rel).is_file(),
+                                    f"{name}.md runs {rel}, and there is no file there")
+        for name in sorted(_AUTH_COMMAND_NAMES):
             with self.subTest(command=name):
                 body = (_COMMANDS_DIR / f"{name}.md").read_text(encoding="utf-8")
                 found = re.findall(r"\$\{CLAUDE_PLUGIN_ROOT\}/(\S+?)\"", body)
@@ -8197,12 +8309,12 @@ class AuthReadme(unittest.TestCase):
         Stated positively because a README that has simply stopped describing the auth
         surface is indistinguishable, to a negative-only guard, from one that never had it.
 
-        The four names come from `_COMMAND_NAMES`, which is written out in this file. The
+        The four names come from `_AUTH_COMMAND_NAMES`, which is written out in this file. The
         README and the manifest are both things under test here and neither may be asked
         what to expect.
         """
         section = self._section()
-        for name in _COMMAND_NAMES:
+        for name in _AUTH_COMMAND_NAMES:
             self.assertIn(f"/memvara:{name}", section,
                           f"the section never names /memvara:{name}, so one of the four "
                           "commands ships undocumented")
@@ -8333,3 +8445,609 @@ class SkillSyncWorkflow(unittest.TestCase):
         """
         self.assertNotIn("git diff --quiet", self.SOURCE.read_text(encoding="utf-8"),
                          "`git diff` cannot see a file the library ADDED")
+
+
+# -- Parity phase 1: the research agent, /memvara:index, /memvara:setup, the status line
+# -- and the MCP project header. Specified in https://github.com/memvara/memvara/pull/220.
+
+STATUSLINE_SCRIPT = PLUGIN / "statusline.py"
+SETUP_SCRIPT = PLUGIN / "setup.py"
+PROJECT_SCRIPT = PLUGIN / "project_scope.py"
+AGENT_FILE = PLUGIN / "agents" / "memory-researcher.md"
+
+#: The prefix Claude Code gives the tools of this plugin's `memvara` MCP server.
+PLUGIN_TOOL_PREFIX = "mcp__plugin_memvara_memvara__"
+
+#: Every tool that changes the store. Written out here rather than derived, because the
+#: research agent must be checked against something that is not itself.
+WRITE_TOOLS = ("memory_add", "memory_remember", "memory_forget", "memory_end",
+               "memory_link", "memory_end_matching", "memory_forget_matching")
+
+
+def _frontmatter(path: pathlib.Path) -> "dict[str, str]":
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        raise AssertionError(f"{path} has no frontmatter")
+    out = {}
+    for line in text.split("---", 2)[1].strip().splitlines():
+        key, _, value = line.partition(":")
+        out[key.strip()] = value.strip()
+    return out
+
+
+def _clean_env(home: str, **extra: str) -> "dict[str, str]":
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("MEMVARA_FEATURE_") and k != "CLAUDE_CONFIG_DIR"}
+    env["HOME"] = home
+    env.update(extra)
+    return env
+
+
+def _run(script: pathlib.Path, args: "list[str]", home: str, stdin: str = "",
+         cwd: "str | None" = None, **extra: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(script), *args], input=stdin.encode("utf-8"),
+                          capture_output=True, env=_clean_env(home, **extra), cwd=cwd,
+                          timeout=30)
+
+
+class ResearchAgent(unittest.TestCase):
+    """The memory-research subagent reads memory and can do nothing else."""
+
+    def test_the_manifest_declares_the_agent_file(self) -> None:
+        manifest = _json(PLUGIN / ".claude-plugin" / "plugin.json")
+        self.assertEqual(manifest.get("agents"), ["./agents/memory-researcher.md"])
+        self.assertTrue(AGENT_FILE.is_file())
+
+    def test_the_agent_names_itself_and_says_when_to_use_it(self) -> None:
+        front = _frontmatter(AGENT_FILE)
+        self.assertEqual(front.get("name"), "memory-researcher",
+                         "setup.py's deny rule names the agent memvara:memory-researcher")
+        self.assertTrue(front.get("description"), "an agent with no description is "
+                                                  "never chosen")
+
+    def _tools(self) -> "list[str]":
+        return [t.strip() for t in _frontmatter(AGENT_FILE)["tools"].split(",")]
+
+    def test_the_agent_has_no_write_tool(self) -> None:
+        tools = self._tools()
+        self.assertTrue(tools, "an empty tools list would inherit every tool, writes too")
+        for tool in tools:
+            self.assertTrue(tool.startswith(PLUGIN_TOOL_PREFIX),
+                            f"{tool} is not one of this plugin's memory tools")
+            self.assertNotIn(tool[len(PLUGIN_TOOL_PREFIX):], WRITE_TOOLS,
+                             f"{tool} writes to the store")
+
+    def test_the_agent_has_exactly_the_tools_the_hooks_approve_without_asking(self) -> None:
+        """The same set as `READ_ONLY` in the vendored `approve.py`.
+
+        A tool the agent lists and the hook does not approve stops the agent at a
+        permission prompt, which is the bug the hooks fixed for `memory_standing` and
+        `memory_ask`. Read out of the hook's source with `ast`, because importing it runs
+        the host binding.
+        """
+        tree = ast.parse((HOOKS / "approve.py").read_text(encoding="utf-8"))
+        read_only = None
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "READ_ONLY" for t in node.targets)):
+                read_only = {elt.value for elt in node.value.args[0].elts}
+        self.assertTrue(read_only, "approve.py no longer defines READ_ONLY")
+        self.assertEqual(sorted(t[len(PLUGIN_TOOL_PREFIX):] for t in self._tools()),
+                         sorted(read_only))
+
+    def test_the_guard_catches_a_write_tool(self) -> None:
+        """Proof the check above can fail: a write tool in the list is found."""
+        leaves = {t[len(PLUGIN_TOOL_PREFIX):] for t in self._tools()}
+        self.assertTrue(leaves.isdisjoint(WRITE_TOOLS))
+        self.assertFalse((leaves | {"memory_remember"}).isdisjoint(WRITE_TOOLS))
+
+
+class IndexCommand(unittest.TestCase):
+    """`/memvara:index` records facts about a repository, and a second run adds none."""
+
+    BODY = PLUGIN / "commands" / "index.md"
+
+    def test_it_checks_the_switch_before_anything_else(self) -> None:
+        body = self.BODY.read_text(encoding="utf-8").split("---", 2)[2]
+        check = 'python3 "${CLAUDE_PLUGIN_ROOT}/setup.py" check index_command'
+        self.assertIn(check, body)
+        self.assertLess(body.index(check), body.index("memory_search"))
+
+    def test_it_resolves_the_subject_with_the_vendored_project_module(self) -> None:
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn('python3 "${CLAUDE_PLUGIN_ROOT}/project_scope.py" subject', body)
+
+    def test_it_searches_before_it_writes(self) -> None:
+        body = self.BODY.read_text(encoding="utf-8").split("---", 2)[2]
+        self.assertLess(body.index("`memory_search`"), body.index("`memory_remember`"))
+
+    def test_every_write_is_semantic_and_says_what_derived_it(self) -> None:
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn('`memory_type`: `"semantic"`', body)
+        self.assertIn('`extractor`: `"memvara-index"`', body)
+
+    def test_a_changed_fact_replaces_the_old_one_by_id(self) -> None:
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("`replaces`", body)
+        self.assertIn("`reason`", body)
+
+    def test_it_names_the_engineering_predicates_and_the_three_new_ones(self) -> None:
+        body = self.BODY.read_text(encoding="utf-8")
+        for predicate in ("depends_on", "version", "deploys_to", "endpoint", "owner",
+                          "known_defect", "convention", "entry_point", "runs_with"):
+            self.assertIn(f"`{predicate}`", body, predicate)
+
+    def test_it_may_write_without_a_prompt_per_fact_and_may_not_end_or_retire(self) -> None:
+        allowed = _frontmatter(self.BODY)["allowed-tools"]
+        self.assertIn(f"{PLUGIN_TOOL_PREFIX}memory_remember", allowed)
+        for tool in ("memory_forget", "memory_end", "memory_add"):
+            self.assertNotIn(f"{PLUGIN_TOOL_PREFIX}{tool},", allowed + ",")
+
+
+class _Home(unittest.TestCase):
+    """A disposable HOME, so nothing here reads or writes the developer's own files."""
+
+    def setUp(self) -> None:
+        self.home = tempfile.mkdtemp(prefix="memvara-parity-home-")
+        self.addCleanup(shutil.rmtree, self.home, True)
+
+    @property
+    def claude_settings(self) -> pathlib.Path:
+        return pathlib.Path(self.home) / ".claude" / "settings.json"
+
+    @property
+    def memvara_settings(self) -> pathlib.Path:
+        return pathlib.Path(self.home) / ".memvara" / "settings.json"
+
+    def write_counts(self, session: str, **values: int) -> None:
+        path = pathlib.Path(self.home) / ".memvara" / ".hooks" / "counts" / f"{session}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({**values, "updated_at": "2026-09-23T00:00:00Z"}),
+                        encoding="utf-8")
+
+    def setup(self, *args: str, **extra: str) -> subprocess.CompletedProcess:
+        return _run(SETUP_SCRIPT, list(args), self.home, **extra)
+
+
+class StatusLine(_Home):
+    """The line, byte for byte, and silence on every failure."""
+
+    def line(self, stdin: str, **extra: str) -> bytes:
+        done = _run(STATUSLINE_SCRIPT, [], self.home, stdin=stdin, **extra)
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(done.stderr, b"")
+        return done.stdout
+
+    def test_it_prints_the_session_counts(self) -> None:
+        self.write_counts("s1", recalled=12, searched=3, captured=5)
+        self.assertEqual(self.line(json.dumps({"session_id": "s1"})),
+                         "⋈ memvara · 12 recalled · 3 searched · "
+                         "5 captured\n".encode("utf-8"))
+
+    def test_a_session_with_no_file_reads_as_zeros(self) -> None:
+        self.assertEqual(self.line(json.dumps({"session_id": "new"})),
+                         "⋈ memvara · 0 recalled · 0 searched · "
+                         "0 captured\n".encode("utf-8"))
+
+    def test_it_says_off_when_the_switch_is_off(self) -> None:
+        self.write_counts("s1", recalled=12, searched=3, captured=5)
+        self.memvara_settings.parent.mkdir(parents=True, exist_ok=True)
+        self.memvara_settings.write_text('{"status_line": false}', encoding="utf-8")
+        self.assertEqual(self.line(json.dumps({"session_id": "s1"})),
+                         "⋈ memvara · off\n".encode("utf-8"))
+
+    def test_the_environment_override_turns_it_off_too(self) -> None:
+        self.assertEqual(self.line(json.dumps({"session_id": "s1"}),
+                                   MEMVARA_FEATURE_STATUS_LINE="0"),
+                         "⋈ memvara · off\n".encode("utf-8"))
+
+    def test_bad_input_prints_nothing(self) -> None:
+        for stdin in ("", "not json", "[]", "{}", '{"session_id": 7}'):
+            with self.subTest(stdin=stdin):
+                self.assertEqual(self.line(stdin), b"")
+
+    def test_a_broken_install_prints_nothing(self) -> None:
+        """No hook tree beside it: the import fails, and the status bar stays empty."""
+        copy = pathlib.Path(self.home) / "plugin-copy"
+        copy.mkdir()
+        shutil.copy(STATUSLINE_SCRIPT, copy / "statusline.py")
+        done = _run(copy / "statusline.py", [], self.home,
+                    stdin=json.dumps({"session_id": "s1"}))
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, b"", b""))
+
+    def test_skipping_site_changes_no_byte(self) -> None:
+        """The installed command runs `python3 -S`. Verify bytes, never timings."""
+        self.write_counts("s1", recalled=4, searched=2, captured=1)
+        stdin = json.dumps({"session_id": "s1"}).encode("utf-8")
+        runs = [subprocess.run([sys.executable, *flags, str(STATUSLINE_SCRIPT)],
+                               input=stdin, capture_output=True,
+                               env=_clean_env(self.home), timeout=30).stdout
+                for flags in ([], ["-S"])]
+        self.assertTrue(runs[0], "nothing printed, so nothing was compared")
+        self.assertEqual(runs[0], runs[1])
+
+    def test_it_imports_nothing_slow(self) -> None:
+        """The budget is 50 ms, and interpreter start-up is already about 21 of it.
+
+        Timings are not asserted, because they vary by machine. What makes this script
+        slow is an import, so the imports are what is checked: the script is run to the end
+        in a fresh interpreter, and none of the modules below may be loaded afterwards.
+        """
+        probe = ("import io, runpy, sys\n"
+                 "sys.stdin = io.TextIOWrapper(io.BytesIO(sys.argv[2].encode()))\n"
+                 "sys.argv = [sys.argv[1]]\n"
+                 "sys.path.insert(0, sys.argv[0].rsplit('/', 1)[0])\n"
+                 "try:\n"
+                 "    runpy.run_path(sys.argv[0], run_name='__main__')\n"
+                 "except SystemExit:\n"
+                 "    pass\n"
+                 "sys.stderr.write('\\n'.join(sorted(sys.modules)))\n")
+        done = subprocess.run(
+            [sys.executable, "-S", "-c", probe, str(STATUSLINE_SCRIPT),
+             json.dumps({"session_id": "s1"})],
+            capture_output=True, env=_clean_env(self.home), timeout=30)
+        self.assertTrue(done.stdout, "the script printed nothing, so this measured nothing")
+        loaded = set(done.stderr.decode("utf-8").splitlines())
+        self.assertIn("lib.counts", loaded, "the counts reader is not what it read")
+        for slow in ("subprocess", "urllib", "http", "ssl", "socket", "lib.ipc",
+                     "lib.project", "lib.state_file"):
+            self.assertNotIn(slow, loaded, f"the status line imported {slow}")
+
+
+class StatusLineInstall(_Home):
+    """Installed only into an empty slot, never over another tool's line."""
+
+    OTHER = ('{\n    "statusLine": {"type": "command", "command": "~/bin/my-line.sh"},\n'
+             '    "model": "opus"\n}\n')
+
+    def test_it_installs_when_there_is_no_status_line(self) -> None:
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text('{"model": "opus", "env": {"A": "1"}}',
+                                        encoding="utf-8")
+        done = self.setup("install-status-line", "--hook")
+        self.assertEqual(done.returncode, 0)
+        message = json.loads(done.stdout)["systemMessage"]
+        self.assertIn("remove-status-line", message)
+        data = json.loads(self.claude_settings.read_text(encoding="utf-8"))
+        self.assertEqual(data["statusLine"],
+                         {"type": "command", "command": f'python3 -S "{STATUSLINE_SCRIPT}"'})
+        self.assertEqual(data["model"], "opus")
+        self.assertEqual(data["env"], {"A": "1"})
+
+    def test_it_creates_the_file_when_there_is_none(self) -> None:
+        self.assertEqual(self.setup("install-status-line", "--hook").returncode, 0)
+        self.assertIn("statusLine", json.loads(self.claude_settings.read_text("utf-8")))
+
+    def test_another_tools_line_is_left_byte_identical(self) -> None:
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text(self.OTHER, encoding="utf-8")
+        before = self.claude_settings.read_bytes()
+        done = self.setup("install-status-line", "--hook")
+        self.assertEqual((done.returncode, done.stdout), (0, b""))
+        self.assertEqual(self.claude_settings.read_bytes(), before)
+        done = self.setup("remove-status-line")
+        self.assertEqual(self.claude_settings.read_bytes(), before)
+        self.assertIn(b"another tool", done.stdout)
+
+    def test_a_second_run_changes_nothing(self) -> None:
+        self.setup("install-status-line", "--hook")
+        before = self.claude_settings.read_bytes()
+        done = self.setup("install-status-line", "--hook")
+        self.assertEqual((done.returncode, done.stdout), (0, b""))
+        self.assertEqual(self.claude_settings.read_bytes(), before)
+
+    def record(self, command: str) -> None:
+        path = pathlib.Path(self.home) / ".memvara" / ".hooks" / "statusline.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"command": command}), encoding="utf-8")
+
+    def test_an_older_plugin_versions_line_is_repointed(self) -> None:
+        """The plugin directory changes with each version, and the old one is deleted.
+
+        The old line is recognised because memvara recorded the exact command it wrote.
+        """
+        self.claude_settings.parent.mkdir(parents=True)
+        old = '/u/.claude/plugins/cache/claude-memvara/memvara/0.2.11/statusline.py'
+        self.record(f'python3 -S "{old}"')
+        self.claude_settings.write_text(json.dumps(
+            {"statusLine": {"type": "command", "command": f'python3 -S "{old}"',
+                            "padding": 1}}), encoding="utf-8")
+        done = self.setup("install-status-line", "--hook")
+        self.assertEqual(done.returncode, 0)
+        self.assertIn("systemMessage", json.loads(done.stdout))
+        entry = json.loads(self.claude_settings.read_text("utf-8"))["statusLine"]
+        self.assertEqual(entry, {"type": "command", "padding": 1,
+                                 "command": f'python3 -S "{STATUSLINE_SCRIPT}"'})
+
+    def test_a_look_alike_line_is_another_tools(self) -> None:
+        """A path that merely resembles memvara's is not memvara's.
+
+        The first version recognised its own line by `statusline.py` and the word memvara
+        in the path, which claims `~/dev/memvara-notes/statusline.py` too: the next session
+        would have replaced it, and remove would have deleted it.
+        """
+        self.claude_settings.parent.mkdir(parents=True)
+        for command in ('python3 "/home/u/dev/memvara-notes/statusline.py"',
+                        'python3 -S "/u/.claude/plugins/cache/x/memvara/0.2.11/statusline.py"'):
+            with self.subTest(command=command):
+                self.claude_settings.write_text(json.dumps(
+                    {"statusLine": {"type": "command", "command": command}}),
+                    encoding="utf-8")
+                before = self.claude_settings.read_bytes()
+                self.setup("install-status-line", "--hook")
+                self.assertEqual(self.claude_settings.read_bytes(), before)
+                self.setup("remove-status-line")
+                self.assertEqual(self.claude_settings.read_bytes(), before)
+
+    def test_installing_records_the_command_it_wrote(self) -> None:
+        self.setup("install-status-line", "--hook")
+        recorded = json.loads((pathlib.Path(self.home) / ".memvara" / ".hooks"
+                               / "statusline.json").read_text("utf-8"))
+        self.assertEqual(recorded, {"command": f'python3 -S "{STATUSLINE_SCRIPT}"'})
+
+    def test_a_failure_in_the_hook_is_logged_not_shown(self) -> None:
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text("{broken", encoding="utf-8")
+        done = self.setup("install-status-line", "--hook")
+        self.assertEqual((done.returncode, done.stdout), (0, b""))
+        log = pathlib.Path(self.home) / ".memvara" / ".hooks" / "setup.log"
+        self.assertIn("could not be read as JSON", log.read_text("utf-8"))
+
+    def test_unreadable_settings_are_never_overwritten(self) -> None:
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text('{"model": "opus",', encoding="utf-8")
+        before = self.claude_settings.read_bytes()
+        done = self.setup("install-status-line", "--hook")
+        self.assertEqual((done.returncode, done.stdout), (0, b""))
+        self.assertEqual(self.claude_settings.read_bytes(), before)
+        done = self.setup("install-status-line")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(b"Nothing changed", done.stdout)
+        self.assertEqual(self.claude_settings.read_bytes(), before)
+
+    def test_it_is_not_installed_while_the_switch_is_off(self) -> None:
+        done = self.setup("install-status-line", "--hook", MEMVARA_FEATURE_STATUS_LINE="0")
+        self.assertEqual((done.returncode, done.stdout), (0, b""))
+        self.assertFalse(self.claude_settings.exists())
+
+    def test_remove_takes_out_ours_and_keeps_it_out(self) -> None:
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text('{"model": "opus"}', encoding="utf-8")
+        self.setup("install-status-line", "--hook")
+        done = self.setup("remove-status-line")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(json.loads(self.claude_settings.read_text("utf-8")),
+                         {"model": "opus"})
+        self.assertEqual(json.loads(self.memvara_settings.read_text("utf-8")),
+                         {"status_line": False})
+        self.setup("install-status-line", "--hook")
+        self.assertNotIn("statusLine", json.loads(self.claude_settings.read_text("utf-8")))
+
+    def test_switching_it_back_on_installs_it(self) -> None:
+        self.setup("remove-status-line")
+        done = self.setup("status_line", "on")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn("statusLine", json.loads(self.claude_settings.read_text("utf-8")))
+
+    def test_the_session_start_hook_runs_the_installer(self) -> None:
+        manifest = _json(PLUGIN / ".claude-plugin" / "plugin.json")
+        hook = manifest["hooks"]["SessionStart"][0]["hooks"][0]
+        self.assertEqual(hook["command"],
+                         'python3 "${CLAUDE_PLUGIN_ROOT}/setup.py" install-status-line --hook')
+        self.assertLessEqual(hook["timeout"], 10)
+        self.assertEqual(set(manifest["hooks"]), {"SessionStart"},
+                         "the manifest's hooks add to hooks/hooks.json; this is the only "
+                         "one the plugin registers itself")
+
+
+class Setup(_Home):
+    """`/memvara:setup`: every feature listed, one set at a time, unknown names refused."""
+
+    def features(self) -> "tuple[str, ...]":
+        spec = importlib.util.spec_from_file_location(
+            "memvara_hooks_for_test", PLUGIN / "memvara_hooks.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.hooks_lib("settings")[0].FEATURES
+
+    def test_the_phase_one_features_are_the_hooks_list(self) -> None:
+        self.assertEqual(self.features(), (
+            "index_command", "research_agent", "project_scope", "status_line",
+            "recall_mark", "profile", "forget_matching", "end_reason", "links"))
+
+    def test_the_listing_names_every_feature_its_value_and_its_default(self) -> None:
+        self.memvara_settings.parent.mkdir(parents=True)
+        self.memvara_settings.write_text('{"recall_mark": false}', encoding="utf-8")
+        done = self.setup()
+        self.assertEqual(done.returncode, 0)
+        lines = done.stdout.decode("utf-8").splitlines()
+        for name in self.features():
+            row = [line for line in lines if line.split()[:1] == [name]]
+            self.assertEqual(len(row), 1, f"{name} is not listed once")
+            expected = "off" if name == "recall_mark" else "on"
+            self.assertEqual(row[0].split()[1:4], [expected, "default", "on"], row[0])
+
+    def test_every_feature_has_a_description(self) -> None:
+        spec = importlib.util.spec_from_file_location("setup_for_test", SETUP_SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(sorted(module.DESCRIPTIONS), sorted(self.features()),
+                         "a feature the hooks know and setup does not describe")
+
+    def test_setting_a_feature_writes_only_that_key(self) -> None:
+        self.memvara_settings.parent.mkdir(parents=True)
+        self.memvara_settings.write_text('{"links": false, "someone_else": 1}',
+                                         encoding="utf-8")
+        done = self.setup("recall_mark", "off")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(json.loads(self.memvara_settings.read_text("utf-8")),
+                         {"links": False, "someone_else": 1, "recall_mark": False})
+        self.setup("recall_mark", "on")
+        self.assertIs(json.loads(self.memvara_settings.read_text("utf-8"))["recall_mark"],
+                      True)
+
+    def test_the_hooks_read_what_setup_writes(self) -> None:
+        self.setup("recall_mark", "off")
+        probe = ("import sys; sys.path.insert(0, sys.argv[1]); from lib import settings; "
+                 "print(settings.enabled('recall_mark'))")
+        done = subprocess.run([sys.executable, "-c", probe, str(HOOKS)],
+                              capture_output=True, env=_clean_env(self.home), timeout=30)
+        self.assertEqual(done.stdout.strip(), b"False")
+
+    def test_an_unknown_feature_is_refused_and_nothing_is_written(self) -> None:
+        done = self.setup("profle", "off")
+        self.assertEqual(done.returncode, 2)
+        said = done.stdout.decode("utf-8")
+        self.assertIn("did you mean profile?", said)
+        for name in self.features():
+            self.assertIn(name, said)
+        self.assertFalse(self.memvara_settings.exists())
+
+    def test_a_value_other_than_on_or_off_is_refused(self) -> None:
+        done = self.setup("links", "maybe")
+        self.assertEqual(done.returncode, 2)
+        self.assertFalse(self.memvara_settings.exists())
+
+    def test_an_unreadable_settings_file_is_not_overwritten(self) -> None:
+        self.memvara_settings.parent.mkdir(parents=True)
+        self.memvara_settings.write_text("{broken", encoding="utf-8")
+        done = self.setup("links", "off")
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(self.memvara_settings.read_text("utf-8"), "{broken")
+
+    def test_check_answers_with_its_exit_code(self) -> None:
+        self.assertEqual(self.setup("check", "index_command").returncode, 0)
+        self.setup("index_command", "off")
+        done = self.setup("check", "index_command")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(b"/memvara:setup index_command on", done.stdout)
+        self.assertEqual(self.setup("check", "nope").returncode, 2)
+
+    def test_research_agent_off_adds_the_deny_rule_and_on_removes_only_it(self) -> None:
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text(json.dumps(
+            {"permissions": {"deny": ["Bash(rm:*)"], "allow": ["Read"]}}), encoding="utf-8")
+        self.setup("research_agent", "off")
+        self.assertEqual(json.loads(self.claude_settings.read_text("utf-8"))["permissions"],
+                         {"deny": ["Bash(rm:*)", "Agent(memvara:memory-researcher)"],
+                          "allow": ["Read"]})
+        self.setup("research_agent", "off")
+        deny = json.loads(self.claude_settings.read_text("utf-8"))["permissions"]["deny"]
+        self.assertEqual(deny.count("Agent(memvara:memory-researcher)"), 1)
+        self.setup("research_agent", "on")
+        self.assertEqual(json.loads(self.claude_settings.read_text("utf-8"))["permissions"],
+                         {"deny": ["Bash(rm:*)"], "allow": ["Read"]})
+
+    def test_an_unreadable_claude_settings_file_is_reported_not_overwritten(self) -> None:
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text("{broken", encoding="utf-8")
+        done = self.setup("research_agent", "off")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(b"Nothing changed", done.stdout)
+        self.assertEqual(self.claude_settings.read_text("utf-8"), "{broken")
+
+    def test_a_failed_agent_rule_changes_neither_file(self) -> None:
+        """Exit 1 means nothing was changed, which is what setup.md tells the user."""
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text("{broken", encoding="utf-8")
+        done = self.setup("research_agent", "off")
+        self.assertEqual(done.returncode, 1)
+        self.assertFalse(self.memvara_settings.exists(),
+                         "the switch was saved although the rule could not be")
+
+    def test_permissions_that_are_not_an_object_are_named_as_such(self) -> None:
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text('{"permissions": ["x"]}', encoding="utf-8")
+        done = self.setup("research_agent", "off")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(b"permissions in", done.stdout)
+        self.assertIn(b"is not an object", done.stdout)
+
+    def test_the_listing_says_when_the_client_settings_cannot_be_read(self) -> None:
+        self.claude_settings.parent.mkdir(parents=True)
+        self.claude_settings.write_text("{broken", encoding="utf-8")
+        said = self.setup().stdout.decode("utf-8")
+        self.assertIn("could not be read as JSON", said)
+        self.assertNotIn("not installed", said)
+        self.assertNotIn(": absent", said)
+
+    def test_a_server_side_switch_says_no_server_reads_it_yet(self) -> None:
+        done = self.setup("profile", "off")
+        self.assertEqual(done.returncode, 0)
+        self.assertIn(b"no server reads this file yet", done.stdout)
+
+    def test_the_command_runs_the_setup_script_with_its_arguments(self) -> None:
+        body = (PLUGIN / "commands" / "setup.md").read_text(encoding="utf-8")
+        self.assertIn('python3 "${CLAUDE_PLUGIN_ROOT}/setup.py" $ARGUMENTS', body)
+
+
+class ProjectHeader(_Home):
+    """The MCP header and the index subject come from the same function as the hooks'."""
+
+    def repo(self, remote: "str | None") -> str:
+        path = os.path.join(self.home, "work", "repo")
+        os.makedirs(path)
+        subprocess.run(["git", "init", "-q", path], check=True, timeout=30)
+        if remote:
+            subprocess.run(["git", "-C", path, "remote", "add", "origin", remote],
+                           check=True, timeout=30)
+        return path
+
+    def headers(self, directory: str, **extra: str) -> dict:
+        done = _run(PROJECT_SCRIPT, ["headers", directory], self.home, **extra)
+        self.assertEqual(done.returncode, 0, "a failing helper logs an error in the client")
+        return json.loads(done.stdout)
+
+    def test_a_repository_sends_its_git_project(self) -> None:
+        path = self.repo("git@github.com:Memvara/Claude-Memvara.git")
+        self.assertEqual(self.headers(path),
+                         {"Memvara-Project": "github.com/memvara/claude-memvara"})
+
+    def test_https_and_ssh_remotes_send_the_same_project(self) -> None:
+        path = self.repo("https://github.com/memvara/claude-memvara")
+        self.assertEqual(self.headers(path),
+                         {"Memvara-Project": "github.com/memvara/claude-memvara"})
+
+    def test_it_matches_what_the_hooks_send(self) -> None:
+        path = self.repo("https://gitlab.example.com:8443/team/app.git")
+        probe = ("import sys; sys.path.insert(0, sys.argv[1]); from lib import project; "
+                 "print(project.canonical_project(sys.argv[2]))")
+        done = subprocess.run([sys.executable, "-c", probe, str(HOOKS), path],
+                              capture_output=True, env=_clean_env(self.home), timeout=30)
+        self.assertEqual(self.headers(path),
+                         {"Memvara-Project": done.stdout.decode("utf-8").strip()})
+
+    def test_no_repository_sends_no_header(self) -> None:
+        plain = os.path.join(self.home, "plain")
+        os.makedirs(plain)
+        self.assertEqual(self.headers(plain), {})
+
+    def test_the_switch_off_sends_no_header(self) -> None:
+        path = self.repo("https://github.com/memvara/claude-memvara")
+        self.assertEqual(self.headers(path, MEMVARA_FEATURE_PROJECT_SCOPE="0"), {})
+
+    def test_an_unexpanded_or_missing_directory_sends_no_header(self) -> None:
+        """An older client that does not expand ${CLAUDE_PROJECT_DIR} passes it literally."""
+        for directory in ("${CLAUDE_PROJECT_DIR}", "", "/no/such/place"):
+            with self.subTest(directory=directory):
+                self.assertEqual(self.headers(directory), {})
+
+    def test_the_subject_names_the_repository(self) -> None:
+        path = self.repo("https://github.com/memvara/claude-memvara.git")
+        done = _run(PROJECT_SCRIPT, ["subject"], self.home, cwd=path)
+        self.assertEqual((done.returncode, done.stdout),
+                         (0, b"project:github.com/memvara/claude-memvara\n"))
+
+    def test_the_subject_ignores_the_scope_switch(self) -> None:
+        path = self.repo("https://github.com/memvara/claude-memvara.git")
+        done = _run(PROJECT_SCRIPT, ["subject"], self.home, cwd=path,
+                    MEMVARA_FEATURE_PROJECT_SCOPE="0")
+        self.assertEqual(done.stdout, b"project:github.com/memvara/claude-memvara\n")
+
+    def test_no_repository_has_no_subject(self) -> None:
+        plain = os.path.join(self.home, "plain")
+        os.makedirs(plain)
+        done = _run(PROJECT_SCRIPT, ["subject"], self.home, cwd=plain)
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(done.stdout, b"")
+        self.assertIn(b"not inside a git repository", done.stderr)

@@ -2,7 +2,8 @@
   "mcpServers": {
     "memvara": {
       "type": "http",
-      "url": "https://app.memvara.dev/mcp"
+      "url": "https://app.memvara.dev/mcp",
+      "headersHelper": "python3 \"${CLAUDE_PLUGIN_ROOT}/project_scope.py\" headers \"${CLAUDE_PROJECT_DIR}\""
     }
   }
 }
