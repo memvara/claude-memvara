@@ -115,6 +115,11 @@ ALLOWED_HOOK_FILES = {
     "lib/project_vectors.json",
     "lib/settings.py",
     "lib/state_file.py",
+    # Added with query rewrite on the recall hook, and read before being listed.
+    # `lib/read_model.py` decides whether the recall hook may ask the local store's model
+    # to rewrite a query, and holds the one test call `/memvara:setup verify-key --yes`
+    # makes. It imports the library only inside that check.
+    "lib/read_model.py",
     # Vendored because the tree is copied whole with ZERO transforms, and read
     # before being listed. `hosts/codex.py`, `hosts/opencode.py`,
     # `hosts/cursor.py` and `hosts/copilot.py` are other clients' records: inert
@@ -3586,13 +3591,16 @@ class Hosted(unittest.TestCase):
 
         ok = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
             "content": [{"type": "text", "text": "- a memory"}]}})
-        # initialize, notifications/initialized, tools/call(STALE),
-        # then the re-handshake and the retry.
+        # initialize, notifications/initialized, then the first call after the handshake
+        # finds the session STALE: that is tools/list, which recall() sends to learn
+        # whether the server offers query_rewrite. Then the re-handshake, the retried
+        # tools/list, and the memory_recall call itself.
         script = [
             Response(200, ok, "session-one"),
             Response(200, ok),
             Response(404, "session not found"),
             Response(200, ok, "session-two"),
+            Response(200, ok),
             Response(200, ok),
             Response(200, ok),
         ]
@@ -8843,19 +8851,33 @@ class StatusLineInstall(_Home):
 class Setup(_Home):
     """`/memvara:setup`: every feature listed, one set at a time, unknown names refused."""
 
-    def features(self) -> "tuple[str, ...]":
+    PHASE_TWO = ("documents", "retrieval_chunks", "extraction_chunks", "ingest_urls",
+                 "ingest_media", "query_rewrite", "synthesis")
+
+    def settings_module(self):
         spec = importlib.util.spec_from_file_location(
             "memvara_hooks_for_test", PLUGIN / "memvara_hooks.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.hooks_lib("settings")[0].FEATURES
+        return module.hooks_lib("settings")[0]
 
-    def test_the_phase_one_features_are_the_hooks_list(self) -> None:
+    def features(self) -> "tuple[str, ...]":
+        return self.settings_module().FEATURES
+
+    def setup_module(self):
+        spec = importlib.util.spec_from_file_location("setup_for_test", SETUP_SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_features_are_the_hooks_list(self) -> None:
         self.assertEqual(self.features(), (
             "index_command", "research_agent", "project_scope", "status_line",
-            "recall_mark", "profile", "forget_matching", "end_reason", "links"))
+            "recall_mark", "profile", "forget_matching", "end_reason", "links",
+            *self.PHASE_TWO))
 
     def test_the_listing_names_every_feature_its_value_and_its_default(self) -> None:
+        """The default printed is the library's, so extraction_chunks reads as off."""
         self.memvara_settings.parent.mkdir(parents=True)
         self.memvara_settings.write_text('{"recall_mark": false}', encoding="utf-8")
         done = self.setup()
@@ -8864,8 +8886,31 @@ class Setup(_Home):
         for name in self.features():
             row = [line for line in lines if line.split()[:1] == [name]]
             self.assertEqual(len(row), 1, f"{name} is not listed once")
-            expected = "off" if name == "recall_mark" else "on"
-            self.assertEqual(row[0].split()[1:4], [expected, "default", "on"], row[0])
+            default = "off" if name == "extraction_chunks" else "on"
+            expected = "off" if name in ("recall_mark", "extraction_chunks") else "on"
+            self.assertEqual(row[0].split()[1:4], [expected, "default", default], row[0])
+
+    def test_every_phase_two_switch_and_every_upcoming_one_has_a_cost(self) -> None:
+        module = self.setup_module()
+        self.assertEqual(sorted(module.COSTS), sorted((*self.PHASE_TWO, *module.UPCOMING)))
+        said = self.setup().stdout.decode("utf-8")
+        for name in self.PHASE_TWO:
+            self.assertIn(f"Cost: {module.COSTS[name][:40]}", said, name)
+
+    def test_an_upcoming_switch_is_listed_and_cannot_be_set(self) -> None:
+        said = self.setup().stdout.decode("utf-8")
+        self.assertIn("Arriving in the next release", said)
+        for name in ("metadata_filters", "encryption"):
+            self.assertIn(name, said)
+            done = self.setup(name, "off")
+            self.assertEqual(done.returncode, 2)
+            self.assertIn(b"arriving in the next release", done.stdout)
+        self.assertFalse(self.memvara_settings.exists(),
+                         "a switch nothing reads was written to the settings file")
+
+    def test_an_upcoming_switch_is_not_a_feature_yet(self) -> None:
+        """When the library ships one, it belongs in the feature list and out of UPCOMING."""
+        self.assertFalse(set(self.setup_module().UPCOMING) & set(self.features()))
 
     def test_every_feature_has_a_description(self) -> None:
         spec = importlib.util.spec_from_file_location("setup_for_test", SETUP_SCRIPT)
@@ -8975,6 +9020,164 @@ class Setup(_Home):
         done = self.setup("profile", "off")
         self.assertEqual(done.returncode, 0)
         self.assertIn(b"no server reads this file yet", done.stdout)
+
+
+class VerifyKey(_Home):
+    """`/memvara:setup verify-key`: the cost first, then one test call, then the record.
+
+    The library is a stand-in written to disk and put on `PYTHONPATH`, so the command runs
+    in its own process exactly as the client runs it, and no test depends on a model key.
+    """
+
+    FAKE_CONFIG = '''
+import os, types
+
+class ServerConfig:
+    @staticmethod
+    def from_env(env):
+        return types.SimpleNamespace(mode="local")
+
+class _Store:
+    llm = types.SimpleNamespace(model="stand-in-model", chat=lambda *a, **k: "")
+
+    def search(self, query, k=6, query_rewrite=True):
+        with open(os.environ["FAKE_CALLS"], "a") as fh:
+            fh.write(f"{query}|{k}|{query_rewrite}\\n")
+        status = int(os.environ.get("FAKE_STATUS") or 0) or None
+        return types.SimpleNamespace(rewrite=types.SimpleNamespace(
+            outcome=os.environ.get("FAKE_OUTCOME", "applied"),
+            reason=os.environ.get("FAKE_REASON") or None, status=status))
+
+    def close(self):
+        pass
+
+def build_memvara(config):
+    return _Store()
+'''
+
+    def setUp(self) -> None:
+        super().setUp()
+        library = pathlib.Path(self.home) / "fake-library" / "memvara"
+        (library / "server").mkdir(parents=True)
+        (library / "__init__.py").write_text("", encoding="utf-8")
+        (library / "server" / "__init__.py").write_text("", encoding="utf-8")
+        (library / "server" / "config.py").write_text(self.FAKE_CONFIG, encoding="utf-8")
+        self.calls = pathlib.Path(self.home) / "calls.txt"
+        self.local = {"PYTHONPATH": str(library.parent), "FAKE_CALLS": str(self.calls),
+                      "MEMVARA_DB": str(pathlib.Path(self.home) / "store.db"),
+                      "MEMVARA_LLM": "anthropic", "MEMVARA_LLM_MODEL": ""}
+
+    def made_calls(self) -> "list[str]":
+        return self.calls.read_text("utf-8").splitlines() if self.calls.exists() else []
+
+    def allowed(self, **extra: str) -> bytes:
+        probe = ("import sys; sys.path.insert(0, sys.argv[1]); from lib import read_model; "
+                 "print(read_model.allowed())")
+        done = subprocess.run([sys.executable, "-c", probe, str(HOOKS)], capture_output=True,
+                              env=_clean_env(self.home, **{**self.local, **extra}),
+                              timeout=30)
+        return done.stdout.strip()
+
+    def test_without_yes_it_shows_the_time_and_the_cost_and_changes_nothing(self) -> None:
+        done = self.setup("verify-key", **self.local)
+        self.assertEqual(done.returncode, 0)
+        said = done.stdout.decode("utf-8")
+        for fact in ("21.0 ms", "5.6 ms", "10 seconds", "5 seconds",
+                     "one chat call per prompt", "the anthropic backend's default model",
+                     "https://www.anthropic.com/pricing", "verify-key --yes"):
+            self.assertIn(fact, said)
+        self.assertNotIn("$", said, "memvara keeps no price list, so it states no price")
+        self.assertEqual(self.made_calls(), [])
+        self.assertFalse(self.memvara_settings.exists())
+
+    def test_the_cost_names_the_configured_model(self) -> None:
+        done = self.setup("verify-key", **{**self.local, "MEMVARA_LLM": "openai",
+                                           "MEMVARA_LLM_MODEL": "some-model"})
+        said = done.stdout.decode("utf-8")
+        self.assertIn("the model some-model (the openai backend)", said)
+        self.assertIn("https://openai.com/api/pricing", said)
+
+    def test_with_no_model_configured_there_is_nothing_to_check(self) -> None:
+        done = self.setup("verify-key", **{**self.local, "MEMVARA_LLM": "none"})
+        self.assertEqual(done.returncode, 0)
+        self.assertIn(b"No model is configured", done.stdout)
+        self.assertNotIn(b"--yes", done.stdout)
+
+    def test_a_working_key_is_recorded_and_the_recall_hook_uses_it(self) -> None:
+        self.assertEqual(self.allowed(), b"False")
+        done = self.setup("verify-key", "--yes", **self.local)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(len(self.made_calls()), 1, "exactly one test call")
+        self.assertTrue(self.made_calls()[0].endswith("|1|True"))
+        record = json.loads(self.memvara_settings.read_text("utf-8"))["read_model"]
+        self.assertEqual((record["outcome"], record["backend"], record["model"]),
+                         ("applied", "anthropic", "stand-in-model"))
+        self.assertIn(b"rewrites each prompt's query", done.stdout)
+        self.assertEqual(self.allowed(), b"True")
+        self.assertEqual(self.allowed(MEMVARA_LLM_MODEL="another-model"), b"False",
+                         "a different model needs a check of its own")
+        self.assertIn("rewrites each prompt's query",
+                      self.setup(**self.local).stdout.decode("utf-8"))
+
+    def test_a_rejected_key_is_recorded_and_the_recall_hook_stays_plain(self) -> None:
+        done = self.setup("verify-key", "--yes", **self.local, FAKE_OUTCOME="key_rejected",
+                          FAKE_STATUS="401")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(b"refused the key (HTTP 401)", done.stdout)
+        record = json.loads(self.memvara_settings.read_text("utf-8"))["read_model"]
+        self.assertEqual((record["outcome"], record["status"]), ("key_rejected", 401))
+        self.assertEqual(self.allowed(), b"False")
+
+    def test_a_hosted_install_has_no_local_store_to_check(self) -> None:
+        local = {**self.local, "MEMVARA_DB": ""}
+        done = self.setup("verify-key", "--yes", **local)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(b"organisation's own key", done.stdout)
+        self.assertEqual(self.made_calls(), [])
+
+    def test_an_unreadable_settings_file_stops_the_check_before_the_call(self) -> None:
+        self.memvara_settings.parent.mkdir(parents=True)
+        self.memvara_settings.write_text("{broken", encoding="utf-8")
+        done = self.setup("verify-key", "--yes", **self.local)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(b"no test call was made", done.stdout)
+        self.assertEqual(self.made_calls(), [])
+        self.assertEqual(self.memvara_settings.read_text("utf-8"), "{broken")
+
+    def test_the_listing_says_the_hook_does_not_rewrite_until_a_key_is_checked(self) -> None:
+        said = self.setup(**self.local).stdout.decode("utf-8")
+        self.assertIn("does not rewrite queries yet: no model key has been checked", said)
+        self.setup("query_rewrite", "off", **self.local)
+        said = self.setup(**self.local).stdout.decode("utf-8")
+        self.assertIn("does not rewrite queries, because query_rewrite is off", said)
+
+    def test_turning_rewrite_back_on_over_a_checked_key_shows_the_cost_first(self) -> None:
+        self.setup("verify-key", "--yes", **self.local)
+        self.setup("query_rewrite", "off", **self.local)
+        self.assertEqual(self.allowed(), b"False")
+        done = self.setup("query_rewrite", "on", **self.local)
+        self.assertEqual(done.returncode, 0)
+        self.assertIn(b"21.0 ms", done.stdout)
+        self.assertIn(b"query_rewrite on --yes", done.stdout)
+        self.assertEqual(self.allowed(), b"False", "nothing changed before the user said yes")
+        done = self.setup("query_rewrite", "on", "--yes", **self.local)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(self.allowed(), b"True")
+
+    def test_turning_rewrite_on_with_no_checked_key_needs_no_confirmation(self) -> None:
+        """Nothing starts: the hook still waits for verify-key, which shows the cost."""
+        self.setup("query_rewrite", "off", **self.local)
+        done = self.setup("query_rewrite", "on", **self.local)
+        self.assertEqual(done.returncode, 0)
+        self.assertIs(json.loads(self.memvara_settings.read_text("utf-8"))["query_rewrite"],
+                      True)
+        self.assertIn(b"no model key has been checked", done.stdout)
+
+    def test_the_command_tells_the_agent_to_leave_the_yes_to_the_user(self) -> None:
+        body = (PLUGIN / "commands" / "setup.md").read_text(encoding="utf-8")
+        self.assertIn("verify-key", body)
+        self.assertIn("--yes", body)
+        self.assertIn("Never add `--yes` yourself", body)
 
     def test_the_command_runs_the_setup_script_with_its_arguments(self) -> None:
         body = (PLUGIN / "commands" / "setup.md").read_text(encoding="utf-8")

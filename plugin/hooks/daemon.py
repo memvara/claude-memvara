@@ -47,6 +47,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from lib.fast import rewrite_kwargs  # noqa: E402
 from lib.ipc import IDLE_TIMEOUT_SEC, socket_path, store_key  # noqa: E402
 from lib.open import open_store  # noqa: E402
 
@@ -134,6 +135,10 @@ class Daemon:
         types = request.get("memory_types")
         if isinstance(types, list) and types:
             kwargs["memory_types"] = [str(t) for t in types]
+        # A plain read unless the client asked for a rewrite, and the argument only for a
+        # backend that takes it -- the same rule `lib.fast.recall` applies on the direct
+        # route, so the two routes hand one backend the same call.
+        read_kind = rewrite_kwargs(self.store.recall, bool(request.get("query_rewrite")))
         try:
             # Serialised deliberately. The store is a read handle over SQLite and is not
             # documented as thread-safe; a per-prompt hook has no concurrency worth the
@@ -146,7 +151,7 @@ class Daemon:
                 #
                 # Both raise on failure and return text on success, which is what lets one
                 # `except` cover both backends without knowing which one it holds.
-                text = str(self.store.recall(query, **kwargs) or "")
+                text = str(self.store.recall(query, **kwargs, **read_kind) or "")
                 self.failures = 0
                 return {"ok": True, "text": text}
         except Exception:
@@ -268,6 +273,11 @@ class Daemon:
 
 def main() -> int:
     store = open_store()
+    # The warm-up is a plain read: it exists to pay connection costs, not a model call.
+    # `open_store()` returns the library's own `Memvara`, which takes `query_rewrite`
+    # unless it was released before query rewrite; the stdlib hosted client below takes no
+    # such argument and always asks its server for a plain read.
+    plain_read: dict = rewrite_kwargs(store.recall, False) if store is not None else {}
     if store is None:
         # No library, or no local store. On a paste-the-URL hosted install that is the
         # normal state, not a broken one, so fall through to the stdlib HTTP client
@@ -275,6 +285,7 @@ def main() -> int:
         from lib.hosted import open_hosted
 
         store = open_hosted()
+        plain_read = {}
     if store is None:
         # Nothing to serve at all. Exiting is correct: a daemon with no backend would
         # accept connections and answer every one with silence, which is indistinguishable
@@ -284,7 +295,7 @@ def main() -> int:
         # Pay the first-query costs -- imports, page cache, TLS handshake -- before any
         # prompt is waiting on them. For hosted this is the handshake that turns a 609ms
         # first call into a 177ms one.
-        store.recall("warm", k=1)
+        store.recall("warm", k=1, **plain_read)
     except Exception:
         pass
     return Daemon(socket_path(store_key()), store).run()
