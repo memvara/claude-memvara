@@ -4,10 +4,28 @@
   "version": "0.2.12",
   "commands": [
     "./commands/authenticate.md",
+    "./commands/index.md",
     "./commands/login.md",
     "./commands/logout.md",
+    "./commands/setup.md",
     "./commands/stats.md"
   ],
+  "agents": [
+    "./agents/memory-researcher.md"
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/setup.py\" install-status-line --hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
   "author": {
     "name": "Memvara",
     "url": "https://memvara.dev"

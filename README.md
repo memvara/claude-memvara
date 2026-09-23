@@ -15,7 +15,13 @@ The hooks below do run locally, and one of them starts a short-lived
 background process to keep recall fast. Nothing is installed to do it:
 they use the standard library, and the process exits after 30 minutes
 idle. Delete the `hooks/` directory and the plugin is still a working
-MCP server plus the skill.
+MCP server plus the skill, without the project header, the status line
+and `/memvara:setup`, which all use the hooks' modules.
+
+The plugin also adds a status line to `~/.claude/settings.json` when you
+have none, and sends your repository's git project to the server with
+every MCP call. Both are described, with every file they write, in
+[The repository, the switches and the status line](#the-repository-the-switches-and-the-status-line).
 
 ## What you get
 
@@ -47,6 +53,17 @@ so the same bodies can be vendored for another editor by adding one
 record beside it. A run that cannot dispatch at all — an unknown host, a
 hook that client has no event for — exits 0 like every other failure here
 and writes the reason to `~/.memvara/.hooks/hooks.log`.
+
+The hooks count what they do for the status line, in
+`~/.memvara/.hooks/counts/<session>.json`, and every memory line they put
+into a prompt starts with `⋈ `, so you can tell recalled memory from
+everything else. Capture drops any line with that mark, so recalled memory
+is never stored a second time.
+
+One more `SessionStart` hook is registered by the plugin manifest rather
+than by `hooks/hooks.json`, because `hooks/hooks.json` is generated from
+the vendored tree. It runs `setup.py install-status-line --hook`, which is
+described below.
 
 Those bodies are vendored, not written here: `plugin/hooks/` is a copy of the
 same directory in [memvara/memvara](https://github.com/memvara/memvara), pinned
@@ -495,6 +512,137 @@ credential minted against the wrong project is not an error anyone ever sees.
 
 `stats` overlaps the `memory_stats` tool, and earns its place by answering when the MCP
 server is not authenticated. When it is connected, ask the tool.
+
+## The repository, the switches and the status line
+
+Two more commands, and three small scripts beside the vendored hooks:
+`project_scope.py`, `statusline.py` and `setup.py`. All three use only the
+standard library and the hooks' own modules.
+
+| Command | What it does |
+|---|---|
+| `/memvara:index` | Explores the current repository and records 10 to 30 facts about it |
+| `/memvara:setup` | Lists every feature switch; `/memvara:setup <feature> on\|off` sets one |
+
+### `/memvara:index`
+
+The command reads the repository — the README, the manifests, CI and Docker
+files, the entry points and the recent git log — and records what a new
+contributor would need to know: what the project is for, its key
+dependencies, how to build, test and run it, its conventions, entry points
+and deploy targets.
+
+Every fact has the same subject, `project:<host>/<owner>/<repo>`, for
+example `project:github.com/memvara/memvara`. `project_scope.py subject`
+works it out from the `origin` remote, so every clone and worktree of one
+repository gets the same subject. A repository with no remote gets
+`project:path:` and 16 hex characters of a hash of its path.
+
+Before it writes, the command calls `memory_search` for facts already
+stored under that subject. A fact that is already there is not written
+again. A fact whose value changed is written with `memory_remember` and
+`replaces` set to the old fact's claim id, which ends the old fact and
+records which fact replaced it. Every write is `semantic` and names
+`memvara-index` as its extractor, so memvara records that the command
+derived the fact rather than that you stated it.
+
+The command pre-approves `memory_remember` so that 20 facts do not mean 20
+permission prompts. That approval lasts only while the command runs, and it
+does not cover ending or retiring anything.
+
+The predicates are `depends_on`, `version`, `deploys_to`, `endpoint`,
+`owner` and `known_defect` from the engineering predicate pack, plus
+`purpose`, `entry_point`, `runs_with` and `convention`. The engineering
+pack does not declare those last four yet, so memvara stores them as
+unregistered predicates: every value is kept beside the others, and nothing
+replaces one automatically. That is why a changed value is replaced by id.
+
+### The project each MCP call is scoped to
+
+The hooks and the MCP server send the repository's git project with every
+call, as the `Memvara-Project` header, so memories are kept per
+repository. `.mcp.json` does this with Claude Code's `headersHelper`: when
+Claude Code connects to the memvara server it runs
+
+```
+python3 "${CLAUDE_PLUGIN_ROOT}/project_scope.py" headers "${CLAUDE_PROJECT_DIR}"
+```
+
+and adds the header that prints to every request. It adds only that
+header. Your sign-in stays Claude Code's own OAuth grant, so nobody has to
+sign in again, and an `Authorization` header you set yourself is not
+touched.
+
+The helper prints no header outside a git repository, when the
+`project_scope` switch is off, and on any failure, and then every call goes
+out unscoped, exactly as before. Claude Code runs it once per connection,
+so a change of switch or remote reaches MCP calls in the next session. An
+older Claude Code that does not know `headersHelper` ignores it and sends no
+header. This was checked on Claude Code 2.1.280, where the debug log shows
+the header added and the OAuth provider still in place.
+
+The header can only narrow a call to one project inside the account your
+credential belongs to. A server that does not read the header yet ignores
+it.
+
+### The status line
+
+```
+⋈ memvara · 12 recalled · 3 searched · 5 captured
+```
+
+`recalled` is how many memory lines the hooks put into prompts this
+session, `searched` how many read-only memory tools the model called, and
+`captured` how many facts were stored from finished turns. With the
+`status_line` switch off, counting stops and the line reads
+`⋈ memvara · off`.
+
+The plugin's `SessionStart` hook adds the status line to
+`~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) only when
+no status line is set there. It never replaces or changes another tool's
+status line. After a plugin update it points its own line at the new plugin
+directory. It writes through a temporary file and a rename, and it leaves a
+settings file that is not valid JSON untouched. The line runs
+`python3 -S statusline.py`, which prints nothing at all on any error.
+
+`/memvara:setup remove-status-line` takes memvara's line out and switches
+`status_line` off, so the next session does not add it back.
+`/memvara:setup status_line on` adds it again if the slot is free.
+
+### The research agent
+
+`memory-researcher` is a subagent the main agent can hand a question that
+needs history. It runs three to six searches and returns a brief of at most
+300 words that cites a claim id for every fact. Its tool list holds only
+read tools: the same set the `PreToolUse` hook approves without asking,
+including the profile tool the hosted server does not serve yet. It cannot
+write, end, retire or link anything.
+
+### The switches
+
+`/memvara:setup` lists nine switches, all on by default: `index_command`,
+`research_agent`, `project_scope`, `status_line`, `recall_mark`, `profile`,
+`forget_matching`, `end_reason` and `links`. The list is the one the hooks
+read, so a name the hooks do not know is refused. The values are stored in
+`~/.memvara/settings.json`, and an environment variable
+`MEMVARA_FEATURE_<NAME>=0` or `=1` overrides the file.
+
+Two switches also change Claude Code's settings file. `research_agent off`
+adds the rule `Agent(memvara:memory-researcher)` to `permissions.deny`,
+which is how Claude Code disables one subagent, and `research_agent on`
+removes that rule and nothing else. `status_line` is described above.
+
+`profile`, `forget_matching`, `end_reason` and `links` are features of the
+server. Their switches are saved, but no server reads this file yet: the
+hosted server's switches are set by its deployment, and a local
+`memvara-mcp` server reads `MEMVARA_FEATURE_<NAME>=0`. The command says so
+when you set one.
+
+Files these write: `~/.memvara/settings.json`; in
+`~/.claude/settings.json`, the `statusLine` key and the one deny rule
+above; `~/.memvara/.hooks/counts/`, one small file per session, removed
+after 14 days; and `~/.memvara/.hooks/projects/`, where the project for
+each directory is cached for an hour.
 
 ## Teach it your vocabulary
 
