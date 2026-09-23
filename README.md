@@ -677,11 +677,15 @@ never costs you your memories. memvara keeps no price list, so the command
 names the model and says where its price per token is published instead of
 guessing a price.
 
-`verify-key --yes` stores the result of the test call in
-`~/.memvara/settings.json` under `read_model`, whatever it was, and says what
-to fix when the model did not answer. If you switch `query_rewrite` off and
-back on over a key that was already checked, the command shows the cost
-again and waits for `/memvara:setup query_rewrite on --yes`.
+`verify-key --yes` saves the result of the test call in
+`~/.memvara/.hooks/read_model.json`, whatever it was, and says what to fix
+when the model did not answer. That is a state file of the hooks', not a
+switch, so it is kept out of `~/.memvara/settings.json`. If the provider
+rejects the key on a later prompt, that prompt still gets its memories, and
+the hook marks the check failed and stops rewriting until you run
+`verify-key --yes` again. If you switch `query_rewrite` off and back on over
+a key that was already checked, the command shows the cost again and waits
+for `/memvara:setup query_rewrite on --yes`.
 
 A hosted install never rewrites from the recall hook. The hosted service
 would use your organisation's own key, which this machine cannot check, so
@@ -703,7 +707,8 @@ from its own environment.
 
 Files these write: `~/.memvara/settings.json`; in
 `~/.claude/settings.json`, the `statusLine` key and the one deny rule
-above; `~/.memvara/.hooks/statusline.json` and `~/.memvara/.hooks/setup.log`,
+above; `~/.memvara/.hooks/statusline.json`, `~/.memvara/.hooks/setup.log` and
+`~/.memvara/.hooks/read_model.json` with its lock file `read_model.json.lock`,
 described above; `~/.memvara/.hooks/counts/`, one small file per session,
 removed after 14 days; and `~/.memvara/.hooks/projects/`, where the project
 for each directory is cached for an hour.

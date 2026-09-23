@@ -9067,6 +9067,13 @@ def build_memvara(config):
                       "MEMVARA_DB": str(pathlib.Path(self.home) / "store.db"),
                       "MEMVARA_LLM": "anthropic", "MEMVARA_LLM_MODEL": ""}
 
+    @property
+    def state(self) -> pathlib.Path:
+        return pathlib.Path(self.home) / ".memvara" / ".hooks" / "read_model.json"
+
+    def record(self) -> dict:
+        return json.loads(self.state.read_text("utf-8"))
+
     def made_calls(self) -> "list[str]":
         return self.calls.read_text("utf-8").splitlines() if self.calls.exists() else []
 
@@ -9109,7 +9116,7 @@ def build_memvara(config):
         self.assertEqual(done.returncode, 0, done.stdout)
         self.assertEqual(len(self.made_calls()), 1, "exactly one test call")
         self.assertTrue(self.made_calls()[0].endswith("|1|True"))
-        record = json.loads(self.memvara_settings.read_text("utf-8"))["read_model"]
+        record = self.record()
         self.assertEqual((record["outcome"], record["backend"], record["model"]),
                          ("applied", "anthropic", "stand-in-model"))
         self.assertIn(b"rewrites each prompt's query", done.stdout)
@@ -9124,7 +9131,7 @@ def build_memvara(config):
                           FAKE_STATUS="401")
         self.assertEqual(done.returncode, 1)
         self.assertIn(b"refused the key (HTTP 401)", done.stdout)
-        record = json.loads(self.memvara_settings.read_text("utf-8"))["read_model"]
+        record = self.record()
         self.assertEqual((record["outcome"], record["status"]), ("key_rejected", 401))
         self.assertEqual(self.allowed(), b"False")
 
@@ -9135,14 +9142,33 @@ def build_memvara(config):
         self.assertIn(b"organisation's own key", done.stdout)
         self.assertEqual(self.made_calls(), [])
 
-    def test_an_unreadable_settings_file_stops_the_check_before_the_call(self) -> None:
+    def test_the_check_is_kept_in_its_own_state_file(self) -> None:
+        """Not in settings.json, which is a flat map of switches written without a lock."""
+        self.setup("verify-key", "--yes", **self.local)
+        self.assertEqual(self.record()["outcome"], "applied")
+        self.assertFalse(self.memvara_settings.exists())
+
+    def test_a_check_in_the_old_place_is_moved_and_removed(self) -> None:
+        """An earlier build of this change wrote it under read_model in settings.json."""
         self.memvara_settings.parent.mkdir(parents=True)
-        self.memvara_settings.write_text("{broken", encoding="utf-8")
+        self.memvara_settings.write_text(json.dumps({
+            "recall_mark": False,
+            "read_model": {"outcome": "applied", "backend": "anthropic",
+                           "model_setting": "", "checked_at": "2026-09-23T10:00:00Z"}}),
+            encoding="utf-8")
+        self.assertEqual(self.allowed(), b"True", "the old record is still honoured")
+        self.setup("verify-key", "--yes", **self.local)
+        self.assertEqual(json.loads(self.memvara_settings.read_text("utf-8")),
+                         {"recall_mark": False})
+
+    def test_a_result_that_cannot_be_saved_is_reported(self) -> None:
+        hooks = pathlib.Path(self.home) / ".memvara" / ".hooks"
+        hooks.parent.mkdir(parents=True)
+        hooks.write_text("not a directory", encoding="utf-8")
         done = self.setup("verify-key", "--yes", **self.local)
         self.assertEqual(done.returncode, 1)
-        self.assertIn(b"no test call was made", done.stdout)
-        self.assertEqual(self.made_calls(), [])
-        self.assertEqual(self.memvara_settings.read_text("utf-8"), "{broken")
+        self.assertIn(b"could not be saved", done.stdout)
+        self.assertEqual(self.allowed(), b"False")
 
     def test_the_listing_says_the_hook_does_not_rewrite_until_a_key_is_checked(self) -> None:
         said = self.setup(**self.local).stdout.decode("utf-8")
@@ -9173,6 +9199,14 @@ def build_memvara(config):
                       True)
         self.assertIn(b"no model key has been checked", done.stdout)
 
+    def test_setup_keeps_no_rule_of_its_own_for_a_checked_key(self) -> None:
+        """Whether a key is checked for this model is `read_model`'s rule; setup asks it."""
+        source = SETUP_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("verified_for_current_config()", source)
+        self.assertNotIn("configured()", source.split("def rewrite_would_start")[1]
+                         .split("\ndef ")[0])
+        self.assertNotIn("_LOADED", source, "use settings.reload(), not a private cache")
+
     def test_the_command_tells_the_agent_to_leave_the_yes_to_the_user(self) -> None:
         body = (PLUGIN / "commands" / "setup.md").read_text(encoding="utf-8")
         self.assertIn("verify-key", body)
@@ -9182,6 +9216,44 @@ def build_memvara(config):
     def test_the_command_runs_the_setup_script_with_its_arguments(self) -> None:
         body = (PLUGIN / "commands" / "setup.md").read_text(encoding="utf-8")
         self.assertIn('python3 "${CLAUDE_PLUGIN_ROOT}/setup.py" $ARGUMENTS', body)
+
+
+class Loader(unittest.TestCase):
+    """`memvara_hooks.hooks_lib` loads `core` and `hosts` only for modules that need them.
+
+    The status line and the project header need `lib` alone. Requiring the other two for
+    every caller would break both on a vendored tree missing either package.
+    """
+
+    def tree_without(self, package: str) -> pathlib.Path:
+        root = pathlib.Path(tempfile.mkdtemp(prefix="memvara-loader-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        shutil.copy(PLUGIN / "memvara_hooks.py", root / "memvara_hooks.py")
+        shutil.copytree(HOOKS, root / "hooks",
+                        ignore=shutil.ignore_patterns("__pycache__", package))
+        return root
+
+    def load(self, root: pathlib.Path, names: "tuple[str, ...]", **kwargs: bool) -> bytes:
+        probe = ("import sys; sys.path.insert(0, sys.argv[1]); import memvara_hooks; "
+                 f"print([m.__name__ for m in memvara_hooks.hooks_lib(*{names!r}, **{kwargs!r})])")
+        home = tempfile.mkdtemp(prefix="memvara-loader-home-")
+        self.addCleanup(shutil.rmtree, home, True)
+        done = subprocess.run([sys.executable, "-c", probe, str(root)], capture_output=True,
+                              env=_clean_env(home), timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr.decode("utf-8"))
+        return done.stdout.strip()
+
+    def test_the_status_line_and_project_modules_need_neither_package(self) -> None:
+        for package in ("core", "hosts"):
+            with self.subTest(missing=package):
+                root = self.tree_without(package)
+                self.assertEqual(self.load(root, ("project",)), b"['lib.project']")
+                self.assertEqual(self.load(root, ("counts", "settings")),
+                                 b"['lib.counts', 'lib.settings']")
+
+    def test_the_key_check_loads_both(self) -> None:
+        root = self.tree_without("nothing-is-missing")
+        self.assertEqual(self.load(root, ("read_model",), host=True), b"['lib.read_model']")
 
 
 class ProjectHeader(_Home):

@@ -26,7 +26,9 @@ rewrite each prompt's query only after `verify-key --yes` has made one test call
 the library and the model answered it (`hooks/lib/read_model.py`). `verify-key` without
 `--yes` prints what a rewrite adds to each prompt, in time and in model calls, and changes
 nothing, so the user sees the cost before anything is switched on. The result of the test
-call is stored in the same settings file under `read_model`.
+call is saved in the hooks' own state file, `~/.memvara/.hooks/read_model.json`, not in
+the switch file, and a record an earlier build left in the switch file is removed once a
+new one is saved.
 
 Two features also change Claude Code's own settings file, `~/.claude/settings.json`
 (or `$CLAUDE_CONFIG_DIR/settings.json`), because that is where Claude Code reads them:
@@ -183,7 +185,9 @@ def _settings_module():
 def _read_model_module():
     from memvara_hooks import hooks_lib
 
-    return hooks_lib("read_model")[0]
+    # `host=True`: `lib.read_model` reads the client's configuration through `lib.ipc`,
+    # which needs the hooks' `core` and `hosts` packages.
+    return hooks_lib("read_model", host=True)[0]
 
 
 def features() -> "tuple[str, ...]":
@@ -471,7 +475,7 @@ def rewrite_state() -> str:
     read_model = _read_model_module()
     if not _settings_module().enabled("query_rewrite"):
         return "The recall hook does not rewrite queries, because query_rewrite is off."
-    record = _settings_module().stored(read_model.KEY)
+    record = read_model.recorded()
     if not isinstance(record, dict):
         return ("The recall hook does not rewrite queries yet: no model key has been "
                 "checked. Run /memvara:setup verify-key to see what it costs.")
@@ -480,7 +484,7 @@ def rewrite_state() -> str:
         return (f"The recall hook does not rewrite queries: the check on {when} found "
                 f"{record.get('outcome') or 'nothing'}. Run /memvara:setup verify-key to "
                 "check again.")
-    if not read_model.allowed():
+    if not read_model.verified_for_current_config():
         return (f"The recall hook does not rewrite queries: the model configured now is "
                 f"not the one checked on {when}. Run /memvara:setup verify-key to check "
                 "it.")
@@ -521,10 +525,10 @@ def verify_key(confirmed: bool) -> "tuple[int, str]":
     """Show the cost of query rewrite, or, when `confirmed`, check the key and record it.
 
     Unconfirmed, nothing is called and nothing is written: exit 0. Confirmed, one test
-    rewrite goes through the library (`read_model.check()`) and its result is stored under
-    `read_model` in the settings file, whatever it was. Exit 0 means the model answered and
-    the recall hook will rewrite; exit 1 means it will not, or the settings file could not
-    be read, in which case no call was made and nothing was written.
+    rewrite goes through the library (`read_model.check()`) and its result is saved in the
+    hooks' state file `~/.memvara/.hooks/read_model.json` (`read_model.save()`), whatever
+    it was. Exit 0 means the model answered and the recall hook will rewrite; exit 1 means
+    it will not, or the result could not be saved.
     """
     if not confirmed:
         cost = rewrite_cost()
@@ -534,23 +538,35 @@ def verify_key(confirmed: bool) -> "tuple[int, str]":
                    "now, and let the recall hook rewrite each prompt's query if it "
                    "answers, run: /memvara:setup verify-key --yes")
     read_model = _read_model_module()
-    path = memvara_settings_path()
-    data, unreadable = load(path)
-    if data is None:
-        return 1, (f"Nothing changed and no test call was made: {unreadable}. Fix or "
-                   "delete it, then try again.")
     record = read_model.check()
-    data[read_model.KEY] = record
-    write(path, data)
+    where = _home_relative(read_model.STATE)
+    if not read_model.save(record):
+        return 1, (f"The test call ran, but its result could not be saved to {where}, so "
+                   "the recall hook will not rewrite. Check that the directory can be "
+                   "written, then run /memvara:setup verify-key --yes again.")
+    _forget_old_record(read_model.KEY)
     outcome = str(record.get("outcome") or "")
     status = f" (HTTP {record['status']})" if record.get("status") else ""
     said = [_VERIFIED.get(outcome, "The check returned {outcome}.").format(
         status=status, reason=record.get("reason") or "no reason given", outcome=outcome)]
-    said.append(f"The result is saved in {_home_relative(path)}.")
-    # The settings module caches the file per process; this process just rewrote it.
-    _settings_module()._LOADED = None
+    said.append(f"The result is saved in {where}.")
     said.append(rewrite_state())
     return (0 if outcome == "applied" else 1), " ".join(said)
+
+
+def _forget_old_record(key: str) -> None:
+    """Take an earlier build's check record out of the switch file, once one is saved.
+
+    It lived under `key` in `~/.memvara/settings.json`. The hooks read it from there only
+    while the state file is missing, so once a check is saved it is dead weight in a file
+    of switches. A settings file that cannot be read is left exactly as it is.
+    """
+    path = memvara_settings_path()
+    data, _ = load(path)
+    if data and key in data:
+        del data[key]
+        write(path, data)
+        _settings_module().reload()
 
 
 # -- the switches -------------------------------------------------------------------------
@@ -685,7 +701,8 @@ def set_feature(name: str, value: bool) -> "tuple[int, str]":
     if name in SERVER_SIDE:
         said.append("This switch is " + SERVER_NOTE.format(upper=name.upper()) + ".")
     if name == "query_rewrite":
-        _settings_module()._LOADED = None
+        # This process read the file before writing it; report what the hooks will read.
+        _settings_module().reload()
         said.append(REWRITE_NOTE + ".")
         said.append(rewrite_state())
     return 0, " ".join(said)
@@ -695,15 +712,11 @@ def rewrite_would_start() -> bool:
     """Whether turning `query_rewrite` on would make the recall hook start rewriting now.
 
     True when the switch is off and a key check for the configured model is on record, so
-    the only thing between the user and one model call per prompt is this switch.
+    the only thing between the user and one model call per prompt is this switch. Whether
+    the key is checked for this model is `read_model`'s rule, asked here rather than copied.
     """
-    settings = _settings_module()
-    if settings.enabled("query_rewrite"):
-        return False
-    record = settings.stored(_read_model_module().KEY)
-    return (isinstance(record, dict) and record.get("outcome") == "applied"
-            and (record.get("backend"), record.get("model_setting"))
-            == _read_model_module().configured())
+    return (not _settings_module().enabled("query_rewrite")
+            and _read_model_module().verified_for_current_config())
 
 
 def main(argv: "list[str]") -> int:
