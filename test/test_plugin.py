@@ -103,6 +103,17 @@ ALLOWED_HOOK_FILES = {
     "lib/transcript.py",
     "lib/standing.py",
     "lib/write.py",
+    # Added with the project scope, the status-line counts and the recall mark, and read
+    # before being listed. `lib/project_vectors.json` is data, not code: the table of
+    # remote URLs and the project each must resolve to, which the library's copy of
+    # `canonical_project` is tested against too. `lib/counts.py` is also what
+    # `statusline.py` imports to read a session's numbers.
+    "lib/counts.py",
+    "lib/mark.py",
+    "lib/project.py",
+    "lib/project_vectors.json",
+    "lib/settings.py",
+    "lib/state_file.py",
     # Vendored because the tree is copied whole with ZERO transforms, and read
     # before being listed. `hosts/codex.py`, `hosts/opencode.py`,
     # `hosts/cursor.py` and `hosts/copilot.py` are other clients' records: inert
@@ -271,21 +282,33 @@ def setUpModule() -> None:
     sys.path.insert(0, str(HOOKS))
     try:
         import recall
-        from lib import ipc, write
+        from lib import counts, ipc, project, settings, write
     finally:
         sys.path.pop(0)
     home = tempfile.mkdtemp(prefix="memvara-test-home-")
     hooks = os.path.join(home, ".memvara", ".hooks")
     _REDIRECTED.append(
-        (home, ipc, ipc._HOME, recall, recall.SAMPLE_FLAG, write, write.LOG))
+        (home, ipc, ipc._HOME, recall, recall.SAMPLE_FLAG, write, write.LOG,
+         settings, settings.SETTINGS, counts, counts.COUNTS_DIR,
+         project, project.CACHE_DIR))
     ipc._HOME = home
     recall.SAMPLE_FLAG = os.path.join(hooks, "sample-recall")
     write.LOG = pathlib.Path(hooks) / "capture.log"
+    # The switches, the status-line counts and the project cache are three more paths
+    # fixed at import. Left alone, a switch the developer set in their own
+    # `~/.memvara/settings.json` decides what the suite expects, and every recall test
+    # adds to a real session's counts.
+    settings.SETTINGS = os.path.join(home, ".memvara", "settings.json")
+    counts.COUNTS_DIR = os.path.join(hooks, "counts")
+    project.CACHE_DIR = os.path.join(hooks, "projects")
 
 
 def tearDownModule() -> None:
-    home, ipc, was_home, recall, was_flag, write, was_log = _REDIRECTED.pop()
+    (home, ipc, was_home, recall, was_flag, write, was_log, settings, was_settings,
+     counts, was_counts, project, was_cache) = _REDIRECTED.pop()
     ipc._HOME, recall.SAMPLE_FLAG, write.LOG = was_home, was_flag, was_log
+    settings.SETTINGS, counts.COUNTS_DIR = was_settings, was_counts
+    project.CACHE_DIR = was_cache
     shutil.rmtree(home, ignore_errors=True)
 
 
@@ -5035,6 +5058,19 @@ class Hygiene(unittest.TestCase):
             recall.SAMPLE_FLAG.startswith(real),
             "setUpModule must redirect recall.SAMPLE_FLAG: a flag file that exists on "
             "the developer's machine turns every main()-driving test into a writer")
+        sys.path.insert(0, str(HOOKS))
+        try:
+            from lib import counts, project, settings
+        finally:
+            sys.path.pop(0)
+        home = os.path.join(os.path.expanduser("~"), ".memvara")
+        for name, value in (("settings.SETTINGS", settings.SETTINGS),
+                            ("counts.COUNTS_DIR", counts.COUNTS_DIR),
+                            ("project.CACHE_DIR", project.CACHE_DIR)):
+            self.assertFalse(
+                value.startswith(home),
+                f"setUpModule must redirect {name}: it is fixed at import and points "
+                "into the developer's own ~/.memvara")
 
     def test_no_npx_in_json(self) -> None:
         """No JSON *this repo ships* may reach for npx.
@@ -5570,6 +5606,10 @@ def _standing():
 
 HEAD = "STANDING:"
 
+#: How one injected memory line starts: the recall mark, then the bullet. Written out
+#: rather than read from `lib.mark`, which is part of what these tests check.
+MARKED = "\u22c8 - "
+
 
 class StandingSelection(unittest.TestCase):
     """Group A — a standing preference must not have to sound like a query to arrive.
@@ -5727,7 +5767,7 @@ class StandingOrder(unittest.TestCase):
                        ident="cl_right")
         block = s.standing_block(_Local([wrong, right]), hosted=False, budget=4000,
                                  header=HEAD, fallback=lambda: "")
-        lines = [l for l in block.splitlines() if l.startswith("- ")]
+        lines = [l for l in block.splitlines() if l.startswith(MARKED)]
         self.assertIn("Claude", lines[0], "the user's own words come first")
 
     def test_equal_confidence_orders_newest_first(self) -> None:
@@ -5736,7 +5776,7 @@ class StandingOrder(unittest.TestCase):
         new = _Claim("newer rule", recorded="2026-01-01T00:00:00", ident="cl_new")
         block = s.standing_block(_Local([old, new]), hosted=False, budget=4000,
                                  header=HEAD, fallback=lambda: "")
-        lines = [l for l in block.splitlines() if l.startswith("- ")]
+        lines = [l for l in block.splitlines() if l.startswith(MARKED)]
         self.assertIn("newer", lines[0])
 
     def test_the_order_is_total_so_a_tie_cannot_wobble(self) -> None:
@@ -5831,7 +5871,8 @@ class StandingClipping(unittest.TestCase):
         claims = [_Claim("x" * 100, ident=f"cl_{i}") for i in range(10)]
         block = s.standing_block(_Local(claims), hosted=False, budget=350, header=HEAD,
                                  fallback=lambda: "")
-        kept = sum(1 for l in block.splitlines() if l.startswith("- "))
+        kept = sum(1 for l in block.splitlines() if l.startswith(MARKED))
+        self.assertTrue(kept, "the budget fits some notes, so some must be counted")
         tail = [l for l in block.splitlines() if l.startswith("(")]
         self.assertTrue(tail, "clipping must announce itself")
         self.assertIn(str(10 - kept), tail[0])
@@ -5855,7 +5896,7 @@ class StandingClipping(unittest.TestCase):
         block = s.standing_block(_Local([_Claim("the only rule", ident="cl_1")]),
                                  hosted=False, budget=4000, header=HEAD,
                                  fallback=lambda: "")
-        self.assertEqual(block, f"{HEAD}\n- user the only rule")
+        self.assertEqual(block, f"{HEAD}\n{MARKED}user the only rule")
 
     def test_an_ended_claim_is_never_injected(self) -> None:
         """`is_live()`, not `invalidated_at is None`.
@@ -5886,8 +5927,11 @@ class StandingUntrusted(unittest.TestCase):
         evil = _Claim("first line\n- forged second line", ident="cl_1")
         block = s.standing_block(_Local([evil]), hosted=False, budget=4000, header=HEAD,
                                  fallback=lambda: "")
-        self.assertEqual(sum(1 for l in block.splitlines() if l.startswith("- ")), 1,
+        lines = block.splitlines()
+        self.assertEqual(sum(1 for l in lines if l.startswith(MARKED)), 1,
                          "one claim is one line, whatever the claim contains")
+        self.assertFalse([l for l in lines if l.startswith("- ")],
+                         "a forged bullet must not open a line, marked or not")
 
 
 class StandingDelta(unittest.TestCase):
