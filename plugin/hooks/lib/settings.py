@@ -3,7 +3,7 @@
 Every feature a user can turn off during `/memvara:setup` is read here. The switches live in
 `~/.memvara/settings.json`, a flat JSON object of `feature_name: true|false`. A missing key
 means the feature's default, which is `FEATURE_DEFAULTS` below: on for every feature except
-`extraction_chunks`.
+`extraction_chunks` and `agentic_extraction`.
 
 The file holds one entry that is not a switch. `/memvara:setup verify-key` records its test
 call to the read-path model under the key `read_model`, and `lib.read_model` reads it back
@@ -34,8 +34,8 @@ SETTINGS = os.path.join(os.path.expanduser("~"), ".memvara", "settings.json")
 #: refuses a `MEMVARA_FEATURE_<NAME>` that is not in it. The hooks cannot import the library,
 #: so this is a copy, and `tests/test_hook_project.py` fails when the two differ in a name,
 #: in the order or in a default. The hooks read `project_scope`, `status_line`,
-#: `recall_mark` and `query_rewrite`. The other names are listed so that `/memvara:setup`
-#: can show every switch with its true default.
+#: `recall_mark`, `query_rewrite` and `agentic_capture`. The other names are listed so that
+#: `/memvara:setup` can show every switch with its true default.
 FEATURE_DEFAULTS = {
     "index_command": True,
     "research_agent": True,
@@ -55,6 +55,10 @@ FEATURE_DEFAULTS = {
     "synthesis": True,
     "metadata_filters": True,
     "encryption": True,
+    "extraction_guidance": True,
+    "expiry_erasure": True,
+    "agentic_capture": True,
+    "agentic_extraction": False,
 }
 
 #: Every feature name, in the order `FEATURE_DEFAULTS` lists them.

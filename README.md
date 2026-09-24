@@ -9,7 +9,8 @@ says how to use it, in one install.
 ```
 
 The first connection opens a browser so you can click Allow. That grant
-lasts 90 days, and no API key is involved.
+lasts until you revoke it, or ten years, whichever comes first, and no API
+key is involved.
 
 The hooks below do run locally, and one of them starts a short-lived
 background process to keep recall fast. Nothing is installed to do it:
@@ -25,11 +26,13 @@ every MCP call. Both are described, with every file they write, in
 
 ## What you get
 
-Fourteen tools on `https://app.memvara.dev/mcp`: `memory_recall`,
+Twenty-two tools on `https://app.memvara.dev/mcp`: `memory_recall`,
 `memory_search`, `memory_neighborhood`, `memory_paths`, `memory_ask`,
-`memory_since`, `memory_standing`, `memory_add`, `memory_remember`,
-`memory_forget`, `memory_end`, `memory_history`, `memory_why`,
-`memory_stats`.
+`memory_since`, `memory_standing`, `memory_profile`, `memory_add`,
+`memory_remember`, `memory_forget`, `memory_end`, `memory_end_matching`,
+`memory_forget_matching`, `memory_link`, `memory_history`, `memory_why`,
+`memory_stats`, `memory_add_document`, `memory_get_document`,
+`memory_list_documents`, `memory_delete_document`.
 
 The `memory` skill is the judgment a single tool description cannot
 carry: which surface to use, the sequence when a stored fact is
@@ -141,7 +144,12 @@ nothing; `⋈ Memvara · recall failed` means it could not be asked at all;
 `⋈ Memvara · retrieval quota spent — resets 1 Sep` means it answered and
 refused, which is a different thing and wants a different response — the
 date is there because "spent" alone reads as "retry later", and retrying
-is the one thing that cannot work. Collapsing those into one message is how a hosted client
+is the one thing that cannot work. On a paid plan the hosted service also
+limits recalls per day, and when that allowance is used up the banner says
+`⋈ Memvara · today's recall allowance is used up — resets in 3 h 30 min`, or
+`resets at 00:00 UTC` when the service did not say how long to wait. A plain
+rate limit, a server error and a timeout still read as `recall failed`.
+Collapsing those into one message is how a hosted client
 whose session id had gone stale went on reporting an empty store for a
 whole session — from the terminal that is indistinguishable from a store
 that is genuinely empty, and nobody investigates an empty store. Three
@@ -307,6 +315,53 @@ On a hosted install there is no local store to open, so capture writes
 over the same MCP endpoint recall reads; a write the endpoint refuses is
 logged as failed rather than counted as stored.
 
+**Before it mines a turn, capture looks at what you already have.** This is
+agentic capture, the `agentic_capture` switch, and it is on by default.
+When a turn ends, the capture hook runs `claude -p` with read-only access
+to your memory. The model can search up to four times, then returns a list
+of proposals: a new fact, a new value for a stored fact with a reason, an
+end for a stored fact with a reason, or an `extends` or `derives` link
+between two facts. The model cannot write anything itself. The hook checks
+each proposal with the same rules as a fact from the single call, refuses
+one that names a stored fact the model did not read during the run, and
+refuses one whose text repeats the extractor's own rules or comes only from
+earlier turns. It applies the rest with `remember` (with `replaces` for a
+new value), `memory_end` and `memory_link`. The model also sees up to
+4,000 characters of the earlier turns, so that a reply such as "yes, do
+that" can be read against its question, but only the new turn is mined.
+
+The run has no built-in tools and connects to no MCP server except
+memvara: the hosted server with the hooks' own login, or the local server
+block from your client settings. It is stopped at its fifth tool call or
+after 60 seconds. If it cannot reach your memory, fails or runs out of
+time, the turn gets the single-call extraction described above, and
+`capture.log` says why. A turn can therefore take the agentic run and then
+the single call, so the capture hook's timeout on this client is 180
+seconds. The hook runs async, so the longer limit does not hold the turn
+open.
+
+Measured on nine test turns, each replayed twice, the agentic run made 12
+of 14 expected changes against 7 of 14 for the single call, ended 6 of 6
+stored values that the turns changed against 2 of 6, and wrote 4 unwanted
+facts against 6. A turn used a mean of 19,436 input and 1,163 output
+tokens and took 17.3 seconds, against 45,258, 1,272 and 19.6 seconds for
+the single call on the same machine. The single call's input is that high
+because it loads your instruction files and plugins; with small ones it is
+about 21,000 tokens, which is about what an agentic turn costs.
+
+On the hosted service each search the run makes is a recall, but every run
+sends a `Memvara-Capture-Run` header with a new random id, and
+`app.memvara.dev` counts all the searches of one run as one recall. A server
+that does not read the header counts each search, up to four per turn. The
+id is never written to `capture.log`. `/memvara:setup agentic_capture off` makes every turn use
+the single call.
+
+The hooks send each hosted recall once. The hosted service counts every
+recall it answers against your plan, including one it refuses, so the
+hooks check each optional argument against the tool's schema before
+sending it, and never send a refused recall again because of a spent
+allowance, a rate limit, a server error or a timeout.
+
 **Facts are written from a closed vocabulary.** The model picks from the
 core's registered predicates and returns nothing when none fit, rather
 than inventing one per fact. This is not tidiness. `remember()`
@@ -456,7 +511,8 @@ block.
 
 ## Four commands for the credential itself
 
-The grant at the top of this page is the host's, and it lasts 90 days. These four
+The grant at the top of this page is the host's, and it lasts until you revoke it or
+for ten years. These four
 commands get a key of your own instead, one the deployment reports no expiry for,
 and say which credential this machine is actually using. They answer while the MCP
 server is unauthenticated, which is when the question is worth asking.
@@ -627,19 +683,20 @@ write, end, retire or link anything.
 
 ### The switches
 
-`/memvara:setup` lists eighteen switches. Seventeen are on by default:
+`/memvara:setup` lists twenty-two switches. Twenty are on by default:
 `index_command`, `research_agent`, `project_scope`, `status_line`,
 `recall_mark`, `profile`, `forget_matching`, `end_reason`, `links`,
 `documents`, `retrieval_chunks`, `ingest_urls`, `ingest_media`,
-`query_rewrite`, `synthesis`, `metadata_filters` and `encryption`.
-`extraction_chunks` is off by default,
-because it has not yet met its release bar. The list and the defaults are
+`query_rewrite`, `synthesis`, `metadata_filters`, `encryption`,
+`extraction_guidance`, `expiry_erasure` and `agentic_capture`.
+`extraction_chunks` and `agentic_extraction` are off by default, because
+neither has passed its release bar yet. The list and the defaults are
 the ones the hooks read, which are a copy of the library's, so a name the
 hooks do not know is refused. The values are stored in
 `~/.memvara/settings.json`, and an environment variable
 `MEMVARA_FEATURE_<NAME>=0` or `=1` overrides the file.
 
-For each of the nine newer switches the listing says, in one sentence each,
+For each of the thirteen newer switches the listing says, in one sentence each,
 what it does and what it costs:
 
 | Switch | What it does | What it costs |
@@ -653,6 +710,10 @@ what it does and what it costs:
 | `synthesis` | Puts a model's short summary above recalled notes when asked | One chat call per recall that asks for one |
 | `metadata_filters` | Lets a search keep only memories whose metadata matches, or that came from a document under a file path | No model call; the filter runs inside the store |
 | `encryption` | Encrypts a new local store on disk, vectors included | Under 1 ms more per write, and more memory from the first search |
+| `extraction_guidance` | Adds a project's extraction guidance, from the TOML file `MEMVARA_EXTRACT_GUIDANCE` names, to a local server's extraction prompt | No model call of its own; each extraction prompt grows by the guidance |
+| `expiry_erasure` | Hides a memory from every read once its `expires_at` passes, then erases it | No model call; a check when the store opens and once an hour while the server runs |
+| `agentic_capture` | Lets the capture hook search your memory before it proposes changes, as described above | Measured at a mean of 19,436 input and 1,163 output tokens and 17.3 seconds per turn, on your Claude Code login |
+| `agentic_extraction` | Has the server extract with a tool loop that searches what is stored before it proposes changes | Up to 12 model answers per write instead of one call, on your key |
 
 **Encryption and its key.** With `encryption` on, a new local store is
 encrypted, vectors included; an existing store stays as it is, and
@@ -708,12 +769,14 @@ removes that rule and nothing else. `status_line` is described above.
 
 `profile`, `forget_matching`, `end_reason`, `links`, `documents`,
 `retrieval_chunks`, `extraction_chunks`, `ingest_urls`, `ingest_media`,
-`synthesis`, `metadata_filters` and `encryption` are features of the server. Their switches are saved, but no
+`synthesis`, `metadata_filters`, `encryption`, `extraction_guidance`,
+`expiry_erasure` and `agentic_extraction` are features of the server. Their switches are saved, but no
 server reads this file yet: the hosted server's switches are set by its
 deployment, and a local `memvara-mcp` server reads
 `MEMVARA_FEATURE_<NAME>=0` or `=1`. The command says so when you set one.
 `query_rewrite` is read from this file by the recall hook, and by a server
-from its own environment.
+from its own environment. `agentic_capture` is read from this file by the
+capture hook.
 
 Files these write: `~/.memvara/settings.json`; in
 `~/.claude/settings.json`, the `statusLine` key and the one deny rule
