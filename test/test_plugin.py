@@ -120,6 +120,12 @@ ALLOWED_HOOK_FILES = {
     # to rewrite a query, and holds the one test call `/memvara:setup verify-key --yes`
     # makes. It imports the library only inside that check.
     "lib/read_model.py",
+    # Added with agentic capture, and read before being listed. `lib/agentic.py` runs
+    # `claude -p` with no built-in tools and only the memvara server's four read tools,
+    # stops it at the fifth tool call or after 60 seconds, checks every proposal the model
+    # returns, and applies the ones that pass through `lib/write.py`. The model writes
+    # nothing itself. It runs only when the first extractor is `claude`, which is this host.
+    "lib/agentic.py",
     # Vendored because the tree is copied whole with ZERO transforms, and read
     # before being listed. `hosts/codex.py`, `hosts/opencode.py`,
     # `hosts/cursor.py` and `hosts/copilot.py` are other clients' records: inert
@@ -4775,8 +4781,11 @@ class ReadmeAndLicense(unittest.TestCase):
 #: list and this list against nothing.
 HOSTED_TOOLS = (
     "memory_recall", "memory_search", "memory_neighborhood", "memory_paths",
-    "memory_ask", "memory_since", "memory_standing", "memory_add", "memory_remember",
-    "memory_forget", "memory_end", "memory_history", "memory_why", "memory_stats",
+    "memory_ask", "memory_since", "memory_standing", "memory_profile", "memory_add",
+    "memory_remember", "memory_forget", "memory_end", "memory_end_matching",
+    "memory_forget_matching", "memory_link", "memory_history", "memory_why",
+    "memory_stats", "memory_add_document", "memory_get_document",
+    "memory_list_documents", "memory_delete_document",
 )
 
 #: Spelled out because that is how the sentence is written, and indexed by the count so
@@ -4785,6 +4794,8 @@ HOSTED_TOOLS = (
 NUMBER_WORDS = (
     "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
     "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    "seventeen", "eighteen", "nineteen", "twenty", "twenty-one", "twenty-two",
+    "twenty-three", "twenty-four",
 )
 
 
@@ -5070,8 +5081,11 @@ class ToolCount(unittest.TestCase):
         # this does not match it -- there, widening the file set alone left the sabotage
         # passing: the file was scanned and the regex still missed it. Fixed here before
         # this repository grows a sentence of that shape.
+        # `(?<!-)` because a compound count such as "twenty-two tools" contains "two tools"
+        # after its hyphen, and `\b` matches there. A wrong compound is still caught: each
+        # compound is an alternative of its own, matched from its first letter.
         pattern = re.compile(
-            r"\b(" + "|".join(w for w in NUMBER_WORDS if w != word)
+            r"(?<!-)\b(" + "|".join(w for w in NUMBER_WORDS if w != word)
             + r")\s+(?:memory\s+)?tools\b",
             re.IGNORECASE)
         # `*.json` as well as `*.md`, because a count is not only ever written in prose.
@@ -8855,6 +8869,14 @@ class Setup(_Home):
                  "ingest_media", "query_rewrite", "synthesis", "metadata_filters",
                  "encryption")
 
+    #: The switches 0.15.0 added: two server switches, agentic capture in the hooks, and
+    #: agentic extraction on the server, which is off by default.
+    PHASE_THREE = ("extraction_guidance", "expiry_erasure", "agentic_capture",
+                   "agentic_extraction")
+
+    #: Off unless switched on, in the library and in the hooks' copy of its defaults.
+    OFF_BY_DEFAULT = ("extraction_chunks", "agentic_extraction")
+
     def settings_module(self):
         spec = importlib.util.spec_from_file_location(
             "memvara_hooks_for_test", PLUGIN / "memvara_hooks.py")
@@ -8875,10 +8897,11 @@ class Setup(_Home):
         self.assertEqual(self.features(), (
             "index_command", "research_agent", "project_scope", "status_line",
             "recall_mark", "profile", "forget_matching", "end_reason", "links",
-            *self.PHASE_TWO))
+            *self.PHASE_TWO, *self.PHASE_THREE))
 
     def test_the_listing_names_every_feature_its_value_and_its_default(self) -> None:
-        """The default printed is the library's, so extraction_chunks reads as off."""
+        """The default printed is the library's, so extraction_chunks and agentic_extraction
+        read as off."""
         self.memvara_settings.parent.mkdir(parents=True)
         self.memvara_settings.write_text('{"recall_mark": false}', encoding="utf-8")
         done = self.setup()
@@ -8887,15 +8910,15 @@ class Setup(_Home):
         for name in self.features():
             row = [line for line in lines if line.split()[:1] == [name]]
             self.assertEqual(len(row), 1, f"{name} is not listed once")
-            default = "off" if name == "extraction_chunks" else "on"
-            expected = "off" if name in ("recall_mark", "extraction_chunks") else "on"
+            default = "off" if name in self.OFF_BY_DEFAULT else "on"
+            expected = "off" if name in ("recall_mark", *self.OFF_BY_DEFAULT) else "on"
             self.assertEqual(row[0].split()[1:4], [expected, "default", default], row[0])
 
-    def test_every_phase_two_switch_has_a_cost(self) -> None:
+    def test_every_phase_two_and_three_switch_has_a_cost(self) -> None:
         module = self.setup_module()
-        self.assertEqual(sorted(module.COSTS), sorted(self.PHASE_TWO))
+        self.assertEqual(sorted(module.COSTS), sorted(self.PHASE_TWO + self.PHASE_THREE))
         said = self.setup().stdout.decode("utf-8")
-        for name in self.PHASE_TWO:
+        for name in self.PHASE_TWO + self.PHASE_THREE:
             self.assertIn(f"Cost: {module.COSTS[name][:40]}", said, name)
 
     def test_the_filter_and_encryption_switches_can_be_set(self) -> None:

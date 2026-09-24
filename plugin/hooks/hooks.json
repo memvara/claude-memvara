@@ -30,7 +30,7 @@
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/run.py\" capture --host claude",
             "async": true,
-            "timeout": 120
+            "timeout": 180
           }
         ]
       }

@@ -113,6 +113,28 @@ DESCRIPTIONS = {
                   "Losing the key makes the store unreadable, so back it up with "
                   "memvara encrypt --export-key. An existing store stays as it is; "
                   "memvara encrypt converts one.",
+    "extraction_guidance": "A local memvara-mcp server adds a project's extraction "
+                           "guidance to the prompt that reads turns for facts. The guidance "
+                           "is a TOML file named by MEMVARA_EXTRACT_GUIDANCE, with a short "
+                           "description of the project and lists of what to keep and what "
+                           "to skip. Off: the guidance is left out.",
+    "expiry_erasure": "A memory written with an expiry time (expires_at) is hidden from "
+                      "every read once that time passes, and then erased from the store. "
+                      "Off: the expiry time is still stored, but nothing is hidden or "
+                      "erased.",
+    "agentic_capture": "When a turn ends, the capture hook runs claude -p with read-only "
+                       "access to your memory. It can search up to four times, then "
+                       "proposes new facts, replacements and ends for stored facts, and "
+                       "links between them. The hook checks every proposal and writes only "
+                       "the ones that pass. If the run fails or takes more than 60 seconds, "
+                       "the hook reads the turn for facts with one call instead. Off: the "
+                       "hook always uses the one call. The capture hook reads this switch "
+                       "from this file.",
+    "agentic_extraction": "The server reads a turn for facts with a tool loop: the model "
+                          "searches what is stored and proposes changes, and the write "
+                          "path checks them before anything is stored. It is off by "
+                          "default because its release bar has not been measured yet: no "
+                          "fewer memories and no more duplicates than the single call.",
 }
 
 #: What each phase 2 switch costs when it is on, in words a user can act on. A test
@@ -142,6 +164,19 @@ COSTS = {
                   "Measured on a store of 20,000 claims: 0.53 ms against 0.30 ms per write, "
                   "and 122 MB against 71 MB of peak memory. It needs "
                   "pip install 'memvara[encrypt]'.",
+    "extraction_guidance": "No model call of its own. Each extraction prompt grows by the "
+                           "guidance: at most 1,500 characters of description and 20 rules "
+                           "of at most 200 characters in each list.",
+    "expiry_erasure": "No model call. The store checks for expired memories when it opens "
+                      "and once an hour while the server runs.",
+    "agentic_capture": "It runs on your Claude Code login. Measured on nine test turns, a "
+                       "turn used a mean of 19,436 input and 1,163 output tokens and took "
+                       "17.3 seconds, against 45,258, 1,272 and 19.6 seconds for the one "
+                       "call on the same machine. On app.memvara.dev one run counts as "
+                       "one recall, however many searches it makes.",
+    "agentic_extraction": "Up to 12 model answers per write instead of one extraction "
+                          "call, on your model key, with at most 25 seconds for a write "
+                          "a caller is waiting on.",
 }
 
 #: Features the server provides rather than the plugin. The switch is saved like any other,
@@ -149,7 +184,8 @@ COSTS = {
 SERVER_SIDE = frozenset({"profile", "forget_matching", "end_reason", "links", "documents",
                          "retrieval_chunks", "extraction_chunks", "ingest_urls",
                          "ingest_media", "synthesis", "metadata_filters",
-                         "encryption"})
+                         "encryption", "extraction_guidance", "expiry_erasure",
+                         "agentic_extraction"})
 
 SERVER_NOTE = ("saved, but no server reads this file yet: the hosted server's switches are "
                "set by its deployment, and a local memvara-mcp server takes "
