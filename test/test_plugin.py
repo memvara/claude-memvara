@@ -4895,17 +4895,23 @@ def _endpoint_tools() -> "list[str]":
                          {**headers, **(extra or {})})
             reply = conn.getresponse()
             return reply.status, dict(reply.getheaders()), reply.read()
+        except (OSError, http.client.IncompleteRead, http.client.BadStatusLine) as exc:
+            # Every request, not only `initialize`: an endpoint that answers the first and
+            # times out on the second has still not been asked. `IncompleteRead` and
+            # `BadStatusLine` mean the answer broke off or was not HTTP, so it was not
+            # asked either. Any other `HTTPException` still fails. The likely ones, such as
+            # `CannotSendRequest`, mean this helper misused the connection, and a skip
+            # would hide that bug on every run.
+            raise EndpointUnreachable(
+                f"{body['method']}: {type(exc).__name__}: {exc}") from exc
         finally:
             conn.close()
 
-    try:
-        status, got, raw = call({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                       "clientInfo": {"name": "memvara-plugin-tests", "version": "1"}},
-        })
-    except OSError as exc:
-        raise EndpointUnreachable(f"{type(exc).__name__}: {exc}") from exc
+    status, got, raw = call({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                   "clientInfo": {"name": "memvara-plugin-tests", "version": "1"}},
+    })
     if status != 200:
         raise EndpointUnreachable(f"initialize answered HTTP {status}: {raw[:120]!r}")
     session = next((value for name, value in got.items()
@@ -4950,6 +4956,130 @@ def _endpoint_tools() -> "list[str]":
     if not served:
         raise EndpointUnreachable("tools/list returned an empty tool set")
     return served
+
+
+class EndpointFailures(unittest.TestCase):
+    """`_endpoint_tools` against a scripted stand-in for `http.client.HTTPSConnection`.
+
+    The helper imports `http.client` inside the function, so replacing the module's
+    attribute reaches it. `MEMVARA_API_KEY` is set to a dummy value, so a real key never
+    reaches the stand-in and a developer's own credentials file is never read.
+    """
+
+    INITIALIZED = (200, {"Mcp-Session-Id": "s"}, b"{}")
+    NOTIFIED = (202, {}, b"")
+
+    def setUp(self) -> None:
+        was = os.environ.get("MEMVARA_API_KEY")
+        os.environ["MEMVARA_API_KEY"] = "dummy"
+        self.addCleanup(self._restore_key, was)
+        self.addCleanup(setattr, http.client, "HTTPSConnection",
+                        http.client.HTTPSConnection)
+
+    @staticmethod
+    def _restore_key(was: "str | None") -> None:
+        if was is None:
+            os.environ.pop("MEMVARA_API_KEY", None)
+        else:
+            os.environ["MEMVARA_API_KEY"] = was
+
+    def endpoint(self, *answers: object) -> None:
+        """Answer the helper's requests from `answers`, in order. Each answer is an
+        exception to raise or a `(status, headers, body)` reply."""
+        script = list(answers)
+
+        class Reply:
+            def __init__(self, status: int, headers: dict, body: bytes) -> None:
+                self.status, self._headers, self._body = status, headers, body
+
+            def getheaders(self) -> "list[tuple[str, str]]":
+                return list(self._headers.items())
+
+            def read(self) -> bytes:
+                return self._body
+
+        class Connection:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.answer: object = None
+
+            def request(self, *args: object) -> None:
+                self.answer = script.pop(0)
+
+            def getresponse(self) -> Reply:
+                if isinstance(self.answer, BaseException):
+                    raise self.answer
+                return Reply(*self.answer)
+
+            def close(self) -> None:
+                pass
+
+        http.client.HTTPSConnection = Connection
+
+    @staticmethod
+    def listed(names: "tuple[str, ...]") -> "tuple[int, dict, bytes]":
+        result = {"tools": [{"name": name} for name in names]}
+        return 200, {}, json.dumps({"jsonrpc": "2.0", "id": 2, "result": result}).encode()
+
+    @staticmethod
+    def guard() -> None:
+        name = "test_the_declared_tools_are_the_ones_the_endpoint_serves"
+        getattr(ToolCount(name), name)()
+
+    def test_an_endpoint_that_stops_answering_skips_the_guard(self) -> None:
+        """Whichever of the three requests fails, the endpoint has not been asked, so the
+        guard skips and names the request. Only `initialize` used to turn a network error
+        into a skip, so a timeout on either later request failed the run instead. It did
+        in the library's own copy of this helper, on a pull request that did not touch it.
+        """
+        failures = [
+            (0, TimeoutError("The read operation timed out")),
+            (1, TimeoutError("The read operation timed out")),
+            (2, TimeoutError("The read operation timed out")),
+            (2, http.client.RemoteDisconnected("Remote end closed connection")),
+            (2, http.client.IncompleteRead(b"{")),
+            (1, http.client.BadStatusLine("HTTP/1.1 ???")),
+        ]
+        for at, error in failures:
+            method = ("initialize", "notifications/initialized", "tools/list")[at]
+            with self.subTest(request=method, error=type(error).__name__):
+                answers: "list[object]" = [self.INITIALIZED, self.NOTIFIED,
+                                           self.listed(HOSTED_TOOLS)]
+                answers[at] = error
+                self.endpoint(*answers)
+                with self.assertRaisesRegex(
+                        unittest.SkipTest,
+                        f"NOT checked: {method}: {type(error).__name__}"):
+                    self.guard()
+
+    def test_an_endpoint_serving_another_tool_set_still_fails_the_guard(self) -> None:
+        """A skip is for an endpoint that could not be asked, never for a wrong answer."""
+        self.endpoint(self.INITIALIZED, self.NOTIFIED, self.listed(HOSTED_TOOLS))
+        self.guard()
+        self.endpoint(self.INITIALIZED, self.NOTIFIED, self.listed(HOSTED_TOOLS[::-1]))
+        with self.assertRaisesRegex(AssertionError, "the endpoint disagree"):
+            self.guard()
+
+    def test_an_endpoint_that_answers_badly_is_still_unreachable(self) -> None:
+        """An answer that is not a usable tool list is reported as unreachable, with why."""
+        cases = [
+            ([(500, {}, b"oops")], "initialize answered HTTP 500"),
+            ([self.INITIALIZED, self.NOTIFIED, (503, {}, b"down")],
+             "tools/list answered HTTP 503"),
+            ([self.INITIALIZED, self.NOTIFIED, (200, {}, b"<html>")],
+             "nothing this can parse"),
+        ]
+        for answers, reason in cases:
+            with self.subTest(reason=reason):
+                self.endpoint(*answers)
+                with self.assertRaisesRegex(EndpointUnreachable, reason):
+                    _endpoint_tools()
+
+    def test_a_connection_the_helper_misused_fails_rather_than_skips(self) -> None:
+        """`CannotSendRequest` means the helper used a connection wrongly, which is a bug in
+        the helper. As a skip it would retire the guard on every run with nothing red."""
+        self.endpoint(self.INITIALIZED, http.client.CannotSendRequest("Request-sent"))
+        with self.assertRaises(http.client.CannotSendRequest):
+            _endpoint_tools()
 
 
 class ToolCount(unittest.TestCase):
