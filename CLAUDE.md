@@ -123,11 +123,11 @@ Today that is `claude-memvara` only. The rules are general.
   owes an account of itself somewhere a person will actually look.
 - **Where that account goes depends on whether the hook is synchronous.** `recall.py` and
   `session_start.py` print a one-line `systemMessage`, which is the only field on those
-  events the person at the terminal ever sees. `capture.py` cannot: it runs `async` so a
-  12-14s extraction does not hold the turn open, and the client discards an async hook's
-  output entirely. Its account is `~/.memvara/.hooks/capture.log`, where every path that
-  reaches a decision writes a line — including the ones that decide to do nothing, because
-  "skipped" and "never ran" are the pair that must not look alike.
+  events the person at the terminal ever sees. `capture.py` cannot: it hands its work to a
+  detached process so a 12-14s extraction does not hold the turn open, and nothing that
+  process prints reaches the client. Its account is `~/.memvara/.hooks/capture.log`,
+  where every path that reaches a decision writes a line — including the ones that decide
+  to do nothing, because "skipped" and "never ran" are the pair that must not look alike.
 - **But silence hides breakage, so verify bytes and never timings.** `python3 -S` looked
   like a 55% speedup. It was the hook returning zero bytes — numpy lives in site-packages,
   and the hook's own degrade-to-silence swallowed the ImportError. *The fastest

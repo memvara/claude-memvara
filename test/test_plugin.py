@@ -126,6 +126,15 @@ ALLOWED_HOOK_FILES = {
     # returns, and applies the ones that pass through `lib/write.py`. The model writes
     # nothing itself. It runs only when the first extractor is `claude`, which is this host.
     "lib/agentic.py",
+    # Added with the 0.17.0 sync, and read before being listed. `lib/private.py` creates
+    # every directory under `~/.memvara` as 0700 and every file as 0600, and takes the
+    # group and other permissions off ones that already exist. `lib/deadline.py` holds one
+    # deadline for a whole hook process, so recall and session start stop making hosted
+    # calls before the host's time limit. `lib/toml_servers.py` reads the MCP server
+    # tables in Codex's `config.toml`, so the hooks find a local store configured there.
+    "lib/deadline.py",
+    "lib/private.py",
+    "lib/toml_servers.py",
     # Vendored because the tree is copied whole with ZERO transforms, and read
     # before being listed. `hosts/codex.py`, `hosts/opencode.py`,
     # `hosts/cursor.py` and `hosts/copilot.py` are other clients' records: inert
@@ -1200,7 +1209,8 @@ class Hooks(unittest.TestCase):
         calls has to match the count of `_split` calls that produce bullets.
         """
         body = (HOOKS / "recall.py").read_text(encoding="utf-8")
-        main = body[body.index("\ndef main("):]
+        # The hook's body is `_main()`; `main()` only runs it and clears the deadline.
+        main = body[body.index("\ndef _main("):body.index("\ndef main(")]
         self.assertEqual(
             main.count("_split("), main.count("_belongs_here("),
             "a _split() in main() is not paired with a _belongs_here() filter")
@@ -1273,25 +1283,39 @@ class Hooks(unittest.TestCase):
         for phrase in ("recall failed", "no matching memories", "recalled"):
             self.assertIn(phrase, source)
 
-    def test_capture_is_async_and_therefore_reports_to_the_log(self) -> None:
-        """Async is why capture prints nothing, and the log is why that is still honest.
+    def test_capture_detaches_and_therefore_reports_to_the_log(self) -> None:
+        """Capture hands its work to a detached process, and the log is its only account.
 
-        Extraction takes 12-14s and a synchronous `Stop` hook holds the turn open for all
-        of it. Async hands the turn straight back — but the client discards an async hook's
-        output, so a `systemMessage` there is not merely unread, it is impossible.
+        Extraction takes 12-14s, and a synchronous `Stop` hook that did the work itself
+        would hold the turn open for all of it. Capture used to be registered `async` for
+        that reason, but `claude -p` cancels an async hook when the process exits, so a
+        headless session stored nothing (memvara/memvara#398). Capture is now registered
+        as an ordinary hook, and `run.py` forks the work into a process in a session of
+        its own and returns at once. That process prints nothing the client reads, so a
+        `systemMessage` from it is impossible.
 
         That reverses this repository's own rule that a hook must be visible, and the rule
         was right: a hook nobody can see working is one nobody notices breaking. So the
         obligation moved rather than lapsed. Both halves are asserted here, because either
-        one alone is a defect — async with no log is a silent hook, and a log with no async
-        is a turn held open for nothing.
+        one alone is a defect: a detached capture with no log is a silent hook, and a
+        capture that neither detaches nor runs async holds the turn open for nothing.
         """
         stop = _json(HOOKS / "hooks.json")["hooks"]["Stop"][0]["hooks"][0]
-        self.assertTrue(stop.get("async"), "capture must not hold the turn open")
+        self.assertNotIn("async", stop,
+                         "`claude -p` cancels an async Stop hook when it exits, so capture "
+                         "must be registered synchronous and detach instead")
+        _, claude = self._adapter()
+        self.assertTrue(claude.HOST.detach_capture,
+                        "capture must not hold the turn open: run.py has to fork it")
+        self.assertFalse(claude.HOST.supports_async)
+        self.assertIn("start_new_session=True",
+                      (HOOKS / "run.py").read_text(encoding="utf-8"),
+                      "the capture child must outlive the process that started it")
 
         source = (HOOKS / "capture.py").read_text(encoding="utf-8")
         self.assertNotIn("emit_json", source,
-                         "an async hook's output is discarded; printing implies otherwise")
+                         "the detached process's output reaches nobody; printing implies "
+                         "otherwise")
         self.assertIn("log(", source, "the log is the only account left")
 
         # Every branch that reaches a decision must leave a trace. The guard clauses above
@@ -1451,8 +1475,8 @@ class Hooks(unittest.TestCase):
         self.assertEqual(plural(0), "0 memories")
         self.assertEqual(plural(1), "1 memory")
         self.assertEqual(plural(2), "2 memories")
-        # capture.py is absent on purpose: it runs async, the client discards an async
-        # hook's output, and it therefore has no count to render for anyone.
+        # capture.py is absent on purpose: it runs in a detached process whose output
+        # nobody reads, and it therefore has no count to render for anyone.
         for hook in ("recall.py", "session_start.py"):
             source = (HOOKS / hook).read_text(encoding="utf-8")
             self.assertIn("plural(", source, f"{hook} must use the shared pluraliser")
@@ -1495,7 +1519,7 @@ class Hooks(unittest.TestCase):
     def test_capture_failing_rides_the_banner_that_was_already_printing(self) -> None:
         """`capture.py` cannot speak for itself; this is the channel that speaks for it.
 
-        It runs `async`, and the client discards an async hook's output entirely, so a
+        It runs in a detached process whose output the client never reads, so a
         `claude -p` that has been failing for hours says nothing anyone sees until the one
         hook already printing on every prompt relays it. Driven as a real subprocess
         against a real, writable `HOME`, because the whole claim is about what actually
@@ -2702,8 +2726,8 @@ class CaptureAlert(unittest.TestCase):
     """The state machine behind `⋈ Memvara · ... · capture failing: ...`.
 
     `lib.extract` raises this and clears it; `lib.ipc` decides when it is due; `recall.py`
-    is the only thing that ever speaks it, because `capture.py` runs `async` and cannot
-    speak for itself. These tests exercise `lib.ipc` directly, against a temp directory of
+    is the only thing that ever speaks it, because `capture.py` runs in a detached
+    process and cannot speak for itself. These tests exercise `lib.ipc` directly, against a temp directory of
     their own rather than the module-wide redirected `_HOME` -- the report-once / remind /
     reset transitions are the actual claim, and asserting them against a home this class
     owns outright is more legible than reading them back through the shared fixture.
@@ -2838,7 +2862,7 @@ class CaptureAlert(unittest.TestCase):
     def test_the_write_is_atomic_not_a_plain_open(self) -> None:
         """The one fix for the race a code review found: raise/due/clear share one file.
 
-        `raise_capture_alert` runs from the async extraction child; `due_capture_alert`
+        `raise_capture_alert` runs from the detached extraction child; `due_capture_alert`
         runs from `recall.py` on the very next prompt, which `capture.py`'s own docstring
         says can arrive while that child is still mid-run. Two real processes read-modify-
         write the same file with no lock between them, and nothing here closes that --
@@ -3262,7 +3286,10 @@ class Daemon(unittest.TestCase):
         literal = re.search(r"request = \{([^}]*)\}", client)
         if literal:
             sent |= set(re.findall(r'"(\w+)":', literal.group(1)))
+        # Read either way: `request.get("k")`, or `request["k"]` behind a `"k" in request`
+        # check, which is how the daemon reads `hosted_min_score`.
         read = set(re.findall(r'request\.get\("(\w+)"\)', served))
+        read |= set(re.findall(r'request\["(\w+)"\]', served))
 
         self.assertTrue(sent, "no request keys found — the parse is wrong, not the code")
         self.assertEqual(sent - read, set(),

@@ -46,7 +46,7 @@ Four hooks, so memory happens without being asked for:
 | `SessionStart` | Opens the session with standing facts, and names the scope it is bound to |
 | `UserPromptSubmit` | Recalls against every prompt, skipping what it has already injected |
 | `Stop` | Keeps the turn that just ended, and mines it for facts |
-| `PreToolUse` | Auto-allows read-only `memory_*` tools; writes still ask |
+| `PreToolUse` | Auto-allows the read-only `memory_*` tools of the server named `memvara`; writes still ask |
 
 All four are the same command, `hooks/run.py <hook> --host claude`. What
 this client calls each event, which stdin key carries the prompt, and
@@ -56,6 +56,11 @@ so the same bodies can be vendored for another editor by adding one
 record beside it. A run that cannot dispatch at all — an unknown host, a
 hook that client has no event for — exits 0 like every other failure here
 and writes the reason to `~/.memvara/.hooks/hooks.log`.
+
+Everything the hooks keep under `~/.memvara` is readable by your account
+only: each directory is created with mode `0700` and each file with `0600`,
+and a hook removes any group or other permission from a file or directory an
+older version left behind.
 
 The hooks count what they do for the status line, in
 `~/.memvara/.hooks/counts/<session>.json`, and every memory line they put
@@ -130,10 +135,12 @@ Recall and session start are synchronous and print a one-line
 `systemMessage`: `⋈ Memvara · 4 memories recalled` before the turn (and
 `1 memory`, singular, when there is one).
 
-Capture prints nothing, because it runs `async`. Extraction shells out to
-`claude -p` and takes 12–14 seconds, and a synchronous `Stop` hook holds
-the turn open for all of it; async hands the turn straight back. The
-client discards an async hook's output, so the report moves to
+Capture prints nothing, because its work runs in a detached process.
+Extraction shells out to `claude -p` and takes 12–14 seconds, and a `Stop`
+hook that did that work itself would hold the turn open for all of it. So
+the hook starts a process in a session of its own and returns at once, and
+that process finishes the capture even after a headless `claude -p` has
+exited. Nothing that process prints reaches the client, so the report goes to
 `~/.memvara/.hooks/capture.log` rather than being dropped — every path
 that reaches a decision writes a line there, including the ones that
 decide to do nothing.
@@ -169,7 +176,7 @@ a section cannot be fetched the banner now says which and why:
 `⋈ Memvara · session opened with 29 memories · notes unavailable (quota)`.
 
 **A failing extractor rides along on whichever of these is already
-printing.** Capture runs `async` and cannot speak for itself — see
+printing.** Capture runs in a detached process and cannot speak for itself — see
 above — so a `claude -p` that has been failing for hours said nothing
 anyone saw until the terminal, past `capture.log`, which nothing reads
 on a schedule. Recall and session start now append `· capture failing:
@@ -337,8 +344,8 @@ after 60 seconds. If it cannot reach your memory, fails or runs out of
 time, the turn gets the single-call extraction described above, and
 `capture.log` says why. A turn can therefore take the agentic run and then
 the single call, so the capture hook's timeout on this client is 180
-seconds. The hook runs async, so the longer limit does not hold the turn
-open.
+seconds. The hook hands the work to a detached process and returns at
+once, so the longer limit does not hold the turn open.
 
 Measured on nine test turns, each replayed twice, the agentic run made 12
 of 14 expected changes against 7 of 14 for the single call, ended 6 of 6
@@ -678,7 +685,8 @@ error.
 needs history. It runs three to six searches and returns a brief of at most
 300 words that cites a claim id for every fact. Its tool list holds only
 read tools: the same set the `PreToolUse` hook approves without asking,
-including the profile tool the hosted server does not serve yet. It cannot
+including the profile tool the hosted server does not serve yet and the two
+document readers, `memory_get_document` and `memory_list_documents`. It cannot
 write, end, retire or link anything.
 
 ### The switches
