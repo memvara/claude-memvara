@@ -1,5 +1,5 @@
 {
-  "description": "Memvara: recall on every prompt, capture when a turn ends. Every command goes through run.py, which binds the host record in hosts/claude.py before dispatching -- the client's field names, reply keys and event names are data there rather than literals in the hook bodies. Capture runs async so a 12-14s extraction never holds the turn open; async hook output is discarded by the client, so its record is ~/.memvara/.hooks/capture.log rather than a systemMessage.",
+  "description": "Memvara: recall on every prompt, capture when a turn ends. Every command goes through run.py, which binds the host record in hosts/claude.py before dispatching -- the client's field names, reply keys and event names are data there rather than literals in the hook bodies. Capture hands its work to a detached process and returns at once, so a 12-14s extraction never holds the turn open and still finishes after claude -p exits; that process prints nothing the client sees, so its record is ~/.memvara/.hooks/capture.log rather than a systemMessage.",
   "hooks": {
     "SessionStart": [
       {
@@ -29,7 +29,6 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/run.py\" capture --host claude",
-            "async": true,
             "timeout": 180
           }
         ]

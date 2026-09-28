@@ -3,7 +3,9 @@
 
 SuperMemory auto-allows search; writes still ask. Same split here. A silent
 no-op on any other tool, so this matcher can be wide (`mcp__.*memvara.*`)
-without approving a forget.
+without approving a forget, or a tool of another server whose name contains
+`memvara`: a tool is approved only when its whole name is one of the host's
+`ApproveSpec.prefixes` followed by a read-only tool's name.
 
 Each read it approves is also counted as one `searched` for the status line, in
 `~/.memvara/.hooks/counts/<session>.json`, unless the `status_line` setting is off.
@@ -26,7 +28,8 @@ from lib.ipc import payload  # noqa: E402
 #: that they were added after this list. `memory_standing` and `memory_ask` were missing for
 #: the same reason, and the memory-research subagent calls both, so it stopped at a
 #: permission prompt on its first search. `memory_profile` is listed before the server
-#: ships it so that the subagent can call it the day it does.
+#: ships it so that the subagent can call it the day it does. The two document readers,
+#: `memory_get_document` and `memory_list_documents`, were missing too (#267).
 READ_ONLY = frozenset({
     "memory_recall",
     "memory_search",
@@ -39,15 +42,18 @@ READ_ONLY = frozenset({
     "memory_standing",
     "memory_ask",
     "memory_profile",
+    "memory_get_document",
+    "memory_list_documents",
 })
 
 
-def _tool_leaf(name: str, separators: "tuple[str, ...]") -> str:
-    # mcp__memvara__memory_search or mcp__plugin_memvara_memvara__memory_search
-    for sep in separators:
-        if sep in name:
-            return name.rsplit(sep, 1)[-1]
-    return name
+def _ours(name: str, prefixes: "tuple[str, ...]") -> bool:
+    """Whether `name` is a read-only tool of memvara's own server on this host.
+
+    `mcp__memvara__memory_search` is; `mcp__not-memvara__memory_search` is not, and
+    neither is `mcp__memvara__memory_forget`.
+    """
+    return any(name.startswith(p) and name[len(p):] in READ_ONLY for p in prefixes)
 
 
 def main() -> int:
@@ -56,8 +62,7 @@ def main() -> int:
         # No pre-tool event on this client: there is no prompt to pre-empt.
         return 0
     event = read_event(host, "approve", payload())
-    leaf = _tool_leaf(event.tool_name, host.approve.separators)
-    if leaf not in READ_ONLY:
+    if not _ours(event.tool_name, host.approve.prefixes):
         return 0
     write(host, Reply("approve", decision=host.approve.allow,
                       reason="Memvara recall is read-only."))
