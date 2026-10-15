@@ -61,7 +61,9 @@ The steps are in `plugin/commands/index.md`, and the README describes them for u
   100 commits; the user removed both limits on 2026-10-15.
 - **Keeping it current.** A second run compares with what is stored, as the command already
   did: a fact already stored is not written again, and a changed purpose is written with
-  `replaces`. A folder that was deleted or moved keeps its old facts. The report names it and
+  `replaces`. It re-reads only the folders whose files changed since `indexed_through`,
+  and it looks up every decision by its sha before writing it, on every run, because a run
+  that stopped early leaves decisions stored without the marker. A folder that was deleted or moved keeps its old facts. The report names it and
   suggests `memory_end`, which asks the user before it runs, because the command's
   `allowed-tools` still excludes `memory_end` and `memory_forget`.
 - **Privacy.** The command reads code and commit messages inside the user's session. Only the

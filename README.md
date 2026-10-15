@@ -630,7 +630,8 @@ files that git tracks, the command records two more kinds of fact:
   one-sentence `purpose` and a `belongs_to` fact that names the repository.
   Tests, docs and CI folders are not recorded. At most 25 folders are
   recorded; when there are more, the ones with the most tracked files are
-  kept.
+  kept. A later run re-reads only the folders whose files changed since the
+  last run.
 - **Decisions from the commit history.** The first run reads every commit
   message on the default branch, 100 at a time, with the files each commit
   changed. It then records the newest commit it read as an `indexed_through`

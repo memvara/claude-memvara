@@ -8797,6 +8797,10 @@ class IndexCommand(unittest.TestCase):
         body = self.BODY.read_text(encoding="utf-8")
         self.assertIn("--format='--%n%h %cs %s%n%b' <last>..origin/HEAD", body)
         self.assertIn("with the commit's short sha as the query", body)
+        # The first real run, on 2026-10-15, skipped this search because it found no
+        # earlier run. A run that stopped before writing `indexed_through` leaves exactly
+        # that state behind, with its decisions already stored.
+        self.assertIn("Do this search on every run, the first one included", body)
 
     def test_a_later_run_reads_only_the_commits_after_the_last_one(self) -> None:
         """With no cap, the first run reads the whole history a page at a time, so a later
@@ -8809,6 +8813,13 @@ class IndexCommand(unittest.TestCase):
     def test_a_component_is_compared_only_with_its_own_rows(self) -> None:
         body = self.BODY.read_text(encoding="utf-8")
         self.assertIn("Keep only the rows whose subject is exactly that component's", body)
+
+    def test_a_later_run_rereads_only_the_folders_that_changed(self) -> None:
+        """A purpose can change only when the folder's files do. The second real run, on
+        2026-10-15, re-checked no purpose at all; re-reading every folder on every run
+        would be the other mistake."""
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("git log --name-only --format= <last>..origin/HEAD", body)
 
 
 class _Home(unittest.TestCase):

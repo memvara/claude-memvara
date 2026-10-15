@@ -106,6 +106,15 @@ with the same `memory_type` and `extractor` as in step 5:
   points;
 - `belongs_to`: the subject from step 2.
 
+On a later run, when step 7 finds an `indexed_through` fact, re-read only the components whose
+files changed since that commit, because a purpose can change only when its folder does:
+
+```bash
+git log --name-only --format= <last>..origin/HEAD
+```
+
+A component with no changed files keeps its stored facts. A new folder is a new component.
+
 A stored component whose folder no longer exists is not ended here. Name it in the report,
 and suggest ending its facts with `memory_end`, which asks the user before it runs.
 
@@ -151,6 +160,8 @@ Before writing a decision, call `memory_search`
 with the commit's short sha as the query. If a stored `decided` fact already ends with that
 sha, do not write it again. The search in step 3 is not enough for this, because it returns
 at most 50 rows.
+Do this search on every run, the first one included: a run that stopped before writing
+`indexed_through` leaves its decisions stored without the marker that says so.
 
 When every page has been read, record where this run stopped. Get the full sha with
 `git log -1 --format=%H origin/HEAD`, and write it as the object of an `indexed_through`
