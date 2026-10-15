@@ -119,9 +119,11 @@ def parse_run(lines: list[str], expected: list[str], root: str) -> Run:
     """Read one run's stream-json transcript."""
     run, seen, context = Run(), set(), 0
     for line in lines:
-        if not line.strip():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            # A blank line, or the half-written last line of a run that was stopped.
             continue
-        event = json.loads(line)
         kind = event.get("type")
         if kind == "system" and event.get("subtype") == "init":
             run.session = event.get("session_id", "")
@@ -175,6 +177,9 @@ class Summary:
     right: float
     judged: int
     tokens_to_first: float = 0.0
+    #: Runs that ended in an error, such as reaching the budget cap. Their answers are
+    #: judged as they stand, so a high count explains a low score.
+    stopped: int = 0
 
 
 def summarize(arm: str, rows: list[tuple[dict, Run, str | None]]) -> Summary:
@@ -194,6 +199,7 @@ def summarize(arm: str, rows: list[tuple[dict, Run, str | None]]) -> Summary:
         right=sum(sum(right) / len(right) for right in answers.values()),
         judged=sum(verdict is not None for _, _, verdict in rows),
         tokens_to_first=statistics.mean(run.tokens_to_first for run in runs),
+        stopped=sum(run.error for run in runs),
     )
 
 
@@ -396,19 +402,22 @@ Reply with one line for each answer and nothing else, in this form:
 def parse_verdicts(reply: str, count: int) -> dict[int, str]:
     """The judge's verdict for each label, or an error naming what it left out."""
     # Judges decorate the label ("1.", "**1**", "1)"), so anything but a digit may surround it.
-    found = {int(m[1]): m[2].lower()
-             for m in re.finditer(r"^\D*?(\d+)\W+(right|partly|wrong)\b", reply, re.M | re.I)}
-    if sorted(found) != list(range(1, count + 1)):
+    graded = [(int(m[1]), m[2].lower())
+              for m in re.finditer(r"^\D*?(\d+)\W+(right|partly|wrong)\b", reply, re.M | re.I)]
+    found = dict(graded)
+    if len(graded) != count or sorted(found) != list(range(1, count + 1)):
         raise SystemExit(f"The judge did not grade every answer exactly once:\n{reply}")
     return found
 
 
 def judge() -> None:
-    """Grade each question's answers in one call, shuffled and without their setups."""
+    """Grade each question's answers in one call, shuffled and without their setups.
+
+    A question is graded again whenever its set of answers has changed since it was last
+    graded, so that runs added later are never left without a verdict.
+    """
     for question in load_questions():
         out = DATA / "judge" / f"{question['id']}.json"
-        if out.exists():
-            continue
         root = str(DATA / "snapshots" / question["repo"])
         answers = [(f"{arm}/{path.stem}",
                     parse_run(path.read_text().splitlines(), question["expected_files"],
@@ -416,6 +425,8 @@ def judge() -> None:
                    for arm in ARMS
                    for path in sorted((DATA / "runs" / arm).glob(f"{question['id']}-*.jsonl"))]
         if not answers:
+            continue
+        if out.exists() and set(json.loads(out.read_text())["verdicts"]) == {k for k, _ in answers}:
             continue
         random.Random(question["id"]).shuffle(answers)
         shown = "\n\n".join(f'<answer label="{i}">\n{text}\n</answer>'
@@ -465,12 +476,12 @@ def report() -> str:
     out = ["# Phase 0 result", "", f"Model: {MODEL}. Snapshots: {shas}.", "",
            "| Setup | Runs | Tool calls before a right file | Tokens before a right file | "
            "Never read one | Tokens per run | Cost at list price | Decision questions right "
-           "| Judged |",
-           "|---|---|---|---|---|---|---|---|---|"]
+           "| Judged | Stopped early |",
+           "|---|---|---|---|---|---|---|---|---|---|"]
     for s in summaries.values():
         out.append(f"| {s.arm} | {s.runs} | {s.calls_to_first:.1f} | "
                    f"{s.tokens_to_first:,.0f} | {s.never_opened} | "
-                   f"{s.tokens:,.0f} | ${s.cost_usd:.2f} | {s.right:.1f} | {s.judged} |")
+                   f"{s.tokens:,.0f} | ${s.cost_usd:.2f} | {s.right:.1f} | {s.judged} | {s.stopped} |")
     if "A" in summaries and "C" in summaries:
         passed, lines = gate(summaries["A"], summaries["C"])
         out += ["", f"Gate: {'passed' if passed else 'not passed'}.", ""]

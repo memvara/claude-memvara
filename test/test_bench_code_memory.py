@@ -129,6 +129,13 @@ class ParseRun(unittest.TestCase):
         run = self.parse(init(), reply("m1", TEXT), result(text="ok", cost=0.25, tokens=1234))
         self.assertEqual((run.answer, run.cost_usd, run.tokens), ("ok", 0.25, 1234))
 
+    def test_a_cut_off_last_line_is_left_out(self):
+        # A run stopped mid-write leaves half a JSON object as its last line.
+        cut = lines(init(), reply("m1", call("Grep", pattern="x")), result())
+        cut[-1] = cut[-1][:20]
+        run = cm.parse_run(cut, ["memvara/store.py"], SNAP)
+        self.assertEqual((run.session, run.tool_calls, run.answer), ("s1", 1, ""))
+
     def test_memvara_is_seen_in_the_init_event(self):
         self.assertEqual(self.parse(init(), result()).memvara, "")
         loaded = self.parse(init(memvara=("memvara@inline", "connected")), result())
@@ -162,6 +169,11 @@ class Gate(unittest.TestCase):
         summary = cm.summarize("A", rows)
         self.assertEqual((summary.right, summary.judged), (1.5, 5))
         self.assertEqual(summary.tokens_to_first, 350)
+
+    def test_runs_that_stopped_early_are_counted(self):
+        q = {"id": "q1", "kind": "locate"}
+        rows = [(q, cm.Run(error=True), None), (q, cm.Run(), None), (q, cm.Run(error=True), None)]
+        self.assertEqual(cm.summarize("A", rows).stopped, 2)
 
 
 class Setups(unittest.TestCase):
@@ -331,3 +343,49 @@ class Verdicts(unittest.TestCase):
                          {1: "right", 2: "partly", 3: "wrong"})
         with self.assertRaises(SystemExit):
             cm.parse_verdicts("1 right fine\n", 2)
+        with self.assertRaises(SystemExit):
+            cm.parse_verdicts("1 right fine\n1 wrong no\n2 right fine\n", 2)
+
+
+class Judge(unittest.TestCase):
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.data = pathlib.Path(tmp.name)
+        (self.data / "snapshots" / "repo").mkdir(parents=True)
+        (self.data / "questions.json").write_text(json.dumps([{
+            "id": "q1", "repo": "repo", "kind": "why", "question": "Why?",
+            "expected_files": ["x.py"], "answer_key": "Because."}]))
+        bin_dir = self.data / "bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "claude"
+        # Grades every answer it is shown as right, and counts its calls.
+        fake.write_text(f"""#!{sys.executable}
+import json, os, sys
+open(os.environ["FAKE_CALLS"], "a").write("x")
+shown = sys.argv[2].count('<answer label=')
+print(json.dumps({{"result": "\\n".join(f"{{i}} right fine" for i in range(1, shown + 1))}}))
+""")
+        fake.chmod(0o755)
+        self.calls = self.data / "calls"
+        env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "FAKE_CALLS": str(self.calls)}
+        for patcher in (mock.patch.object(cm, "DATA", self.data), mock.patch.dict(os.environ, env)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def add_run(self, arm, n):
+        path = self.data / "runs" / arm / f"q1-{n}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines(init(), result(text=f"answer {arm}{n}"))) + "\n")
+
+    def test_a_question_is_graded_again_when_its_answers_change(self):
+        self.add_run("A", 1)
+        with redirect_stdout(io.StringIO()):
+            cm.judge()
+            self.add_run("C", 1)
+            cm.judge()
+            cm.judge()
+        verdicts = json.loads((self.data / "judge" / "q1.json").read_text())["verdicts"]
+        self.assertEqual(verdicts, {"A/q1-1": "right", "C/q1-1": "right"})
+        self.assertEqual(self.calls.read_text(), "xx")
