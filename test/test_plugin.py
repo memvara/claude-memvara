@@ -8762,6 +8762,33 @@ class IndexCommand(unittest.TestCase):
         for tool in ("memory_forget", "memory_end", "memory_add"):
             self.assertNotIn(f"{PLUGIN_TOOL_PREFIX}{tool},", allowed + ",")
 
+    def test_a_coding_project_gets_one_subject_per_main_folder(self) -> None:
+        """The code mode: what a folder is for, under a subject every clone spells the same.
+
+        The subject is built from the repository's own subject and the folder's path, so a
+        second run, or a run from another worktree, finds the facts the first one wrote.
+        """
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("`component:github.com/memvara/memvara:memvara/store`", body)
+        self.assertIn("`belongs_to`", body)
+        self.assertIn("at most 25", body)
+        allowed = _frontmatter(self.BODY)["allowed-tools"]
+        self.assertIn("Bash(git ls-files:*)", allowed)
+
+    def test_decisions_come_from_commit_messages_dated_by_the_commit(self) -> None:
+        """A decision is dated when it was made, not when the index ran.
+
+        And only paths inside a folder decide which folder a decision belongs to. Counting
+        tests, docs and the changelog left almost every decision on the project when the
+        notes for this were first written by hand.
+        """
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("git log -100 --no-merges --name-only", body)
+        self.assertIn("`decided`", body)
+        self.assertIn("`true_since`", body)
+        self.assertIn("counting only the changed paths inside a component", body)
+        self.assertIn("at most 40 decisions", body)
+
 
 class _Home(unittest.TestCase):
     """A disposable HOME, so nothing here reads or writes the developer's own files."""
