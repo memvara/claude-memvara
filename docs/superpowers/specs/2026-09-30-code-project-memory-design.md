@@ -163,10 +163,14 @@ the previous value, or two values would stay live.
 
 ### 5.3 The structure map
 
-A component is a top-level source directory, or a package that a manifest declares as a
-workspace member (npm or pnpm workspaces, Cargo workspace members, Go modules, Python
-packages). At most 25 components are recorded. When a repository has more, the command
-keeps the largest by tracked file count and reports the rest by name.
+A component is a source directory. That is a top-level source directory, a package that a
+manifest declares as a workspace member (npm or pnpm workspaces, Cargo workspace members, Go
+modules), or a subpackage of the repository's main Python package, as `memvara/store` is in
+memvara. When a package is split into components, the files directly inside it form one more
+component, named after the package directory. Directories that hold no product source, such
+as tests, docs and CI configuration, are not components. At most 25 components are recorded.
+When a repository has more, the command keeps the largest by tracked file count and reports
+the rest by name.
 
 For each component the command writes `belongs_to`, one `purpose`, and any `entry_point`,
 `depends_on` and `convention` facts that the repository itself states. It reads READMEs,
@@ -188,10 +192,17 @@ manifests, entry points and a small sample of files. It does not read every file
   `known_defect` and `convention` when the message states them. Anything else is skipped.
   Secrets, credentials and personal data are never written, as the command already
   requires.
-- **Anchoring.** Each fact goes to the component that holds most of the commit's changed
-  paths. When no component holds a majority, it goes to the project.
-- **Limit.** At most 40 decisions per run. When more commits qualify, the rest wait for
-  the next run, and the report says how many are waiting.
+- **Anchoring.** Only the changed paths that fall inside a component are counted, each in
+  the longest component path that contains it. Tests, docs and the changelog fall outside
+  every component, so they are not counted. The fact goes to the component that holds more
+  than half of the counted paths. When no component does, it goes to the project. Phase 0
+  found why the paths outside components must not count: most commits also change tests
+  and docs, so counting every path left almost every decision on the project, where the
+  brief shows only five of them.
+- **Limit.** At most 40 decisions per run. The first run takes the newest qualifying
+  commits first, so that the map describes the code as it is now. When more commits
+  qualify, the report says how many were left. How a later run reaches the older ones is
+  open question 7, because later runs read only the commits after `indexed_through`.
 - **No duplicates.** Before writing, the command searches the stored facts for that
   subject and predicate, as step 3 of the index command already does.
 
@@ -408,6 +419,10 @@ that is off by default, in both core locations listed in section 6.
 5. **Per-prompt recall.** Should decisions stay out of the 4-slot per-prompt recall and
    appear only through the brief and file-touch notes?
 6. **Phase 0 thresholds.** Are 30%, 2 of 10 and 20% the right bars?
+7. **Older decisions after the first run.** The first run keeps the newest 40 decisions,
+   and later runs read only the commits after `indexed_through`, so the older qualifying
+   commits are never read. Either the command keeps a second marker for how far back it
+   has read, or older history is out of scope.
 
 ## 10. Checks made before writing this
 
