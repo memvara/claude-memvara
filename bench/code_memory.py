@@ -264,3 +264,83 @@ def check_setup(arm: str, run: Run, briefed: set[str]) -> str | None:
     if arm == "C" and run.session not in briefed:
         return "the notes hook did not add the brief"
     return None
+
+
+def locate(path: str) -> tuple[str, str] | None:
+    """(repository, path inside it) for a path in one of the snapshots, else None."""
+    snapshots = DATA / "snapshots"
+    if not path or not snapshots.is_dir():
+        return None
+    path = os.path.realpath(path)
+    for snapshot in snapshots.iterdir():
+        root = os.path.realpath(snapshot)
+        if path == root:
+            return snapshot.name, ""
+        if path.startswith(root + os.sep):
+            return snapshot.name, path[len(root) + 1:]
+    return None
+
+
+def first_touch(session: str, component: str) -> bool:
+    """True the first time a session touches a component, even when two calls race."""
+    marker = DATA / "hook-state" / session / component.replace("/", "%2F")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.close(os.open(marker, os.O_CREAT | os.O_EXCL))
+    except FileExistsError:
+        return False
+    return True
+
+
+def hook(event: dict) -> dict | None:
+    """Setup C's reply to one hook event, or None to add nothing."""
+    name = event.get("hook_event_name")
+    if name == "SessionStart":
+        found = locate(event.get("cwd", ""))
+    elif name == "PreToolUse":
+        found = locate((event.get("tool_input") or {}).get("file_path", ""))
+    else:
+        return None
+    text, component = None, None
+    if found:
+        notes = json.loads((DATA / "notes" / f"{found[0]}.json").read_text())
+        if name == "SessionStart":
+            text = notes.get("brief")
+        else:
+            inside = [c for c in notes.get("components", {})
+                      if found[1] == c or found[1].startswith(c + "/")]
+            component = max(inside, key=len, default=None)
+            if component and first_touch(event.get("session_id", ""), component):
+                text = notes["components"][component]
+    with open(DATA / "hook.log", "a") as log:
+        log.write(json.dumps({"session": event.get("session_id"), "event": name,
+                              "component": component, "injected": bool(text)}) + "\n")
+    if not text:
+        return None
+    return {"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}}
+
+
+def run_hook() -> int:
+    """Claude Code's entry point in setup C. It never blocks a tool and never fails."""
+    try:
+        reply = hook(json.load(sys.stdin))
+    except Exception as exc:  # noqa: BLE001 - a broken note must not break the run
+        try:
+            with open(DATA / "hook.log", "a") as log:
+                log.write(json.dumps({"error": f"{type(exc).__name__}: {exc}"}) + "\n")
+        except OSError:
+            pass
+        return 0
+    if reply:
+        print(json.dumps(reply))
+    return 0
+
+
+def briefed() -> set[str]:
+    """The sessions that the notes hook gave a brief to."""
+    log = DATA / "hook.log"
+    if not log.exists():
+        return set()
+    events = (json.loads(line) for line in log.read_text().splitlines() if line.strip())
+    return {e["session"] for e in events
+            if e.get("event") == "SessionStart" and e.get("injected")}

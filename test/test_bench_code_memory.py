@@ -219,3 +219,55 @@ class Setups(unittest.TestCase):
         self.assertIsNotNone(cm.check_setup("C", off, set()))
         self.assertIsNone(cm.check_setup("C", off, {"s"}))
         self.assertIsNotNone(cm.check_setup("A", cm.Run(), set()))
+
+
+class NotesHook(unittest.TestCase):
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.data = pathlib.Path(tmp.name)
+        self.snap = self.data / "snapshots" / "memvara"
+        (self.snap / "memvara" / "store").mkdir(parents=True)
+        (self.data / "notes").mkdir()
+        (self.data / "notes" / "memvara.json").write_text(json.dumps({
+            "brief": "BRIEF",
+            "components": {"memvara": "CORE NOTES", "memvara/store": "STORE NOTES"}}))
+        patcher = mock.patch.object(cm, "DATA", self.data)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def touch(self, path, session="s1", tool="Read"):
+        reply = cm.hook({"hook_event_name": "PreToolUse", "session_id": session,
+                         "tool_name": tool, "tool_input": {"file_path": str(path)}})
+        return reply and reply["hookSpecificOutput"]["additionalContext"]
+
+    def test_the_brief_is_added_when_the_session_starts(self):
+        reply = cm.hook({"hook_event_name": "SessionStart", "session_id": "s1",
+                         "cwd": str(self.snap)})
+        self.assertEqual(reply["hookSpecificOutput"],
+                         {"hookEventName": "SessionStart", "additionalContext": "BRIEF"})
+        self.assertEqual(cm.briefed(), {"s1"})
+
+    def test_a_component_s_notes_are_added_once_per_session(self):
+        self.assertEqual(self.touch(self.snap / "memvara/store/a.py"), "STORE NOTES")
+        self.assertIsNone(self.touch(self.snap / "memvara/store/b.py", tool="Edit"))
+        self.assertEqual(self.touch(self.snap / "memvara/core.py"), "CORE NOTES")
+        self.assertEqual(self.touch(self.snap / "memvara/store/a.py", session="s2"),
+                         "STORE NOTES")
+
+    def test_a_file_outside_every_component_or_snapshot_adds_nothing(self):
+        self.assertIsNone(self.touch(self.snap / "README.md"))
+        self.assertIsNone(self.touch("/etc/hosts"))
+        self.assertIsNone(cm.hook({"hook_event_name": "PreToolUse", "session_id": "s1",
+                                   "tool_name": "Write", "tool_input": {}}))
+
+    def test_the_hook_never_fails_and_says_why_in_its_log(self):
+        (self.data / "notes" / "memvara.json").write_text("{broken")
+        for stdin in ("not json",
+                      json.dumps({"hook_event_name": "SessionStart", "cwd": str(self.snap)})):
+            out = io.StringIO()
+            with mock.patch.object(sys, "stdin", io.StringIO(stdin)), redirect_stdout(out):
+                self.assertEqual(cm.run_hook(), 0)
+            self.assertEqual(out.getvalue(), "")
+        self.assertEqual((self.data / "hook.log").read_text().count('"error"'), 2)
