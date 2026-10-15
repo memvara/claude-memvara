@@ -8783,19 +8783,28 @@ class IndexCommand(unittest.TestCase):
         notes for this were first written by hand.
         """
         body = self.BODY.read_text(encoding="utf-8")
-        self.assertIn("git log -100 --no-merges --name-only", body)
+        self.assertIn("git log -100 --skip=0 --no-merges --name-only", body)
         self.assertIn("`decided`", body)
         self.assertIn("`true_since`", body)
         self.assertIn("counting only the changed paths inside a component", body)
-        self.assertIn("at most 40 decisions", body)
+        # No cap: the user asked for every decision the history holds (2026-10-15).
+        self.assertIn("Write every qualifying decision. There is no limit.", body)
 
     def test_decisions_come_from_the_default_branch_and_are_found_by_their_sha(self) -> None:
         """Every worktree shares one project scope, so only merged history is true for all
         of them; and a stored decision is found by its sha, because one search capped at 50
         rows stops seeing them once a repository has more facts than that."""
         body = self.BODY.read_text(encoding="utf-8")
-        self.assertIn("--format='--%n%h %cs %s%n%b' origin/HEAD", body)
+        self.assertIn("--format='--%n%h %cs %s%n%b' <last>..origin/HEAD", body)
         self.assertIn("with the commit's short sha as the query", body)
+
+    def test_a_later_run_reads_only_the_commits_after_the_last_one(self) -> None:
+        """With no cap, the first run reads the whole history a page at a time, so a later
+        run must start where it stopped instead of reading everything again."""
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("`indexed_through`", body)
+        self.assertIn("`replaces` set to the previous `indexed_through` fact's claim id", body)
+        self.assertIn("stop when a page comes back empty", body)
 
     def test_a_component_is_compared_only_with_its_own_rows(self) -> None:
         body = self.BODY.read_text(encoding="utf-8")

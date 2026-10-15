@@ -109,20 +109,32 @@ with the same `memory_type` and `extractor` as in step 5:
 A stored component whose folder no longer exists is not ended here. Name it in the report,
 and suggest ending its facts with `memory_end`, which asks the user before it runs.
 
-**7. Record the decisions in recent commits.** Run:
+**7. Record the decisions in the commit history.** Decisions are read from the default
+branch, `origin/HEAD`, because every clone and worktree of the repository shares these facts,
+and only merged history is true for all of them. If `origin/HEAD` does not exist, use `HEAD`
+in its place in the commands below, which reads the current branch, and say so in the report.
+
+First find where the last run stopped. Call `memory_search` with the query `indexed_through`
+followed by the step 2 subject, and keep the row whose subject is the step 2 subject and whose
+predicate is `indexed_through`. Its object is the last commit an earlier run read; call it
+`<last>`.
+
+Then read the commits after it, 100 at a time, newest first:
 
 ```bash
-git log -100 --no-merges --name-only --format='--%n%h %cs %s%n%b' origin/HEAD
+git log -100 --skip=0 --no-merges --name-only --format='--%n%h %cs %s%n%b' <last>..origin/HEAD
 ```
 
-This reads the default branch, because every clone and worktree of the repository shares
-these facts, and only merged history is true for all of them. If `origin/HEAD` does not
-exist, run the same command without it, which reads the current branch, and say so in the
-report.
+On the first run there is no `<last>`, so leave out `<last>..` and read the whole history.
+If git cannot find `<last>`, because the history was rewritten, do the same: the search by
+sha below keeps a decision from being written twice. Raise `--skip` by 100 for each next
+page, and stop when a page comes back empty.
 
 Keep a commit only when its message states a choice and the reason for it. Skip commits
-with no body, dependency bumps, releases and reverts. For each kept commit, write one fact
-with `memory_remember`, with the same `memory_type` and `extractor` as in step 5:
+with no body, dependency bumps, releases and reverts.
+Write every qualifying decision. There is no limit.
+For each kept commit, write one fact with `memory_remember`, with the same `memory_type`
+and `extractor` as in step 5:
 
 - `predicate`: `decided`;
 - `object`: the choice and its reason in one sentence, ending with the short sha in
@@ -135,16 +147,24 @@ with `memory_remember`, with the same `memory_type` and `extractor` as in step 5
   count, and a path belongs to the longest component folder that contains it. When no
   component holds more than half, use the subject from step 2.
 
-Write at most 40 decisions in one run, newest first, and say in the report how many were
-left out. Before writing a decision, call `memory_search`
+Before writing a decision, call `memory_search`
 with the commit's short sha as the query. If a stored `decided` fact already ends with that
-sha, do not write it again. The
-search in step 3 is not enough for this, because it returns at most 50 rows.
+sha, do not write it again. The search in step 3 is not enough for this, because it returns
+at most 50 rows.
+
+When every page has been read, record where this run stopped. Get the full sha with
+`git log -1 --format=%H origin/HEAD`, and write it as the object of an `indexed_through`
+fact about the step 2 subject, with the same `memory_type` and `extractor` as in step 5.
+When an earlier one was found above, write it with
+`replaces` set to the previous `indexed_through` fact's claim id
+and `reason` `indexed up to a newer commit`, so that only one stays live. A later run then
+reads only the commits after it.
 
 **8. Report.** Tell the user the subject, how many facts were written, how many were already
 stored, and which ones replaced an older value. List the facts written, one per line. In a
-coding project, also give the number of components and decisions written, and name the
-components that were skipped and the stored ones whose folder no longer exists.
+coding project, also give the number of components written, how many commits were read
+and how many decisions were written, and name the components that were skipped and the
+stored ones whose folder no longer exists.
 
 Store only what the repository states. Do not record secrets, credentials, personal data or
 guesses; if something is unclear, leave it out.

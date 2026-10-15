@@ -49,14 +49,16 @@ The steps are in `plugin/commands/index.md`, and the README describes them for u
 - **Facts per component.** The subject is `component:<host>/<owner>/<repo>:<folder>`, built
   from the repository's own subject so that every clone and worktree spells it the same. Each
   component gets a one-sentence `purpose` and a `belongs_to` fact naming the repository.
-- **Decisions.** The command reads the last 100 commits on the default branch that are not
-  merges, with the files each one changed. Only merged history is read, because every clone
+- **Decisions.** The first run reads every commit on the default branch that is not a
+  merge, 100 at a time, with the files each one changed. It then records the newest commit
+  it read as an `indexed_through` fact, and later runs read only the commits after it. Only merged history is read, because every clone
   and worktree shares these facts. A decision is found again by its sha, so a second run does
   not write it twice. A commit whose message states a choice and its reason becomes a `decided`
   fact. The fact's `true_since` is the commit's date, and its text ends with the short sha.
   It is filed under the component that holds more than half of the commit's changed paths,
-  counting only paths inside components, or under the repository when no component does. At
-  most 40 decisions are written in one run, newest first.
+  counting only paths inside components, or under the repository when no component does.
+  Every such decision is written. The first version capped a run at 40 and read only the last
+  100 commits; the user removed both limits on 2026-10-15.
 - **Keeping it current.** A second run compares with what is stored, as the command already
   did: a fact already stored is not written again, and a changed purpose is written with
   `replaces`. A folder that was deleted or moved keeps its old facts. The report names it and
@@ -113,8 +115,6 @@ Each of these waits for real use to show that the facts are not reaching Claude.
   crowded for code facts.
 - **Running the code mode automatically** on a repository that has never been indexed.
 - **Pull request descriptions** as a source of decisions, read with `gh`.
-- **Older decisions.** Each run sees only the last 100 commits, so a decision older than that
-  is recorded only if an earlier run already saw it.
 
 ## 7. Open questions
 

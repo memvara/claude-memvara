@@ -631,14 +631,16 @@ files that git tracks, the command records two more kinds of fact:
   Tests, docs and CI folders are not recorded. At most 25 folders are
   recorded; when there are more, the ones with the most tracked files are
   kept.
-- **Decisions from recent commits.** The command reads the last 100 commit
-  messages on the default branch, and the files each commit changed. Only
-  merged history is read, because every clone and worktree shares these facts. A commit whose message states
+- **Decisions from the commit history.** The first run reads every commit
+  message on the default branch, 100 at a time, with the files each commit
+  changed. It then records the newest commit it read as an `indexed_through`
+  fact, and later runs read only the commits after it. Only merged history is
+  read, because every clone and worktree shares these facts. A commit whose message states
   a choice and the reason for it becomes a `decided` fact, dated by the
   commit and ending with its short sha. The fact is filed under the folder
   that holds more than half of the commit's changed source files, or under
-  the repository when no folder does. At most 40 decisions are written in
-  one run.
+  the repository when no folder does. Every such decision is written; there
+  is no limit.
 
 Nothing else is needed to use these facts. The hook that runs on every
 prompt already shows Claude the memories that best match your message, up to
