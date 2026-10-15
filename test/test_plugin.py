@@ -8762,6 +8762,65 @@ class IndexCommand(unittest.TestCase):
         for tool in ("memory_forget", "memory_end", "memory_add"):
             self.assertNotIn(f"{PLUGIN_TOOL_PREFIX}{tool},", allowed + ",")
 
+    def test_a_coding_project_gets_one_subject_per_main_folder(self) -> None:
+        """The code mode: what a folder is for, under a subject every clone spells the same.
+
+        The subject is built from the repository's own subject and the folder's path, so a
+        second run, or a run from another worktree, finds the facts the first one wrote.
+        """
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("`component:github.com/memvara/memvara:memvara/store`", body)
+        self.assertIn("`belongs_to`", body)
+        self.assertIn("at most 25", body)
+        allowed = _frontmatter(self.BODY)["allowed-tools"]
+        self.assertIn("Bash(git ls-files:*)", allowed)
+
+    def test_decisions_come_from_commit_messages_dated_by_the_commit(self) -> None:
+        """A decision is dated when it was made, not when the index ran.
+
+        And only paths inside a folder decide which folder a decision belongs to. Counting
+        tests, docs and the changelog left almost every decision on the project when the
+        notes for this were first written by hand.
+        """
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("git log -100 --skip=0 --no-merges --name-only", body)
+        self.assertIn("`decided`", body)
+        self.assertIn("`true_since`", body)
+        self.assertIn("counting only the changed paths inside a component", body)
+        # No cap: the user asked for every decision the history holds (2026-10-15).
+        self.assertIn("Write every qualifying decision. There is no limit.", body)
+
+    def test_decisions_come_from_the_default_branch_and_are_found_by_their_sha(self) -> None:
+        """Every worktree shares one project scope, so only merged history is true for all
+        of them; and a stored decision is found by its sha, because one search capped at 50
+        rows stops seeing them once a repository has more facts than that."""
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("--format='--%n%h %cs %s%n%b' <last>..origin/HEAD", body)
+        self.assertIn("with the commit's short sha as the query", body)
+        # The first real run, on 2026-10-15, skipped this search because it found no
+        # earlier run. A run that stopped before writing `indexed_through` leaves exactly
+        # that state behind, with its decisions already stored.
+        self.assertIn("Do this search on every run, the first one included", body)
+
+    def test_a_later_run_reads_only_the_commits_after_the_last_one(self) -> None:
+        """With no cap, the first run reads the whole history a page at a time, so a later
+        run must start where it stopped instead of reading everything again."""
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("`indexed_through`", body)
+        self.assertIn("`replaces` set to the previous `indexed_through` fact's claim id", body)
+        self.assertIn("stop when a page comes back empty", body)
+
+    def test_a_component_is_compared_only_with_its_own_rows(self) -> None:
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("Keep only the rows whose subject is exactly that component's", body)
+
+    def test_a_later_run_rereads_only_the_folders_that_changed(self) -> None:
+        """A purpose can change only when the folder's files do. The second real run, on
+        2026-10-15, re-checked no purpose at all; re-reading every folder on every run
+        would be the other mistake."""
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("git log --name-only --format= <last>..origin/HEAD", body)
+
 
 class _Home(unittest.TestCase):
     """A disposable HOME, so nothing here reads or writes the developer's own files."""

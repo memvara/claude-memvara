@@ -585,7 +585,7 @@ through `memvara_hooks.py`.
 
 | Command | What it does |
 |---|---|
-| `/memvara:index` | Explores the current repository and records 10 to 30 facts about it |
+| `/memvara:index` | Explores the current repository and records 10 to 30 facts about it. In a coding project it also records what each main folder is for and the decisions in recent commits |
 | `/memvara:setup` | Lists every feature switch; `/memvara:setup <feature> on\|off` sets one; `/memvara:setup verify-key` shows what query rewrite costs and, with `--yes`, checks the model key |
 
 ### `/memvara:index`
@@ -620,6 +620,41 @@ The predicates are `depends_on`, `version`, `deploys_to`, `endpoint`,
 pack does not declare those last four yet, so memvara stores them as
 unregistered predicates: every value is kept beside the others, and nothing
 replaces one automatically. That is why a changed value is replaced by id.
+
+In a coding project, which means a repository with a manifest and source
+files that git tracks, the command records two more kinds of fact:
+
+- **What each main folder is for.** Each main source folder gets its own
+  subject, `component:<host>/<owner>/<repo>:<folder>`, for example
+  `component:github.com/memvara/memvara:memvara/store`. It gets a
+  one-sentence `purpose` and a `belongs_to` fact that names the repository.
+  Tests, docs and CI folders are not recorded. At most 25 folders are
+  recorded; when there are more, the ones with the most tracked files are
+  kept. A later run re-reads only the folders whose files changed since the
+  last run.
+- **Decisions from the commit history.** The first run reads every commit
+  message on the default branch, 100 at a time, with the files each commit
+  changed. It then records the newest commit it read as an `indexed_through`
+  fact, and later runs read only the commits after it. Only merged history is
+  read, because every clone and worktree shares these facts. A commit whose message states
+  a choice and the reason for it becomes a `decided` fact, dated by the
+  commit and ending with its short sha. The fact is filed under the folder
+  that holds more than half of the commit's changed source files, or under
+  the repository when no folder does. Every such decision is written; there
+  is no limit.
+
+Nothing else is needed to use these facts. The hook that runs on every
+prompt already shows Claude the memories that best match your message, up to
+four, so a question about one part of the code can bring that part's facts
+in first.
+
+What leaves your machine is these short facts. The command reads the code
+and the commit messages inside your session, but it does not send source
+code or diffs to memvara.
+
+A folder that was deleted or moved keeps its old facts until you end them.
+The report names such folders and suggests `memory_end`, which asks you
+before it runs.
 
 ### The project each MCP call is scoped to
 
