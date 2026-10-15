@@ -162,3 +162,60 @@ class Gate(unittest.TestCase):
         summary = cm.summarize("A", rows)
         self.assertEqual((summary.right, summary.judged), (1.5, 5))
         self.assertEqual(summary.tokens_to_first, 350)
+
+
+class Setups(unittest.TestCase):
+
+    def settings(self, cmd):
+        return json.loads(cmd[cmd.index("--settings") + 1])
+
+    def test_a_and_c_turn_memvara_off_and_load_no_copy(self):
+        for arm in ("A", "C"):
+            cmd = cm.command("Why?", arm)
+            self.assertEqual(self.settings(cmd)["enabledPlugins"], {cm.MEMVARA: False})
+            self.assertNotIn("--plugin-dir", cmd)
+        self.assertNotIn("hooks", self.settings(cm.command("Why?", "A")))
+
+    def test_b_turns_the_installed_memvara_off_and_loads_the_copy(self):
+        cmd = cm.command("Why?", "B", pathlib.Path("/copy"))
+        self.assertEqual(self.settings(cmd)["enabledPlugins"], {cm.MEMVARA: False})
+        self.assertEqual(cmd[cmd.index("--plugin-dir") + 1], "/copy")
+
+    def test_c_adds_the_notes_hook_at_start_and_before_file_tools(self):
+        hooks = self.settings(cm.command("Why?", "C"))["hooks"]
+        self.assertEqual(hooks["PreToolUse"][0]["matcher"], "Read|Edit|MultiEdit|Write")
+        for event in ("SessionStart", "PreToolUse"):
+            self.assertTrue(hooks[event][0]["hooks"][0]["command"].endswith("code_memory.py hook"))
+
+    def test_every_setup_asks_the_question_and_may_change_nothing(self):
+        for arm in cm.ARMS:
+            cmd = cm.command("Why is it like this?", arm, pathlib.Path("/copy"))
+            self.assertEqual(cmd[:3], ["claude", "-p", "Why is it like this?"])
+            denied = cmd[cmd.index("--disallowedTools") + 1:]
+            for tool in ("Edit", "Write", "mcp__plugin_memvara_memvara__memory_remember",
+                         "mcp__plugin_memvara_memvara__memory_add"):
+                self.assertIn(tool, denied)
+
+    def test_the_copy_keeps_memvara_and_drops_capture(self):
+        # Read against this repository's real plugin, so a capture hook moved to another
+        # event upstream fails here rather than writing every run to the store.
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = cm.plugin_without_capture(pathlib.Path(tmp) / "plugin-b")
+            hooks = json.loads((copy / "hooks" / "hooks.json").read_text())["hooks"]
+        self.assertNotIn("Stop", hooks)
+        self.assertNotIn("capture", json.dumps(hooks))
+        self.assertIn("SessionStart", hooks)
+        self.assertIn("UserPromptSubmit", hooks)
+
+    def test_a_run_in_the_wrong_setup_is_named(self):
+        on = cm.Run(session="s", memvara="memvara@inline connected")
+        installed = cm.Run(session="s", memvara="memvara@claude-memvara connected")
+        off = cm.Run(session="s")
+        self.assertIsNotNone(cm.check_setup("A", on, set()))
+        self.assertIsNone(cm.check_setup("A", off, set()))
+        self.assertIsNotNone(cm.check_setup("B", installed, set()))
+        self.assertIsNotNone(cm.check_setup("B", off, set()))
+        self.assertIsNone(cm.check_setup("B", on, set()))
+        self.assertIsNotNone(cm.check_setup("C", off, set()))
+        self.assertIsNone(cm.check_setup("C", off, {"s"}))
+        self.assertIsNotNone(cm.check_setup("A", cm.Run(), set()))

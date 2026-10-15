@@ -212,3 +212,55 @@ def gate(a: Summary, c: Summary) -> tuple[bool, list[str]]:
         f"for C. The gate allows +20% at most.",
     ]
     return (fewer >= 0.30 or more >= 2) and extra <= 0.20, lines
+
+
+def command(question: str, arm: str, plugin_copy: Path | None = None) -> list[str]:
+    """The whole `claude -p` command for one question in one setup."""
+    settings: dict = {"enabledPlugins": {MEMVARA: False}}
+    extra: list[str] = []
+    if arm == "B":
+        extra = ["--plugin-dir", str(plugin_copy)]
+    elif arm == "C":
+        hook = [{"type": "command",
+                 "command": f"{shlex.quote(sys.executable)} "
+                            f"{shlex.quote(str(Path(__file__).resolve()))} hook"}]
+        settings["hooks"] = {
+            "SessionStart": [{"hooks": hook}],
+            "PreToolUse": [{"matcher": "Read|Edit|MultiEdit|Write", "hooks": hook}],
+        }
+    elif arm != "A":
+        raise ValueError(f"unknown setup {arm!r}")
+    # The question goes straight after -p: --allowedTools and --disallowedTools take every
+    # word that follows them, up to the next option.
+    return ["claude", "-p", question, "--model", MODEL,
+            "--output-format", "stream-json", "--verbose", "--no-session-persistence",
+            "--permission-mode", "default", "--max-budget-usd", BUDGET_USD,
+            "--settings", json.dumps(settings), *extra,
+            "--allowedTools", *READ_ONLY, "--disallowedTools", *DENIED]
+
+
+def plugin_without_capture(dest: Path) -> Path:
+    """A copy of this repository's plugin without its capture hook, for setup B."""
+    shutil.rmtree(dest, ignore_errors=True)
+    shutil.copytree(REPO / "plugin", dest, ignore=shutil.ignore_patterns("__pycache__"))
+    manifest = dest / "hooks" / "hooks.json"
+    hooks = json.loads(manifest.read_text())
+    hooks["hooks"].pop("Stop")
+    if "capture" in json.dumps(hooks["hooks"]):
+        raise SystemExit("The plugin still registers a capture hook, so setup B would "
+                         "write every run to the store. Remove it here first.")
+    manifest.write_text(json.dumps(hooks, indent=2))
+    return dest
+
+
+def check_setup(arm: str, run: Run, briefed: set[str]) -> str | None:
+    """Why a run did not get the setup it was meant to have, or None when it did."""
+    if not run.session:
+        return "the transcript has no init event"
+    if arm in ("A", "C") and run.memvara:
+        return f"memvara was loaded ({run.memvara})"
+    if arm == "B" and run.memvara != "memvara@inline connected":
+        return f"memvara did not load from the copy ({run.memvara or 'absent'})"
+    if arm == "C" and run.session not in briefed:
+        return "the notes hook did not add the brief"
+    return None
