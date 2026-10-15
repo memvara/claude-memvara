@@ -1,6 +1,8 @@
 # Code project memory for `/memvara:index`: design
 
-Status: draft for review, 2026-09-30. Nothing here is built yet.
+Status: draft for review, 2026-09-30. Updated 2026-10-15: the plugin, not memvara-code,
+owns the decisions taken from git history for now (section 7, Phase 0). Nothing here is
+built yet.
 
 ## 1. Summary
 
@@ -293,12 +295,13 @@ pull request follows the repositories' rules: open the PR, run `/code-review hig
 fix what it finds, run the gate again, and keep AI attribution out of commits and PR
 text. Each decision is recorded in Confluence under "Decisions" and in memvara.
 
-### Phase 0: measure first, and decide who owns "why"
+### Phase 0: measure first
 
-1. **Ownership decision.** memvara-code's `why` already explains symbols from commits
-   and pull requests. We need to decide whether the plugin should also store decisions
-   per component (this spec's proposal) or leave all git-derived "why" to memvara-code.
-   Record the decision in Confluence before Phase 1 starts.
+1. **Ownership decision, made 2026-10-15.** memvara-code's `why` explains symbols from
+   commits and pull requests, so the two could overlap. The plugin stores decisions per
+   component, as this spec proposes, because memvara-code is not ready. The question is
+   reopened when memvara-code is ready. The step that overlaps is the git-history step in
+   section 5.4.
 2. **Question set.** Take 10 real questions from past sessions in each of memvara and
    memvara-cloud. Before any run, write down for each question the files that answer it
    and the decision it depends on, if any.
@@ -385,7 +388,7 @@ that is off by default, in both core locations listed in section 6.
 | The map goes stale between runs | The brief shows its age in commits and suggests a re-run at 20 commits. |
 | A model-written purpose is wrong | Marked with `extractor` and a lower confidence. The next run replaces it. |
 | Cost of an index run | Incremental runs after the first, and the caps in 5.9. |
-| Duplicating memvara-code | Ownership decision in Phase 0. |
+| Duplicating memvara-code | The plugin owns git-derived decisions until memvara-code is ready (decided 2026-10-15). Only the git-history step in 5.4 overlaps, and that is the step to revisit then. |
 | Branches and worktrees disagree | Only the default branch is read. |
 | A host cannot carry context before a tool call | That host is not registered, and the README says so. |
 | The feature fails silently | The three outcomes in 5.8 are tested for every step. |
