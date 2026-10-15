@@ -271,3 +271,63 @@ class NotesHook(unittest.TestCase):
                 self.assertEqual(cm.run_hook(), 0)
             self.assertEqual(out.getvalue(), "")
         self.assertEqual((self.data / "hook.log").read_text().count('"error"'), 2)
+
+
+class RunCommand(unittest.TestCase):
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.data = pathlib.Path(tmp.name)
+        (self.data / "snapshots" / "repo").mkdir(parents=True)
+        (self.data / "questions.json").write_text(json.dumps([{
+            "id": "q1", "repo": "repo", "kind": "locate", "question": "Where?",
+            "expected_files": ["x.py"], "answer_key": "x.py"}]))
+        bin_dir = self.data / "bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "claude"
+        fake.write_text(f"""#!{sys.executable}
+import json, os
+open(os.environ["FAKE_CALLS"], "a").write("x")
+print(json.dumps({json.dumps(init(session="s1"))}))
+print(json.dumps({{"type": "assistant", "message": {{"id": "m1", "usage": {{}},
+    "content": [{{"type": "tool_use", "name": "Read",
+                  "input": {{"file_path": os.path.join(os.getcwd(), "x.py")}}}}]}}}}))
+print(json.dumps({json.dumps(result())}))
+""")
+        fake.chmod(0o755)
+        self.calls = self.data / "calls"
+        env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "FAKE_CALLS": str(self.calls)}
+        for patcher in (mock.patch.object(cm, "DATA", self.data), mock.patch.dict(os.environ, env)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_run_is_kept_once_and_not_repeated(self):
+        with redirect_stdout(io.StringIO()) as out:
+            cm.run(["A"], 1, None)
+            cm.run(["A"], 1, None)
+        self.assertTrue((self.data / "runs" / "A" / "q1-1.jsonl").exists())
+        self.assertEqual(self.calls.read_text(), "x")
+        self.assertIn("right file at call 1", out.getvalue())
+
+    def test_a_run_without_its_setup_is_set_aside_and_tried_again_next_time(self):
+        # The stand-in never calls the notes hook, so setup C never gets its brief.
+        with redirect_stdout(io.StringIO()) as out:
+            cm.run(["C"], 1, None)
+            cm.run(["C"], 1, None)
+        self.assertFalse((self.data / "runs" / "C" / "q1-1.jsonl").exists())
+        self.assertTrue((self.data / "runs" / "C" / "q1-1.invalid").exists())
+        self.assertEqual(self.calls.read_text(), "xx")
+        self.assertIn("not counted, because the notes hook did not add the brief", out.getvalue())
+
+
+class Verdicts(unittest.TestCase):
+
+    def test_every_label_must_be_graded_exactly_once(self):
+        self.assertEqual(cm.parse_verdicts("1 right fine\n2 wrong misses the reason\n", 2),
+                         {1: "right", 2: "wrong"})
+        # The form a real judge used on 2026-10-15, and two more it could use.
+        self.assertEqual(cm.parse_verdicts("1. right ok\n\n**2** - Partly half\n3) wrong no\n", 3),
+                         {1: "right", 2: "partly", 3: "wrong"})
+        with self.assertRaises(SystemExit):
+            cm.parse_verdicts("1 right fine\n", 2)

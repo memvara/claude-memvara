@@ -344,3 +344,164 @@ def briefed() -> set[str]:
     events = (json.loads(line) for line in log.read_text().splitlines() if line.strip())
     return {e["session"] for e in events
             if e.get("event") == "SessionStart" and e.get("injected")}
+
+
+def load_questions() -> list[dict]:
+    return json.loads((DATA / "questions.json").read_text())
+
+
+def run(arms: list[str], repeats: int, only: set[str] | None) -> None:
+    """Run every question in every setup, skipping the runs that already exist."""
+    copy = plugin_without_capture(DATA / "plugin-b") if "B" in arms else None
+    for question in load_questions():
+        if only and question["id"] not in only:
+            continue
+        root = DATA / "snapshots" / question["repo"]
+        for arm in arms:
+            for n in range(1, repeats + 1):
+                out = DATA / "runs" / arm / f"{question['id']}-{n}.jsonl"
+                if out.exists():
+                    continue
+                out.parent.mkdir(parents=True, exist_ok=True)
+                partial = out.with_suffix(".partial")
+                with open(partial, "w") as stdout, open(out.with_suffix(".err"), "w") as stderr:
+                    subprocess.run(command(question["question"], arm, copy), cwd=root,
+                                   stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+                result = parse_run(partial.read_text().splitlines(),
+                                   question["expected_files"], str(root))
+                problem = check_setup(arm, result, briefed())
+                name = f"{arm} {question['id']}-{n}"
+                if problem:
+                    partial.rename(out.with_suffix(".invalid"))
+                    print(f"{name}: not counted, because {problem}")
+                    continue
+                partial.rename(out)
+                print(f"{name}: {result.tool_calls} tool calls, right file at call "
+                      f"{result.calls_to_first}, ${result.cost_usd:.2f}")
+
+
+JUDGE = """You are grading answers to one question about a codebase. Grade each answer only
+against the answer key. Do not reward length, confidence or style.
+
+Question: {question}
+
+Answer key, which says what a right answer must contain: {key}
+
+Reply with one line for each answer and nothing else, in this form:
+<label> <right|partly|wrong> <one short reason>
+
+{answers}"""
+
+
+def parse_verdicts(reply: str, count: int) -> dict[int, str]:
+    """The judge's verdict for each label, or an error naming what it left out."""
+    # Judges decorate the label ("1.", "**1**", "1)"), so anything but a digit may surround it.
+    found = {int(m[1]): m[2].lower()
+             for m in re.finditer(r"^\D*?(\d+)\W+(right|partly|wrong)\b", reply, re.M | re.I)}
+    if sorted(found) != list(range(1, count + 1)):
+        raise SystemExit(f"The judge did not grade every answer exactly once:\n{reply}")
+    return found
+
+
+def judge() -> None:
+    """Grade each question's answers in one call, shuffled and without their setups."""
+    for question in load_questions():
+        out = DATA / "judge" / f"{question['id']}.json"
+        if out.exists():
+            continue
+        root = str(DATA / "snapshots" / question["repo"])
+        answers = [(f"{arm}/{path.stem}",
+                    parse_run(path.read_text().splitlines(), question["expected_files"],
+                              root).answer)
+                   for arm in ARMS
+                   for path in sorted((DATA / "runs" / arm).glob(f"{question['id']}-*.jsonl"))]
+        if not answers:
+            continue
+        random.Random(question["id"]).shuffle(answers)
+        shown = "\n\n".join(f'<answer label="{i}">\n{text}\n</answer>'
+                            for i, (_, text) in enumerate(answers, 1))
+        prompt = JUDGE.format(question=question["question"], key=question["answer_key"],
+                              answers=shown)
+        done = subprocess.run(
+            ["claude", "-p", prompt, "--model", MODEL, "--output-format", "json",
+             "--no-session-persistence", "--settings",
+             json.dumps({"enabledPlugins": {MEMVARA: False}}), "--tools", ""],
+            cwd=DATA, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True)
+        reply = json.loads(done.stdout)["result"]
+        verdicts = parse_verdicts(reply, len(answers))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({
+            "reply": reply,
+            "verdicts": {key: verdicts[i] for i, (key, _) in enumerate(answers, 1)},
+        }, indent=2))
+        print(f"{question['id']}: graded {len(answers)} answers")
+
+
+def head(repo: Path) -> str:
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+                          capture_output=True, text=True).stdout.strip() or "no commit"
+
+
+def report() -> str:
+    """The result table and the gate, written to report.md and returned."""
+    questions = {q["id"]: q for q in load_questions()}
+    verdicts: dict[str, str] = {}
+    for path in (DATA / "judge").glob("*.json"):
+        verdicts.update(json.loads(path.read_text())["verdicts"])
+    summaries = {}
+    for arm in ARMS:
+        rows = []
+        for path in sorted((DATA / "runs" / arm).glob("*.jsonl")):
+            question = questions[path.stem.rsplit("-", 1)[0]]
+            root = str(DATA / "snapshots" / question["repo"])
+            rows.append((question,
+                         parse_run(path.read_text().splitlines(),
+                                   question["expected_files"], root),
+                         verdicts.get(f"{arm}/{path.stem}")))
+        if rows:
+            summaries[arm] = summarize(arm, rows)
+    shas = ", ".join(f"{snapshot.name} at {head(snapshot)}"
+                     for snapshot in sorted((DATA / "snapshots").iterdir()))
+    out = ["# Phase 0 result", "", f"Model: {MODEL}. Snapshots: {shas}.", "",
+           "| Setup | Runs | Tool calls before a right file | Tokens before a right file | "
+           "Never read one | Tokens per run | Cost at list price | Decision questions right "
+           "| Judged |",
+           "|---|---|---|---|---|---|---|---|---|"]
+    for s in summaries.values():
+        out.append(f"| {s.arm} | {s.runs} | {s.calls_to_first:.1f} | "
+                   f"{s.tokens_to_first:,.0f} | {s.never_opened} | "
+                   f"{s.tokens:,.0f} | ${s.cost_usd:.2f} | {s.right:.1f} | {s.judged} |")
+    if "A" in summaries and "C" in summaries:
+        passed, lines = gate(summaries["A"], summaries["C"])
+        out += ["", f"Gate: {'passed' if passed else 'not passed'}.", ""]
+        out += [f"- {line}" for line in lines]
+    text = "\n".join(out) + "\n"
+    (DATA / "report.md").write_text(text)
+    return text
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    runner = sub.add_parser("run", help="run the questions")
+    runner.add_argument("--arms", default="A,B,C")
+    runner.add_argument("--repeats", type=int, default=2)
+    runner.add_argument("--only", default="", help="question ids, separated by commas")
+    sub.add_parser("judge", help="grade the answers without their setups")
+    sub.add_parser("report", help="print the result and the gate")
+    sub.add_parser("hook", help="setup C's notes hook, which Claude Code calls")
+    args = parser.parse_args(argv)
+    if args.command == "hook":
+        return run_hook()
+    if args.command == "run":
+        run(args.arms.split(","), args.repeats,
+            set(filter(None, args.only.split(","))) or None)
+    elif args.command == "judge":
+        judge()
+    else:
+        print(report(), end="")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
