@@ -332,6 +332,11 @@ text. Each decision is recorded in Confluence under "Decisions" and in memvara.
    costs no more than 20% more total tokens. If hand-written notes do not help, automated
    notes will not help either, and we stop here.
 
+   The decision bar is a share: 2 more right for every 10 decision questions. Only 4 real
+   "why" questions passed the selection rule (3 about memvara and 1 about memvara-cloud),
+   so with them the bar is 0.8 more right. Decided on 2026-10-15 when the question set was
+   approved.
+
 ### Phase 1: code mode in the index command (this repository)
 
 1. Detection step, as in 5.1, with the no-coding-project outcome in the report.

@@ -144,8 +144,8 @@ class ParseRun(unittest.TestCase):
 
 class Gate(unittest.TestCase):
 
-    def summary(self, calls, right, tokens):
-        return cm.Summary("X", 40, calls, 0, tokens, 0.0, right, 40)
+    def summary(self, calls, right, tokens, why=10):
+        return cm.Summary("X", 40, calls, 0, tokens, 0.0, right, 40, why_questions=why)
 
     def test_thirty_percent_fewer_calls_passes_within_a_fifth_more_tokens(self):
         self.assertTrue(cm.gate(self.summary(10, 3, 100), self.summary(7, 3, 120))[0])
@@ -156,6 +156,15 @@ class Gate(unittest.TestCase):
     def test_two_more_decision_questions_right_passes(self):
         self.assertTrue(cm.gate(self.summary(10, 3, 100), self.summary(10, 5, 100))[0])
         self.assertFalse(cm.gate(self.summary(10, 3, 100), self.summary(8, 4.5, 100))[0])
+
+    def test_the_decision_bar_is_two_for_every_ten_why_questions(self):
+        # Decided 2026-10-15: only four real why questions passed the selection rule, and the
+        # spec's "2 more of 10" is kept as a share, so four questions need +0.8.
+        self.assertTrue(cm.gate(self.summary(10, 1, 100, why=4), self.summary(10, 1.8, 100, why=4))[0])
+        self.assertFalse(cm.gate(self.summary(10, 1, 100, why=4), self.summary(10, 1.5, 100, why=4))[0])
+
+    def test_with_no_why_questions_the_decision_half_cannot_pass(self):
+        self.assertFalse(cm.gate(self.summary(10, 0, 100, why=0), self.summary(10, 0, 100, why=0))[0])
 
     def test_decisions_are_averaged_over_repeats_and_only_why_questions_count(self):
         why1, why2 = {"id": "q1", "kind": "why"}, {"id": "q2", "kind": "why"}
@@ -169,6 +178,7 @@ class Gate(unittest.TestCase):
         summary = cm.summarize("A", rows)
         self.assertEqual((summary.right, summary.judged), (1.5, 5))
         self.assertEqual(summary.tokens_to_first, 350)
+        self.assertEqual(summary.why_questions, 2)
 
     def test_runs_that_stopped_early_are_counted(self):
         q = {"id": "q1", "kind": "locate"}
