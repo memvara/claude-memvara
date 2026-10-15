@@ -8789,6 +8789,18 @@ class IndexCommand(unittest.TestCase):
         self.assertIn("counting only the changed paths inside a component", body)
         self.assertIn("at most 40 decisions", body)
 
+    def test_decisions_come_from_the_default_branch_and_are_found_by_their_sha(self) -> None:
+        """Every worktree shares one project scope, so only merged history is true for all
+        of them; and a stored decision is found by its sha, because one search capped at 50
+        rows stops seeing them once a repository has more facts than that."""
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("--format='--%n%h %cs %s%n%b' origin/HEAD", body)
+        self.assertIn("with the commit's short sha as the query", body)
+
+    def test_a_component_is_compared_only_with_its_own_rows(self) -> None:
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("Keep only the rows whose subject is exactly that component's", body)
+
 
 class _Home(unittest.TestCase):
     """A disposable HOME, so nothing here reads or writes the developer's own files."""

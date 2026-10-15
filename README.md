@@ -632,7 +632,8 @@ files that git tracks, the command records two more kinds of fact:
   recorded; when there are more, the ones with the most tracked files are
   kept.
 - **Decisions from recent commits.** The command reads the last 100 commit
-  messages and the files each commit changed. A commit whose message states
+  messages on the default branch, and the files each commit changed. Only
+  merged history is read, because every clone and worktree shares these facts. A commit whose message states
   a choice and the reason for it becomes a `decided` fact, dated by the
   commit and ending with its short sha. The fact is filed under the folder
   that holds more than half of the commit's changed source files, or under

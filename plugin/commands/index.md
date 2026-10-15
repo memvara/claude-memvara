@@ -97,8 +97,10 @@ longer than 128 characters, and name it in the report.
 
 First call `memory_search` with the query `component:` followed by the step 2 subject
 without `project:`, and `k` of 50, to see which components are already stored. Then, for
-each component, call `memory_search` with its subject as the query and compare its facts as
-in step 5 before writing these, with the same `memory_type` and `extractor` as in step 5:
+each component, call `memory_search` with its subject as the query and `k` of 50.
+Keep only the rows whose subject is exactly that component's, because a search for one
+folder also finds folders with similar names. Compare with those rows as in step 5 before writing these,
+with the same `memory_type` and `extractor` as in step 5:
 
 - `purpose`: what the folder is for, in one sentence, from its README, docstrings and entry
   points;
@@ -110,8 +112,13 @@ and suggest ending its facts with `memory_end`, which asks the user before it ru
 **7. Record the decisions in recent commits.** Run:
 
 ```bash
-git log -100 --no-merges --name-only --format='--%n%h %cs %s%n%b'
+git log -100 --no-merges --name-only --format='--%n%h %cs %s%n%b' origin/HEAD
 ```
+
+This reads the default branch, because every clone and worktree of the repository shares
+these facts, and only merged history is true for all of them. If `origin/HEAD` does not
+exist, run the same command without it, which reads the current branch, and say so in the
+report.
 
 Keep a commit only when its message states a choice and the reason for it. Skip commits
 with no body, dependency bumps, releases and reverts. For each kept commit, write one fact
@@ -129,7 +136,10 @@ with `memory_remember`, with the same `memory_type` and `extractor` as in step 5
   component holds more than half, use the subject from step 2.
 
 Write at most 40 decisions in one run, newest first, and say in the report how many were
-left out. A decision already stored for that subject is not written again.
+left out. Before writing a decision, call `memory_search`
+with the commit's short sha as the query. If a stored `decided` fact already ends with that
+sha, do not write it again. The
+search in step 3 is not enough for this, because it returns at most 50 rows.
 
 **8. Report.** Tell the user the subject, how many facts were written, how many were already
 stored, and which ones replaced an older value. List the facts written, one per line. In a

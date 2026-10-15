@@ -49,8 +49,10 @@ The steps are in `plugin/commands/index.md`, and the README describes them for u
 - **Facts per component.** The subject is `component:<host>/<owner>/<repo>:<folder>`, built
   from the repository's own subject so that every clone and worktree spells it the same. Each
   component gets a one-sentence `purpose` and a `belongs_to` fact naming the repository.
-- **Decisions.** The command reads the last 100 commits that are not merges, with the files
-  each one changed. A commit whose message states a choice and its reason becomes a `decided`
+- **Decisions.** The command reads the last 100 commits on the default branch that are not
+  merges, with the files each one changed. Only merged history is read, because every clone
+  and worktree shares these facts. A decision is found again by its sha, so a second run does
+  not write it twice. A commit whose message states a choice and its reason becomes a `decided`
   fact. The fact's `true_since` is the commit's date, and its text ends with the short sha.
   It is filed under the component that holds more than half of the commit's changed paths,
   counting only paths inside components, or under the repository when no component does. At
