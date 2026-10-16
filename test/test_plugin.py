@@ -8891,6 +8891,10 @@ class IndexCommand(unittest.TestCase):
         for tag in found.values():
             self.assertRegex(tag, r"^[0-9a-f]{8}$")
         self.assertIn("[exact ", self.BODY.read_text(encoding="utf-8"))
+        # Review finding: once a partner is deleted, the remaining file is written without
+        # its tag, so its tagged fact has to be ended or it stays live beside the new one.
+        self.assertIn("also suggest ending the tagged facts of the files that remain",
+                      self.BODY.read_text(encoding="utf-8"))
 
     def test_the_collision_check_finds_every_pair_the_core_fold_merges(self) -> None:
         """Checked against its referent, the library's own `typed_entity_key`, and not

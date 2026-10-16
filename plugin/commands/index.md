@@ -181,6 +181,8 @@ For each path it prints, end the file's subject with ` [exact <tag>]`, using the
 characters printed after the path, for example
 `file:github.com/memvara/memvara:plugin/.mcp.json [exact 1a2b3c4d]`. The tag keeps those
 files apart, and it is the same on every run, so a later run writes to the same subject.
+When a deleted file was one of a tagged group, also suggest ending the tagged facts of the files that remain,
+because once a file has no partner left its next fact is written without the tag.
 
 If you hand the files to subagents to go faster, run at most 3 at a time, because every call
 from this credential counts against one shared rate limit,
