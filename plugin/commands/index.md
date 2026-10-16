@@ -79,8 +79,8 @@ Compare each fact with the rows from step 3 before writing it:
   first: ending the old fact separately loses the link between the two.
 - **A new fact:** write it.
 
-If memvara refuses a write because of its rate limit, retry it after a short wait, and do not
-move on to the next fact until it is stored. After five refusals in a row, stop the run and
+If memvara refuses a call because of its rate limit, wait as long as the refusal says, retry
+it, and do not move on to the next fact until it is stored. After five refusals in a row, stop the run and
 say in the report which facts were not stored; a later run picks them up, because it looks
 each one up before writing.
 
@@ -106,15 +106,19 @@ prefix, then `:` and the folder's path from the repository root. For example,
 longer than 128 characters, and name it in the report.
 
 First call `memory_search` with the query `component:` followed by the step 2 subject
-without `project:`, and `k` of 50, to see which components are already stored. Then, for
-each component, call `memory_search` with its subject as the query and `k` of 50.
-Keep only the rows whose subject is exactly that component's, because a search for one
-folder also finds folders with similar names. Compare with those rows as in step 5 before writing these,
-with the same `memory_type` and `extractor` as in step 5:
+without `project:`, and `k` of 50, to see which components are already stored; it is used
+only to name, in the report, stored components whose folder no longer exists. Then write
+these for each component, with the same `memory_type` and `extractor` as in step 5, and
+without searching for the component first:
 
 - `purpose`: what the folder is for, in one sentence, from its README, docstrings and entry
   points;
 - `belongs_to`: the subject from step 2.
+
+A `purpose` keeps one value per subject: writing a new one ends the old one, and writing the
+same text again stores nothing, so a folder or file can never hold two purposes. A search
+can also miss a stored row,
+so a search before each write would cost rate limit and protect nothing.
 
 On a later run, when step 7 finds an `indexed_through` fact, re-read only the components whose
 files changed since that commit, because a purpose can change only when its folder does:
@@ -131,31 +135,37 @@ and suggest ending its facts with `memory_end`, which asks the user before it ru
 **The architecture.** Write between 3 and 8 `architecture` facts about the step 2 subject,
 each one sentence on how the main parts fit together: where requests or commands come in,
 which components they pass through, where data is kept, and which outside services are
-called. Base them on the components above and their entry points. First call
-`memory_search` with the query `architecture` followed by the step 2 subject, keep the rows
-with exactly that subject and predicate, and compare as in step 5, so that a sentence that
-changed replaces the old one by id.
+called. Base them on the components above and their entry points. Write them only when the
+repository has none yet: first call `memory_search` with the query `architecture` followed by
+the step 2 subject, and if any are found, leave them and say so in the report, because
+`architecture` keeps every value it is given and a second set would sit beside the first. To
+bring a stored architecture up to date, end its sentences with `memory_end`, which asks the
+user, and run the command again.
 
 **Every file.** Write one `purpose` fact for every file that git tracks,
-except lock files, generated files and binary files such as images, fonts and archives. Its subject is `file:`, then the step 2 subject without
-`project:`, then `:` and the file's path, for example
-`file:github.com/memvara/memvara:memvara/core.py`. The object says in one sentence what the
-file is for, from its first lines, docstring or exports; read only as much of the file as
-that needs. Skip a file whose subject would be longer than 128 characters, and name it in
-the report. Before writing, call `memory_search` with the file's subject as the query, keep
-only the rows whose subject is exactly that file's, and compare as in step 5.
-Do this search for every file on every run, even when an earlier search found no file facts:
-a run that stopped part way, or another run at the same time, leaves some files stored.
+except lock files, generated files and binary files such as images, fonts and archives. Its
+subject is `file:`, then the step 2 subject without `project:`, then `:` and the file's path,
+for example `file:github.com/memvara/memvara:memvara/core.py`. The object says in one
+sentence what the file is for, from its first lines, docstring or exports; read only as much
+of the file as that needs. Skip a file whose subject would be longer than 128 characters,
+and name it in the report. Write each one without searching for it first, for the reason
+given for components above.
 
-If you hand the files to subagents to go faster, give each subagent its own folders, so that
-no file goes to two of them, and give each one these rules in full: the subject format, one
-sentence per file, the files to skip, and the search before every write.
+If you hand the files to subagents to go faster, run at most 3 at a time, because every call
+from this credential counts against one shared rate limit,
+and give each subagent its own folders, so that no file goes to two of them. Give each one
+these rules in full: the subject format, one sentence per file, the files to skip, and the
+rule on rate-limit refusals in step 5.
+Wait for every subagent to finish before you end your turn: permission to write lasts only
+while this command runs, and a subagent still working after that has every write refused.
+So start each subagent in the foreground, not in the background, because waiting for a
+background subagent means ending your turn.
 
 On a later run, re-read only the files changed since `<last>`, from the same `git log`
-output as the components, and any new file. Name the files that were deleted in the report,
-and suggest ending their facts with `memory_end`. Do the full pass anyway when a search for
-`file:` followed by the step 2 subject without `project:` finds no file facts, because then
-the repository was indexed before files were recorded. Finish the files before step 7: its
+output as the components, and any new file. But when a search for `file:` followed by the
+step 2 subject without `project:` finds no file facts, read every file, because the
+repository was indexed before files were recorded. Name the files that were deleted in the
+report, and suggest ending their facts with `memory_end`. Finish the files before step 7: its
 `indexed_through` marker is what tells a later run that every file was read.
 
 **7. Record the decisions in the commit history.** Decisions are read from the default

@@ -616,10 +616,10 @@ does not cover ending or retiring anything.
 
 The predicates are `depends_on`, `version`, `deploys_to`, `endpoint`,
 `owner` and `known_defect` from the engineering predicate pack, plus
-`purpose`, `entry_point`, `runs_with` and `convention`. The engineering
-pack does not declare those last four yet, so memvara stores them as
-unregistered predicates: every value is kept beside the others, and nothing
-replaces one automatically. That is why a changed value is replaced by id.
+`purpose`, `entry_point`, `runs_with` and `convention`, which the pack
+declares too. A `purpose` holds one value per subject, so a new purpose ends
+the old one. The others hold many values side by side, and nothing replaces
+one of them automatically. That is why a changed value is replaced by id.
 
 In a coding project, which means a repository with a manifest and source
 files that git tracks, the command records four more kinds of fact:
@@ -640,8 +640,9 @@ files that git tracks, the command records four more kinds of fact:
   lock files, generated files and binary files, each under its own subject,
   `file:<host>/<owner>/<repo>:<path>`. The first run reads the top of every
   file, so on a large repository it takes a while and costs more than later
-  runs, which re-read only the files that changed. Each file is looked up
-  before its fact is written, on every run, so a file never gets two facts.
+  runs, which re-read only the files that changed. A file never gets two
+  facts: the store keeps one `purpose` per subject, so a new sentence
+  replaces the old one, and the same sentence again stores nothing.
 - **Decisions from the commit history.** The command reads at most the newest
   100 commits on the default branch: on the first run, the last 100 of the
   whole history, and after that, the last 100 of the commits since the
