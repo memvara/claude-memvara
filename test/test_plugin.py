@@ -8783,7 +8783,7 @@ class IndexCommand(unittest.TestCase):
         notes for this were first written by hand.
         """
         body = self.BODY.read_text(encoding="utf-8")
-        self.assertIn("git log -100 --skip=0 --no-merges --name-only", body)
+        self.assertIn("git log --no-walk --name-only", body)
         self.assertIn("`decided`", body)
         self.assertIn("`true_since`", body)
         self.assertIn("counting only the changed paths inside a component", body)
@@ -8795,7 +8795,7 @@ class IndexCommand(unittest.TestCase):
         of them; and a stored decision is found by its sha, because one search capped at 50
         rows stops seeing them once a repository has more facts than that."""
         body = self.BODY.read_text(encoding="utf-8")
-        self.assertIn("--format='--%n%h %cs %s%n%b' <last>..origin/HEAD", body)
+        self.assertIn("git log --reverse --no-merges --format=%h <last>..origin/HEAD", body)
         self.assertIn("with the commit's short sha as the query", body)
         # The first real run, on 2026-10-15, skipped this search because it found no
         # earlier run. A run that stopped before writing `indexed_through` leaves exactly
@@ -8808,7 +8808,16 @@ class IndexCommand(unittest.TestCase):
         body = self.BODY.read_text(encoding="utf-8")
         self.assertIn("`indexed_through`", body)
         self.assertIn("`replaces` set to the previous `indexed_through` fact's claim id", body)
-        self.assertIn("stop when a page comes back empty", body)
+
+    def test_a_long_history_is_read_in_small_groups_and_progress_is_kept(self) -> None:
+        """The first real run on memvara-cloud, on 2026-10-16, read a page of 100 commits
+        through `| head -400`, saw about 16 of 579 commits, and stopped without the marker,
+        so every later run would have stopped at the same place. Groups of 10 fit in one
+        tool output, and the marker moves forward as the run goes, oldest commits first."""
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("10 at a time, oldest first", body)
+        self.assertIn("Do not shorten this output", body)
+        self.assertIn("After every 5 groups", body)
 
     def test_a_component_is_compared_only_with_its_own_rows(self) -> None:
         body = self.BODY.read_text(encoding="utf-8")

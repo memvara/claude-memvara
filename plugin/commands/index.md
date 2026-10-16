@@ -128,16 +128,27 @@ followed by the step 2 subject, and keep the row whose subject is the step 2 sub
 predicate is `indexed_through`. Its object is the last commit an earlier run read; call it
 `<last>`.
 
-Then read the commits after it, 100 at a time, newest first:
+Then list the commits after it, oldest first:
 
 ```bash
-git log -100 --skip=0 --no-merges --name-only --format='--%n%h %cs %s%n%b' <last>..origin/HEAD
+git log --reverse --no-merges --format=%h <last>..origin/HEAD
 ```
 
-On the first run there is no `<last>`, so leave out `<last>..` and read the whole history.
+On the first run there is no `<last>`, so leave out `<last>..` and list the whole history.
 If git cannot find `<last>`, because the history was rewritten, do the same: the search by
-sha below keeps a decision from being written twice. Raise `--skip` by 100 for each next
-page, and stop when a page comes back empty.
+sha below keeps a decision from being written twice. If a very long list comes back cut
+off, work through as much of it as you have; the next run continues after it.
+
+Read the listed commits 10 at a time, oldest first, with their messages and the files they
+changed, naming the commits of each group:
+
+```bash
+git log --no-walk --name-only --format='--%n%h %cs %s%n%b' <sha> <sha> ...
+```
+
+Do not shorten this output with `head` or any other command, because a commit left unread
+is a decision lost. If a group's output comes back cut off, read the same commits again in
+smaller groups. Read every listed commit before you report.
 
 Keep a commit only when its message states a choice and the reason for it. Skip commits
 with no body, dependency bumps, releases and reverts.
@@ -163,13 +174,15 @@ at most 50 rows.
 Do this search on every run, the first one included: a run that stopped before writing
 `indexed_through` leaves its decisions stored without the marker that says so.
 
-When every page has been read, record where this run stopped. Get the full sha with
-`git log -1 --format=%H origin/HEAD`, and write it as the object of an `indexed_through`
-fact about the step 2 subject, with the same `memory_type` and `extractor` as in step 5.
-When an earlier one was found above, write it with
+**Keep your place.** After every 5 groups (50 commits), and once more after the last group,
+record the newest commit read so far: the last listed commit you have read. Get its full sha
+with `git log -1 --format=%H <sha>`, and write it as the object of an `indexed_through` fact
+about the step 2 subject, with the same `memory_type` and `extractor` as in step 5. When an
+earlier one exists, found above or written earlier in this run, write it with
 `replaces` set to the previous `indexed_through` fact's claim id
 and `reason` `indexed up to a newer commit`, so that only one stays live. A later run then
-reads only the commits after it.
+reads only the commits after it, and a run that stops early, at its budget or for any other
+reason, has not lost its place.
 
 **8. Report.** Tell the user the subject, how many facts were written, how many were already
 stored, and which ones replaced an older value. List the facts written, one per line. In a
