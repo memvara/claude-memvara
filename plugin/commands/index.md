@@ -70,13 +70,19 @@ lets memvara tell a changed value from a new one.
 
 Compare each fact with the rows from step 3 before writing it:
 
-- **The same fact is already stored:** do not write it.
+- **The same fact is already stored:** do not write it, even if you would word it differently
+  today. Rewording a value that is still right ends a true fact and adds churn.
 - **A stored fact now has a different value** (a new version, a changed test command):
   write the new value with `replaces` set to the stored fact's claim id, and `reason`
   saying what changed, for example `moved from Jest to Vitest`. That ends the old fact
   and records that this one replaced it. Do not call `memory_end` or `memory_forget`
   first: ending the old fact separately loses the link between the two.
 - **A new fact:** write it.
+
+If memvara refuses a write because of its rate limit, retry it after a short wait, and do not
+move on to the next fact until it is stored. After five refusals in a row, stop the run and
+say in the report which facts were not stored; a later run picks them up, because it looks
+each one up before writing.
 
 **6. In a coding project, record its architecture and what each folder and file is for.**
 Skip steps 6 and 7, and say so in the report, unless the repository has a manifest from
@@ -138,6 +144,12 @@ file is for, from its first lines, docstring or exports; read only as much of th
 that needs. Skip a file whose subject would be longer than 128 characters, and name it in
 the report. Before writing, call `memory_search` with the file's subject as the query, keep
 only the rows whose subject is exactly that file's, and compare as in step 5.
+Do this search for every file on every run, even when an earlier search found no file facts:
+a run that stopped part way, or another run at the same time, leaves some files stored.
+
+If you hand the files to subagents to go faster, give each subagent its own folders, so that
+no file goes to two of them, and give each one these rules in full: the subject format, one
+sentence per file, the files to skip, and the search before every write.
 
 On a later run, re-read only the files changed since `<last>`, from the same `git log`
 output as the components, and any new file. Name the files that were deleted in the report,

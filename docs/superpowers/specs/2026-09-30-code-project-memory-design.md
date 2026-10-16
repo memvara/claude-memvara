@@ -82,7 +82,12 @@ The steps are in `plugin/commands/index.md`, and the README describes them for u
   `purpose` sentence under its own subject, `file:<host>/<owner>/<repo>:<path>`, short
   enough for the per-prompt recall, which clips a line at 320 characters. The files are
   written before the commit marker, so a marker means every file was read, and a later run
-  re-reads only the files that changed since it.
+  re-reads only the files that changed since it. Since 0.5.3 every file is looked up before
+  it is written on every run, subagents that share the work get separate folders and the same
+  rules, a write refused by the rate limit is retried, and a stored value that is still
+  right is not reworded. The first 0.5.2 run on memvara-cloud broke the first two of those
+  and reworded 5 folder purposes; it left no live duplicate only because the store ignores
+  an identical write.
 - **Privacy.** The command reads code and commit messages inside the user's session. Only the
   short facts are sent to memvara, never source code or diffs.
 
