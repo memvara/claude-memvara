@@ -151,6 +151,37 @@ of the file as that needs. Skip a file whose subject would be longer than 128 ch
 and name it in the report. Write each one without searching for it first, for the reason
 given for components above.
 
+Some different paths become one subject, because memvara compares subjects without case,
+accents, punctuation or company-form words such as `co` and `spa`: `plugin/.mcp.json` and
+`plugin/mcp.json`, `__init__.py` and `init.py`, `src/spa/index.ts` and `src/index.ts`. Only
+one fact of each such group would stay live. Before writing file facts, list those paths:
+
+```bash
+git ls-files | python3 -c '
+import collections, hashlib, re, sys, unicodedata
+LEGAL = {"inc", "incorporated", "corp", "corporation", "co", "company", "ltd", "limited",
+         "llc", "llp", "lp", "plc", "gmbh", "ag", "sa", "sas", "srl", "spa", "bv", "nv",
+         "oy", "ab", "as", "aps", "pty", "pte", "kk", "kg", "sarl"}
+def fold(path):
+    text = unicodedata.normalize("NFKD", path).casefold()
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub("[\u0027\u2018\u2019\u02bc\u00b4\u0060]", "", text)
+    return " ".join(w for w in re.findall(r"[^\W_]+", text) if w not in LEGAL)
+groups = collections.defaultdict(list)
+for path in sys.stdin.read().splitlines():
+    groups[fold(path)].append(path)
+for paths in groups.values():
+    if len(paths) > 1:
+        for path in paths:
+            print(path, hashlib.sha1(path.encode()).hexdigest()[:8])
+'
+```
+
+For each path it prints, end the file's subject with ` [exact <tag>]`, using the eight
+characters printed after the path, for example
+`file:github.com/memvara/memvara:plugin/.mcp.json [exact 1a2b3c4d]`. The tag keeps those
+files apart, and it is the same on every run, so a later run writes to the same subject.
+
 If you hand the files to subagents to go faster, run at most 3 at a time, because every call
 from this credential counts against one shared rate limit,
 and give each subagent its own folders, so that no file goes to two of them. Give each one

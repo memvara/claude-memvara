@@ -5404,7 +5404,7 @@ class Version(unittest.TestCase):
     would silently cover less than the caller believes.
     """
 
-    VERSION = "0.5.4"
+    VERSION = "0.5.5"
     DECLARED = {"plugin/.claude-plugin/plugin.json"}
 
     @classmethod
@@ -8865,6 +8865,58 @@ class IndexCommand(unittest.TestCase):
         self.assertIn("start each subagent in the foreground", body)
         self.assertIn("run at most 3 at a time", body)
         self.assertIn("a search before each write would cost rate limit and protect nothing", body)
+
+    _SCRIPT_START = "git ls-files | python3 -c '"
+
+    def _collisions(self, paths: list) -> dict:
+        """Run the command's own collision check on `paths`: path -> the tag it prints."""
+        body = self.BODY.read_text(encoding="utf-8")
+        start = body.index(self._SCRIPT_START) + len(self._SCRIPT_START)
+        script = body[start:body.index("\n'", start)]
+        out = subprocess.run([sys.executable, "-c", script], input="\n".join(paths),
+                             capture_output=True, text=True, check=True).stdout
+        return dict(line.split(" ", 1) for line in out.splitlines())
+
+    def test_paths_that_fold_to_one_subject_get_a_tag_of_their_own(self) -> None:
+        """memvara compares subjects without case, accents, punctuation or company-form
+        words, so on 2026-10-16 `plugin/.mcp.json` and `plugin/mcp.json` became one subject,
+        as did `memvara/server/__init__.py` and `memvara/server/init.py`, and only one fact
+        of each pair stayed live. The command finds such paths and tags their subjects."""
+        paths = ["plugin/.mcp.json", "plugin/mcp.json", "memvara/server/__init__.py",
+                 "memvara/server/init.py", "src/spa/index.ts", "src/index.ts", "README.md",
+                 "readme.md", "docs/guide.md", "memvara/core.py"]
+        found = self._collisions(paths)
+        self.assertEqual(set(found), set(paths[:8]))
+        self.assertEqual(len(set(found.values())), 8)
+        for tag in found.values():
+            self.assertRegex(tag, r"^[0-9a-f]{8}$")
+        self.assertIn("[exact ", self.BODY.read_text(encoding="utf-8"))
+
+    def test_the_collision_check_finds_every_pair_the_core_fold_merges(self) -> None:
+        """Checked against its referent, the library's own `typed_entity_key`, and not
+        against a copy of itself. The check may tag a pair the core keeps apart (`c++` next
+        to `c`), which costs one tag; it must never miss a pair the core merges."""
+        library = os.environ.get("MEMVARA_LIBRARY")
+        if not library:
+            self.skipTest("MEMVARA_LIBRARY is not set, so the core's fold cannot be loaded")
+        spec = importlib.util.spec_from_file_location(
+            "core_entities", os.path.join(library, "memvara", "entities.py"))
+        core = importlib.util.module_from_spec(spec)
+        sys.modules["core_entities"] = core
+        spec.loader.exec_module(core)
+        paths = ["plugin/.mcp.json", "plugin/mcp.json", "a/__init__.py", "a/init.py",
+                 "src/spa/index.ts", "src/index.ts", "src/co/x.py", "src/x.py",
+                 "docs/Café.md", "docs/cafe.md", "src/naïve.py", "src/naive.py",
+                 "src/O'Reilly.py", "src/oreilly.py",
+                 "lib/c++/x.h", "lib/c/x.h", "README.md", "readme.md", "src/a-b.py",
+                 "src/a_b.py", "src/ab.py", "tests/the/x.py", "tests/x.py", "keep/me.py"]
+        merged: dict = {}
+        for path in paths:
+            merged.setdefault(core.typed_entity_key(f"file:github.com/acme/app:{path}"), set()).add(path)
+        found = set(self._collisions(paths))
+        for group in merged.values():
+            if len(group) > 1:
+                self.assertLessEqual(group, found, f"the core merges {sorted(group)}")
 
     def test_only_the_last_100_commits_are_read(self) -> None:
         """Decided 2026-10-16: a run reads at most the newest 100 commits after the marker,

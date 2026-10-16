@@ -642,7 +642,12 @@ files that git tracks, the command records four more kinds of fact:
   file, so on a large repository it takes a while and costs more than later
   runs, which re-read only the files that changed. A file never gets two
   facts: the store keeps one `purpose` per subject, so a new sentence
-  replaces the old one, and the same sentence again stores nothing.
+  replaces the old one, and the same sentence again stores nothing. memvara
+  compares subjects without case, accents, punctuation or company-form words
+  such as `co`, so a few different paths would share one subject
+  (`plugin/.mcp.json` and `plugin/mcp.json`); the command finds those and
+  ends their subjects with a short tag, `[exact 1a2b3c4d]`, that keeps them
+  apart.
 - **Decisions from the commit history.** The command reads at most the newest
   100 commits on the default branch: on the first run, the last 100 of the
   whole history, and after that, the last 100 of the commits since the
