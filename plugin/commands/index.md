@@ -79,8 +79,8 @@ Compare each fact with the rows from step 3 before writing it:
   first: ending the old fact separately loses the link between the two.
 - **A new fact:** write it.
 
-If memvara refuses a write because of its rate limit, retry it after a short wait, and do not
-move on to the next fact until it is stored. After five refusals in a row, stop the run and
+If memvara refuses a call because of its rate limit, wait as long as the refusal says, retry
+it, and do not move on to the next fact until it is stored. After five refusals in a row, stop the run and
 say in the report which facts were not stored; a later run picks them up, because it looks
 each one up before writing.
 
@@ -137,25 +137,32 @@ with exactly that subject and predicate, and compare as in step 5, so that a sen
 changed replaces the old one by id.
 
 **Every file.** Write one `purpose` fact for every file that git tracks,
-except lock files, generated files and binary files such as images, fonts and archives. Its subject is `file:`, then the step 2 subject without
-`project:`, then `:` and the file's path, for example
-`file:github.com/memvara/memvara:memvara/core.py`. The object says in one sentence what the
-file is for, from its first lines, docstring or exports; read only as much of the file as
-that needs. Skip a file whose subject would be longer than 128 characters, and name it in
-the report. Before writing, call `memory_search` with the file's subject as the query, keep
-only the rows whose subject is exactly that file's, and compare as in step 5.
-Do this search for every file on every run, even when an earlier search found no file facts:
-a run that stopped part way, or another run at the same time, leaves some files stored.
+except lock files, generated files and binary files such as images, fonts and archives. Its
+subject is `file:`, then the step 2 subject without `project:`, then `:` and the file's path,
+for example `file:github.com/memvara/memvara:memvara/core.py`. The object says in one
+sentence what the file is for, from its first lines, docstring or exports; read only as much
+of the file as that needs. Skip a file whose subject would be longer than 128 characters,
+and name it in the report.
 
-If you hand the files to subagents to go faster, give each subagent its own folders, so that
-no file goes to two of them, and give each one these rules in full: the subject format, one
-sentence per file, the files to skip, and the search before every write.
+Before writing any file fact, call `memory_search` once with the query `file:` followed by
+the step 2 subject without `project:`. If it finds no file facts, every file is new: write
+each one without a search of its own, and read every file even on a later run, because the
+repository was indexed before files were recorded. Otherwise search before every file: call
+`memory_search` with the file's subject as the query, keep only the rows whose subject is
+exactly that file's, and compare as in step 5, because an earlier run that stopped part way
+left some files stored.
+
+If you hand the files to subagents to go faster, run at most 3 at a time, because every call
+from this credential counts against one shared rate limit,
+and give each subagent its own folders, so that no file goes to two of them. Give each one
+these rules in full: the subject format, one sentence per file, the files to skip, whether to
+search before every write, and the rule on rate-limit refusals in step 5.
+Wait for every subagent to finish before you end your turn: permission to write lasts only
+while this command runs, and a subagent still working after that has every write refused.
 
 On a later run, re-read only the files changed since `<last>`, from the same `git log`
 output as the components, and any new file. Name the files that were deleted in the report,
-and suggest ending their facts with `memory_end`. Do the full pass anyway when a search for
-`file:` followed by the step 2 subject without `project:` finds no file facts, because then
-the repository was indexed before files were recorded. Finish the files before step 7: its
+and suggest ending their facts with `memory_end`. Finish the files before step 7: its
 `indexed_through` marker is what tells a later run that every file was read.
 
 **7. Record the decisions in the commit history.** Decisions are read from the default

@@ -5404,7 +5404,7 @@ class Version(unittest.TestCase):
     would silently cover less than the caller believes.
     """
 
-    VERSION = "0.5.3"
+    VERSION = "0.5.4"
     DECLARED = {"plugin/.claude-plugin/plugin.json"}
 
     @classmethod
@@ -8847,12 +8847,22 @@ class IndexCommand(unittest.TestCase):
         duplicate only because the store ignores an identical write. These rules close each
         way a second fact for one file, or a churned one, could appear."""
         body = self.BODY.read_text(encoding="utf-8")
-        self.assertIn("Do this search for every file on every run", body)
+        self.assertIn("Otherwise search before every file", body)
         self.assertIn("give each subagent its own folders", body)
-        self.assertIn("retry it after a short wait", body)
+        self.assertIn("wait as long as the refusal says", body)
         # Review finding: a retry with no end spends the whole budget on one write.
         self.assertIn("After five refusals in a row, stop the run", body)
         self.assertIn("even if you would word it differently", body)
+
+    def test_the_file_pass_fits_the_permission_and_the_rate_limit(self) -> None:
+        """The 0.5.3 run on memvara, on 2026-10-16, ended its turn while 14 background
+        subagents were still writing: the command's permission to write had lapsed, so 126
+        writes were refused, and its searches before every file, at 65 units each against
+        a 6,000-unit window, kept the credential at its rate limit. It stored 11 facts."""
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("Wait for every subagent to finish before you end your turn", body)
+        self.assertIn("run at most 3 at a time", body)
+        self.assertIn("finds no file facts, every file is new", body)
 
     def test_only_the_last_100_commits_are_read(self) -> None:
         """Decided 2026-10-16: a run reads at most the newest 100 commits after the marker,

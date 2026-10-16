@@ -640,8 +640,9 @@ files that git tracks, the command records four more kinds of fact:
   lock files, generated files and binary files, each under its own subject,
   `file:<host>/<owner>/<repo>:<path>`. The first run reads the top of every
   file, so on a large repository it takes a while and costs more than later
-  runs, which re-read only the files that changed. Each file is looked up
-  before its fact is written, on every run, so a file never gets two facts.
+  runs, which re-read only the files that changed. When the repository
+  already has file facts, each file is looked up before its fact is written,
+  so a file never gets two facts.
 - **Decisions from the commit history.** The command reads at most the newest
   100 commits on the default branch: on the first run, the last 100 of the
   whole history, and after that, the last 100 of the commits since the
