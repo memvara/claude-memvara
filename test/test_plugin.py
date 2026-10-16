@@ -8861,6 +8861,9 @@ class IndexCommand(unittest.TestCase):
         a 6,000-unit window, kept the credential at its rate limit. It stored 11 facts."""
         body = self.BODY.read_text(encoding="utf-8")
         self.assertIn("Wait for every subagent to finish before you end your turn", body)
+        # Review finding: subagents start in the background by default, and waiting for a
+        # background one means ending the turn, which is what let the permission lapse.
+        self.assertIn("start each subagent in the foreground", body)
         self.assertIn("run at most 3 at a time", body)
         self.assertIn("finds no file facts, every file is new", body)
 

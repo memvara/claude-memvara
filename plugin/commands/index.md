@@ -159,6 +159,8 @@ these rules in full: the subject format, one sentence per file, the files to ski
 search before every write, and the rule on rate-limit refusals in step 5.
 Wait for every subagent to finish before you end your turn: permission to write lasts only
 while this command runs, and a subagent still working after that has every write refused.
+So start each subagent in the foreground, not in the background, because waiting for a
+background subagent means ending your turn.
 
 On a later run, re-read only the files changed since `<last>`, from the same `git log`
 output as the components, and any new file. Name the files that were deleted in the report,
