@@ -616,10 +616,10 @@ does not cover ending or retiring anything.
 
 The predicates are `depends_on`, `version`, `deploys_to`, `endpoint`,
 `owner` and `known_defect` from the engineering predicate pack, plus
-`purpose`, `entry_point`, `runs_with` and `convention`. The engineering
-pack does not declare those last four yet, so memvara stores them as
-unregistered predicates: every value is kept beside the others, and nothing
-replaces one automatically. That is why a changed value is replaced by id.
+`purpose`, `entry_point`, `runs_with` and `convention`, which the pack
+declares too. A `purpose` holds one value per subject, so a new purpose ends
+the old one. The others hold many values side by side, and nothing replaces
+one of them automatically. That is why a changed value is replaced by id.
 
 In a coding project, which means a repository with a manifest and source
 files that git tracks, the command records four more kinds of fact:
