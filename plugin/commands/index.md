@@ -80,7 +80,9 @@ Compare each fact with the rows from step 3 before writing it:
 - **A new fact:** write it.
 
 If memvara refuses a write because of its rate limit, retry it after a short wait, and do not
-move on to the next fact until it is stored.
+move on to the next fact until it is stored. After five refusals in a row, stop the run and
+say in the report which facts were not stored; a later run picks them up, because it looks
+each one up before writing.
 
 **6. In a coding project, record its architecture and what each folder and file is for.**
 Skip steps 6 and 7, and say so in the report, unless the repository has a manifest from

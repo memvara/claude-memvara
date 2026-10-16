@@ -8850,6 +8850,8 @@ class IndexCommand(unittest.TestCase):
         self.assertIn("Do this search for every file on every run", body)
         self.assertIn("give each subagent its own folders", body)
         self.assertIn("retry it after a short wait", body)
+        # Review finding: a retry with no end spends the whole budget on one write.
+        self.assertIn("After five refusals in a row, stop the run", body)
         self.assertIn("even if you would word it differently", body)
 
     def test_only_the_last_100_commits_are_read(self) -> None:
