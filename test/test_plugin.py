@@ -8847,7 +8847,6 @@ class IndexCommand(unittest.TestCase):
         duplicate only because the store ignores an identical write. These rules close each
         way a second fact for one file, or a churned one, could appear."""
         body = self.BODY.read_text(encoding="utf-8")
-        self.assertIn("Otherwise search before every file", body)
         self.assertIn("give each subagent its own folders", body)
         self.assertIn("wait as long as the refusal says", body)
         # Review finding: a retry with no end spends the whole budget on one write.
@@ -8865,7 +8864,7 @@ class IndexCommand(unittest.TestCase):
         # background one means ending the turn, which is what let the permission lapse.
         self.assertIn("start each subagent in the foreground", body)
         self.assertIn("run at most 3 at a time", body)
-        self.assertIn("finds no file facts, every file is new", body)
+        self.assertIn("a search before each write would cost rate limit and protect nothing", body)
 
     def test_only_the_last_100_commits_are_read(self) -> None:
         """Decided 2026-10-16: a run reads at most the newest 100 commits after the marker,
@@ -8874,9 +8873,22 @@ class IndexCommand(unittest.TestCase):
         self.assertIn("at most the newest 100 commits", body)
         self.assertIn("Write every qualifying decision. There is no limit.", body)
 
-    def test_a_component_is_compared_only_with_its_own_rows(self) -> None:
+    def test_purpose_facts_are_written_without_a_search_first(self) -> None:
+        """A `purpose` keeps one value per subject on the store: a new one ends the old one,
+        and the same text again stores nothing. The third 0.5.4 run on memvara, on
+        2026-10-16, stopped because a search for a component returned only its `belongs_to`
+        row while a `purpose` was stored, so the searches before each folder and file could
+        not protect anything and cost 65 units of the rate limit each."""
         body = self.BODY.read_text(encoding="utf-8")
-        self.assertIn("Keep only the rows whose subject is exactly that component's", body)
+        self.assertIn("A `purpose` keeps one value per subject", body)
+        self.assertIn("without searching for the component first", body)
+        self.assertIn("Write each one without searching for it first", body)
+
+    def test_the_architecture_is_written_once(self) -> None:
+        """`architecture` keeps every value it is given, so a second full run would put a
+        second set of sentences beside the first."""
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("if any are found, leave them", body)
 
     def test_a_later_run_rereads_only_the_folders_that_changed(self) -> None:
         """A purpose can change only when the folder's files do. The second real run, on
