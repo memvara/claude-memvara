@@ -88,7 +88,10 @@ The steps are in `plugin/commands/index.md`, and the README describes them for u
   are written without a search first, because a `purpose` keeps one value per subject and a
   search can miss a stored row; the architecture is written only when the repository has
   none; at most 3 subagents run at once, in the foreground, and the run waits for them
-  before it ends its turn. The 0.5.3 run on memvara showed
+  before it ends its turn. Since 0.5.5 the paths that memvara's subject fold would merge,
+  such as `plugin/.mcp.json` and `plugin/mcp.json`, get a short tag at the end of their
+  subject; a test checks the command's list of them against the core's own fold. The
+  0.5.3 run on memvara showed
   why: its permission to write ended with its turn while 14 subagents were still writing, and
   its search before every file, at 65 units each against the credential's 6,000-unit window,
   kept it at the rate limit, so it stored 11 facts. The first 0.5.2 run on memvara-cloud broke the first two of those
