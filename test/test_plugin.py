@@ -5404,7 +5404,7 @@ class Version(unittest.TestCase):
     would silently cover less than the caller believes.
     """
 
-    VERSION = "0.5.1"
+    VERSION = "0.5.2"
     DECLARED = {"plugin/.claude-plugin/plugin.json"}
 
     @classmethod
@@ -8795,7 +8795,7 @@ class IndexCommand(unittest.TestCase):
         of them; and a stored decision is found by its sha, because one search capped at 50
         rows stops seeing them once a repository has more facts than that."""
         body = self.BODY.read_text(encoding="utf-8")
-        self.assertIn("git log --reverse --no-merges --format=%h <last>..origin/HEAD", body)
+        self.assertIn("git log --reverse -100 --no-merges --format=%h <last>..origin/HEAD", body)
         self.assertIn("with the commit's short sha as the query", body)
         # The first real run, on 2026-10-15, skipped this search because it found no
         # earlier run. A run that stopped before writing `indexed_through` leaves exactly
@@ -8818,6 +8818,31 @@ class IndexCommand(unittest.TestCase):
         self.assertIn("10 at a time, oldest first", body)
         self.assertIn("Do not shorten this output", body)
         self.assertIn("After every 5 groups", body)
+
+    def test_the_architecture_is_recorded_in_a_few_sentences(self) -> None:
+        """Asked for on 2026-10-16: an overview of how the parts fit together."""
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("Write between 3 and 8 `architecture` facts about the step 2 subject", body)
+        self.assertIn("how the main parts fit together", body)
+
+    def test_every_file_gets_one_sentence_under_its_own_subject(self) -> None:
+        """Asked for on 2026-10-16: an overview of all the files. One sentence per file, each
+        under its own subject, so that the per-prompt recall, which clips a line at 320
+        characters, can bring in the one file a question is about. The files are finished
+        before the commit marker is written, because a later run reads the marker as proof
+        that every file was read."""
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("`file:github.com/memvara/memvara:memvara/core.py`", body)
+        self.assertIn("except lock files, generated files and binary files", body)
+        self.assertIn("Finish the files before step 7", body)
+        self.assertIn("finds no file facts", body)
+
+    def test_only_the_last_100_commits_are_read(self) -> None:
+        """Decided 2026-10-16: a run reads at most the newest 100 commits after the marker,
+        the whole window on a first run. Every qualifying decision in them is still written."""
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("at most the newest 100 commits", body)
+        self.assertIn("Write every qualifying decision. There is no limit.", body)
 
     def test_a_component_is_compared_only_with_its_own_rows(self) -> None:
         body = self.BODY.read_text(encoding="utf-8")
