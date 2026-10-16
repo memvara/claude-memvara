@@ -633,9 +633,10 @@ files that git tracks, the command records two more kinds of fact:
   kept. A later run re-reads only the folders whose files changed since the
   last run.
 - **Decisions from the commit history.** The first run reads every commit
-  message on the default branch, 100 at a time, with the files each commit
-  changed. It then records the newest commit it read as an `indexed_through`
-  fact, and later runs read only the commits after it. Only merged history is
+  message on the default branch, oldest first and 10 at a time, with the
+  files each commit changed. Every 50 commits it records the newest commit it
+  has read as an `indexed_through` fact, so later runs read only the commits
+  after it, and a run that stops early keeps its place. Only merged history is
   read, because every clone and worktree shares these facts. A commit whose message states
   a choice and the reason for it becomes a `decided` fact, dated by the
   commit and ending with its short sha. The fact is filed under the folder

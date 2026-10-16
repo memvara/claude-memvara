@@ -50,8 +50,12 @@ The steps are in `plugin/commands/index.md`, and the README describes them for u
   from the repository's own subject so that every clone and worktree spells it the same. Each
   component gets a one-sentence `purpose` and a `belongs_to` fact naming the repository.
 - **Decisions.** The first run reads every commit on the default branch that is not a
-  merge, 100 at a time, with the files each one changed. It then records the newest commit
-  it read as an `indexed_through` fact, and later runs read only the commits after it. Only merged history is read, because every clone
+  merge, oldest first and 10 at a time, with the files each one changed. Every 50 commits it
+  records the newest commit it has read as an `indexed_through` fact, so later runs read only
+  the commits after it, and a run that stops early keeps its place. The first version read
+  pages of 100, newest first, and recorded the marker only at the end. Its first run on
+  memvara-cloud shortened a page itself, read about 16 of 579 commits, and stopped without
+  the marker, so every later run would have stopped at the same place. Only merged history is read, because every clone
   and worktree shares these facts. A decision is found again by its sha, so a second run does
   not write it twice. A commit whose message states a choice and its reason becomes a `decided`
   fact. The fact's `true_since` is the commit's date, and its text ends with the short sha.
