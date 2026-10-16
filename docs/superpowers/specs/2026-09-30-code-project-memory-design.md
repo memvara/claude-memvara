@@ -12,7 +12,9 @@ taken from recent commit messages. Nothing new reads these facts back. The hook 
 every prompt already shows Claude the memories that best match the user's message, so a
 question about one part of the code can bring that part's facts in first.
 
-It does not store a summary of every file. Section 2 explains why.
+It does not store a summary of every file; section 2 explains why. Since 2026-10-16 it does
+store one sentence per file saying what the file is for, and a few sentences on the
+architecture, at the user's request (section 4).
 
 ## 2. Why not a summary of every file
 
@@ -49,8 +51,12 @@ The steps are in `plugin/commands/index.md`, and the README describes them for u
 - **Facts per component.** The subject is `component:<host>/<owner>/<repo>:<folder>`, built
   from the repository's own subject so that every clone and worktree spells it the same. Each
   component gets a one-sentence `purpose` and a `belongs_to` fact naming the repository.
-- **Decisions.** The first run reads every commit on the default branch that is not a
-  merge, oldest first and 10 at a time, with the files each one changed. Every 50 commits it
+- **Decisions.** A run reads at most the newest 100 commits on the default branch that are
+  not merges: the last 100 of the whole history on the first run, and after that the last
+  100 of the commits since the previous run. It reads them oldest first and 10 at a time,
+  with the files each one changed. The user set this window on 2026-10-16, after the first
+  run on memvara-cloud, which has 579 commits; earlier the first run read the whole
+  history. Every 50 commits it
   records the newest commit it has read as an `indexed_through` fact, so later runs read only
   the commits after it, and a run that stops early keeps its place. The first version read
   pages of 100, newest first, and recorded the marker only at the end. Its first run on
@@ -61,8 +67,9 @@ The steps are in `plugin/commands/index.md`, and the README describes them for u
   fact. The fact's `true_since` is the commit's date, and its text ends with the short sha.
   It is filed under the component that holds more than half of the commit's changed paths,
   counting only paths inside components, or under the repository when no component does.
-  Every such decision is written. The first version capped a run at 40 and read only the last
-  100 commits; the user removed both limits on 2026-10-15.
+  Every such decision among the commits read is written. The first version also capped a
+  run at 40 decisions; the user removed that cap on 2026-10-15 and set the 100-commit
+  window on 2026-10-16.
 - **Keeping it current.** A second run compares with what is stored, as the command already
   did: a fact already stored is not written again, and a changed purpose is written with
   `replaces`. It re-reads only the folders whose files changed since `indexed_through`,
@@ -70,6 +77,12 @@ The steps are in `plugin/commands/index.md`, and the README describes them for u
   that stopped early leaves decisions stored without the marker. A folder that was deleted or moved keeps its old facts. The report names it and
   suggests `memory_end`, which asks the user before it runs, because the command's
   `allowed-tools` still excludes `memory_end` and `memory_forget`.
+- **Architecture and files.** Three to eight `architecture` sentences describe how the main
+  parts fit together. Every tracked file except lock, generated and binary files gets one
+  `purpose` sentence under its own subject, `file:<host>/<owner>/<repo>:<path>`, short
+  enough for the per-prompt recall, which clips a line at 320 characters. The files are
+  written before the commit marker, so a marker means every file was read, and a later run
+  re-reads only the files that changed since it.
 - **Privacy.** The command reads code and commit messages inside the user's session. Only the
   short facts are sent to memvara, never source code or diffs.
 
@@ -83,6 +96,12 @@ The steps are in `plugin/commands/index.md`, and the README describes them for u
   notes for the measurement by hand showed why. Counting every changed path left 38 of 40
   memvara decisions on the repository, because most commits also change tests, docs and the
   changelog. Counting only paths inside components put 26 of 40 on a component.
+- **One sentence per file, and the architecture** (2026-10-16). The user asked for a memory
+  of the overall architecture and an overview of all the files. This is not the per-file
+  summary that section 2 rejects: it is one sentence per file, written once and re-read only
+  when the file changes. What it costs is real. memvara-cloud tracks 727 files, so its first
+  run writes about 720 file facts and reads the top of each file, and on a question about
+  code the file facts compete with decisions for the 4 per-prompt recall slots.
 - **The simple version first** (2026-10-15). The larger design added a brief at session
   start, notes injected when the agent touches a file, both built as new hooks in the core
   repository, and a measurement phase before any of it. The user's call was that it had to be

@@ -1,5 +1,5 @@
 ---
-description: Record 10 to 30 facts about the current repository in memvara and, in a coding project, what each main folder is for and the decisions in its recent commits, without repeating facts already stored.
+description: Record 10 to 30 facts about the current repository in memvara and, in a coding project, its architecture, what each main folder and each file is for, and the decisions in its recent commits, without repeating facts already stored.
 allowed-tools: Bash(python3:*), Bash(git log:*), Bash(git ls-files:*), Bash(git remote:*), Read, Glob, Grep, mcp__plugin_memvara_memvara__memory_search, mcp__plugin_memvara_memvara__memory_remember
 ---
 
@@ -78,9 +78,13 @@ Compare each fact with the rows from step 3 before writing it:
   first: ending the old fact separately loses the link between the two.
 - **A new fact:** write it.
 
-**6. In a coding project, record what each main folder is for.** Skip steps 6 and 7, and
-say so in the report, unless the repository has a manifest from step 4 and source files that
-git tracks (`git ls-files`).
+**6. In a coding project, record its architecture and what each folder and file is for.**
+Skip steps 6 and 7, and say so in the report, unless the repository has a manifest from
+step 4 and source files that git tracks (`git ls-files`).
+
+Before anything else in this step, find the `indexed_through` marker, as the start of step 7
+describes, because it decides whether this step reads every folder and file or only the ones
+that changed.
 
 A component is one of the main source folders: a top-level source folder, a package that a
 manifest declares as a workspace member, or a subpackage of the main package, as
@@ -118,6 +122,30 @@ A component with no changed files keeps its stored facts. A new folder is a new 
 A stored component whose folder no longer exists is not ended here. Name it in the report,
 and suggest ending its facts with `memory_end`, which asks the user before it runs.
 
+**The architecture.** Write between 3 and 8 `architecture` facts about the step 2 subject,
+each one sentence on how the main parts fit together: where requests or commands come in,
+which components they pass through, where data is kept, and which outside services are
+called. Base them on the components above and their entry points. First call
+`memory_search` with the query `architecture` followed by the step 2 subject, keep the rows
+with exactly that subject and predicate, and compare as in step 5, so that a sentence that
+changed replaces the old one by id.
+
+**Every file.** Write one `purpose` fact for every file that git tracks,
+except lock files, generated files and binary files such as images, fonts and archives. Its subject is `file:`, then the step 2 subject without
+`project:`, then `:` and the file's path, for example
+`file:github.com/memvara/memvara:memvara/core.py`. The object says in one sentence what the
+file is for, from its first lines, docstring or exports; read only as much of the file as
+that needs. Skip a file whose subject would be longer than 128 characters, and name it in
+the report. Before writing, call `memory_search` with the file's subject as the query, keep
+only the rows whose subject is exactly that file's, and compare as in step 5.
+
+On a later run, re-read only the files changed since `<last>`, from the same `git log`
+output as the components, and any new file. Name the files that were deleted in the report,
+and suggest ending their facts with `memory_end`. Do the full pass anyway when a search for
+`file:` followed by the step 2 subject without `project:` finds no file facts, because then
+the repository was indexed before files were recorded. Finish the files before step 7: its
+`indexed_through` marker is what tells a later run that every file was read.
+
 **7. Record the decisions in the commit history.** Decisions are read from the default
 branch, `origin/HEAD`, because every clone and worktree of the repository shares these facts,
 and only merged history is true for all of them. If `origin/HEAD` does not exist, use `HEAD`
@@ -128,16 +156,17 @@ followed by the step 2 subject, and keep the row whose subject is the step 2 sub
 predicate is `indexed_through`. Its object is the last commit an earlier run read; call it
 `<last>`.
 
-Then list the commits after it, oldest first:
+Then list the commits after it, oldest first. A run reads at most the newest 100 commits
+after `<last>`, so a busy repository is not read back to its beginning:
 
 ```bash
-git log --reverse --no-merges --format=%h <last>..origin/HEAD
+git log --reverse -100 --no-merges --format=%h <last>..origin/HEAD
 ```
 
-On the first run there is no `<last>`, so leave out `<last>..` and list the whole history.
-If git cannot find `<last>`, because the history was rewritten, do the same: the search by
-sha below keeps a decision from being written twice. If a very long list comes back cut
-off, work through as much of it as you have; the next run continues after it.
+On the first run there is no `<last>`, so leave out `<last>..`: the run then reads the
+newest 100 commits of the whole history. If git cannot find `<last>`, because the history
+was rewritten, do the same: the search by sha below keeps a decision from being written
+twice.
 
 Read the listed commits 10 at a time, oldest first, with their messages and the files they
 changed, naming the commits of each group:
@@ -186,9 +215,9 @@ reason, has not lost its place.
 
 **8. Report.** Tell the user the subject, how many facts were written, how many were already
 stored, and which ones replaced an older value. List the facts written, one per line. In a
-coding project, also give the number of components written, how many commits were read
-and how many decisions were written, and name the components that were skipped and the
-stored ones whose folder no longer exists.
+coding project, also give the number of components, `architecture` facts and files
+written, how many commits were read and how many decisions were written, and name the
+components and files that were skipped and the stored ones that no longer exist.
 
 Store only what the repository states. Do not record secrets, credentials, personal data or
 guesses; if something is unclear, leave it out.

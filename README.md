@@ -622,7 +622,7 @@ unregistered predicates: every value is kept beside the others, and nothing
 replaces one automatically. That is why a changed value is replaced by id.
 
 In a coding project, which means a repository with a manifest and source
-files that git tracks, the command records two more kinds of fact:
+files that git tracks, the command records four more kinds of fact:
 
 - **What each main folder is for.** Each main source folder gets its own
   subject, `component:<host>/<owner>/<repo>:<folder>`, for example
@@ -632,11 +632,22 @@ files that git tracks, the command records two more kinds of fact:
   recorded; when there are more, the ones with the most tracked files are
   kept. A later run re-reads only the folders whose files changed since the
   last run.
-- **Decisions from the commit history.** The first run reads every commit
-  message on the default branch, oldest first and 10 at a time, with the
-  files each commit changed. Every 50 commits it records the newest commit it
-  has read as an `indexed_through` fact, so later runs read only the commits
-  after it, and a run that stops early keeps its place. Only merged history is
+- **The architecture.** Three to eight `architecture` sentences about the
+  repository, on how the main parts fit together: where requests come in,
+  which folders they pass through, where data is kept and which outside
+  services are called.
+- **What every file is for.** One sentence per file that git tracks, except
+  lock files, generated files and binary files, each under its own subject,
+  `file:<host>/<owner>/<repo>:<path>`. The first run reads the top of every
+  file, so on a large repository it takes a while and costs more than later
+  runs, which re-read only the files that changed.
+- **Decisions from the commit history.** The command reads at most the newest
+  100 commits on the default branch: on the first run, the last 100 of the
+  whole history, and after that, the last 100 of the commits since the
+  previous run. It reads them oldest first and 10 at a time, with the files
+  each commit changed. Every 50 commits it records the newest commit it has
+  read as an `indexed_through` fact, so a run that stops early keeps its
+  place. Only merged history is
   read, because every clone and worktree shares these facts. A commit whose message states
   a choice and the reason for it becomes a `decided` fact, dated by the
   commit and ending with its short sha. The fact is filed under the folder
