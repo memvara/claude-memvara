@@ -5404,7 +5404,7 @@ class Version(unittest.TestCase):
     would silently cover less than the caller believes.
     """
 
-    VERSION = "0.5.2"
+    VERSION = "0.5.3"
     DECLARED = {"plugin/.claude-plugin/plugin.json"}
 
     @classmethod
@@ -8839,6 +8839,18 @@ class IndexCommand(unittest.TestCase):
         # Step 6 chooses between the full pass and the changed files by the marker, so it
         # has to look for the marker itself rather than wait for step 7 to.
         self.assertIn("Before anything else in this step, find the `indexed_through` marker", body)
+
+    def test_the_file_pass_cannot_write_a_file_twice(self) -> None:
+        """The first 0.5.2 run on memvara-cloud, on 2026-10-16, skipped the search before
+        each file because an earlier search found no file facts, handed the files to 12
+        subagents, and reworded 5 folder purposes that were still right. It left no live
+        duplicate only because the store ignores an identical write. These rules close each
+        way a second fact for one file, or a churned one, could appear."""
+        body = self.BODY.read_text(encoding="utf-8")
+        self.assertIn("Do this search for every file on every run", body)
+        self.assertIn("give each subagent its own folders", body)
+        self.assertIn("retry it after a short wait", body)
+        self.assertIn("even if you would word it differently", body)
 
     def test_only_the_last_100_commits_are_read(self) -> None:
         """Decided 2026-10-16: a run reads at most the newest 100 commits after the marker,
