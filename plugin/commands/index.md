@@ -79,9 +79,12 @@ Compare each fact with the rows from step 3 before writing it:
 - **A new fact:** write it.
 
 **6. In a coding project, record its architecture and what each folder and file is for.**
-Skip steps 6 and 7, and
-say so in the report, unless the repository has a manifest from step 4 and source files that
-git tracks (`git ls-files`).
+Skip steps 6 and 7, and say so in the report, unless the repository has a manifest from
+step 4 and source files that git tracks (`git ls-files`).
+
+Before anything else in this step, find the `indexed_through` marker, as the start of step 7
+describes, because it decides whether this step reads every folder and file or only the ones
+that changed.
 
 A component is one of the main source folders: a top-level source folder, a package that a
 manifest declares as a workspace member, or a subpackage of the main package, as

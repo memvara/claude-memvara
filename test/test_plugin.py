@@ -8836,6 +8836,9 @@ class IndexCommand(unittest.TestCase):
         self.assertIn("except lock files, generated files and binary files", body)
         self.assertIn("Finish the files before step 7", body)
         self.assertIn("finds no file facts", body)
+        # Step 6 chooses between the full pass and the changed files by the marker, so it
+        # has to look for the marker itself rather than wait for step 7 to.
+        self.assertIn("Before anything else in this step, find the `indexed_through` marker", body)
 
     def test_only_the_last_100_commits_are_read(self) -> None:
         """Decided 2026-10-16: a run reads at most the newest 100 commits after the marker,
